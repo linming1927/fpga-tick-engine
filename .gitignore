@@ -1,0 +1,30 @@
+# ---- simulation artifacts (regenerate with iverilog) ----
+*.out
+*.vcd
+
+# ---- Vivado project junk (the project is reproducible from rtl/ + xdc) ----
+*.jou
+*.log
+*.str
+.Xil/
+vivado_project/
+*.cache/
+*.hw/
+*.runs/
+*.sim/
+*.ip_user_files/
+*.gen/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+
+# ---- runtime state: NEVER commit these ----
+# tick logs & audit trails (may contain account activity)
+*.jsonl
+# kill-switch marker — per-machine state, not code
+om.kill
+# if ALPACA keys ever live in a file, it is this one, and this
+# line keeps it out of git forever (gitignore has no trailing
+# comments — patterns must sit alone on their line, like these)
+.env

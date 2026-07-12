@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+dashboard.py — live web console for the tick engine. Zero dependencies.
+
+A stdlib http.server thread embedded in the order-manager process serves a
+single-page instrument console:
+
+  * scope-style chart: price trace + fast/slow SMA + BUY/SELL markers
+  * an LED strip mirroring the Arty's physical LD4-LD7 semantics
+    (parse/divergence trouble, tick activity, link trouble, heartbeat)
+  * position, realized/net P&L, fees, round-trip latency, verification
+  * signal & event log
+  * a guarded KILL SWITCH (arm, then confirm) wired to OrderManager.halt —
+    killing is the fail-safe direction, so the dashboard may do it; it can
+    do nothing else that touches money
+
+Open http://localhost:<port> on the bench machine, or from a phone on the
+same LAN via the machine's IP. The page is fully self-contained (system
+fonts, no CDN) because a bench box may have no internet.
+
+Endpoints:
+  GET  /            the console page
+  GET  /api/state   JSON snapshot for the 500 ms poll
+  POST /api/kill    manual kill switch -> OrderManager.halt (latching)
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class DashboardServer:
+    def __init__(self, bridge, om, port: int = 8000, points: int = 240,
+                 scorecards: dict | None = None):
+        self.bridge = bridge
+        self.om = om
+        self.scorecards = scorecards
+        self.port = port
+        self._lock = threading.Lock()
+        self._series = deque(maxlen=points)     # (price, smaf, smas, warmed)
+        self._signals = deque(maxlen=20)
+        self._events = deque(maxlen=30)
+        self._last_echo_t = 0.0
+        self._last_trouble_t = 0.0
+        self.t0 = time.time()
+
+        bridge.on_echo = self._on_echo          # hook added in bridge.py
+
+    # ---- feed hooks (called from bridge threads) ------------------------------
+    def _on_echo(self, fr: dict):
+        m = self.bridge.models["sma"]
+        e = self.bridge.models["ema"]
+        with self._lock:
+            self._series.append((fr["price_e4"], m.sma_fast, m.sma_slow,
+                                 m.warmed_up, e.ema_fast, e.ema_slow,
+                                 e.warmed_up))
+            self._last_echo_t = time.time()
+
+    def on_signal(self, fr: dict):
+        with self._lock:
+            self._signals.appendleft({"t": time.strftime("%H:%M:%S"),
+                                      "strategy": fr.get("strategy", "sma"),
+                                      "side": fr["side"],
+                                      "price_e4": fr["price_e4"],
+                                      "sma_fast": fr["sma_fast"],
+                                      "sma_slow": fr["sma_slow"]})
+
+    def on_event(self, text: str, bad: bool = False):
+        with self._lock:
+            self._events.appendleft({"t": time.strftime("%H:%M:%S"),
+                                     "text": text, "bad": bad})
+            if bad:
+                self._last_trouble_t = time.time()
+
+    # ---- snapshot for the poll ---------------------------------------------------
+    def snapshot(self) -> dict:
+        br, om = self.bridge, self.om
+        now = time.time()
+        rtt = sorted(br.rtt_us[-200:]) if br.rtt_us else []
+        with self._lock:
+            series = list(self._series)
+            signals = list(self._signals)
+            events = list(self._events)
+            echo_age = now - self._last_echo_t if self._last_echo_t else 1e9
+            trouble_age = (now - self._last_trouble_t
+                           if self._last_trouble_t else 1e9)
+        return {
+            "symbol": om.symbol,
+            "uptime_s": int(now - self.t0),
+            "series": series,
+            "signals": signals,
+            "events": events,
+            "sent": br.sent, "echoes": br.echoes,
+            "resyncs": br.parser.resync_count,
+            "fpga_signals": br.fpga_signals,
+            "verified": sum(v.verified for v in br.verifiers.values()),
+            "divergences": sum(v.divergences
+                               for v in br.verifiers.values()),
+            "strategies": [
+                {"name": c.name, "signals": c.signals, "trips": c.trips,
+                 "wins": c.wins, "net": round(c.net_usd, 2),
+                 "open": c.open_e4 is not None}
+                for c in (self.scorecards or {}).values()],
+            "warmed_up": br.model.warmed_up,
+            "fill": br.model.fill, "slow_n": br.model.slow_n,
+            "rtt": {"min": rtt[0], "med": rtt[len(rtt)//2],
+                    "max": rtt[-1]} if rtt else None,
+            "position": om.position_qty,
+            "orders": om.orders, "blocked": om.blocked,
+            "pnl_gross": om.costs.realized_pnl_usd,
+            "fees": om.costs.total_fees,
+            "pnl_net": om.costs.net_pnl_usd,
+            "halted": om.halted, "halt_reason": om.halt_reason,
+            "led": {"trouble": trouble_age < 3.0 or om.halted,
+                    "activity": echo_age < 1.0,
+                    "link": echo_age < 10.0},
+        }
+
+    # ---- server -------------------------------------------------------------------
+    def start(self):
+        dash = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):           # keep the terminal clean
+                pass
+
+            def _send(self, code, body: bytes, ctype: str):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/":
+                    self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+                elif self.path == "/api/state":
+                    self._send(200, json.dumps(dash.snapshot()).encode(),
+                               "application/json")
+                else:
+                    self._send(404, b"not found", "text/plain")
+
+            def do_POST(self):
+                if self.path == "/api/kill":
+                    dash.om.halt("manual kill from dashboard")
+                    dash.on_event("KILL SWITCH — manual, from dashboard",
+                                  bad=True)
+                    self._send(200, b'{"halted": true}', "application/json")
+                else:
+                    self._send(404, b"not found", "text/plain")
+
+        self.httpd = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+        t = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        t.start()
+        print(f"[dash] console at http://localhost:{self.port}")
+        return self
+
+    def stop(self):
+        self.httpd.shutdown()
+
+
+# -----------------------------------------------------------------------------
+# The console page. Self-contained: system fonts, no CDN, no build step.
+# -----------------------------------------------------------------------------
+PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TICK ENGINE — console</title>
+<style>
+:root{
+  --bg:#0E1116; --panel:#151B23; --line:#232C38; --ink:#C7D3E2;
+  --dim:#66788E; --amber:#E5B454; --green:#4CC38A; --cyan:#5CC8FF;
+  --violet:#B18CFF; --red:#E5484D;
+}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--ink);
+  font:14px/1.5 ui-monospace,'SF Mono','Cascadia Mono',Consolas,Menlo,monospace;
+  padding:14px;max-width:1180px;margin:0 auto}
+header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+  border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:14px}
+h1{font-size:15px;letter-spacing:.28em;font-weight:700;color:var(--amber)}
+h1 span{color:var(--dim);font-weight:400}
+.leds{display:flex;gap:14px;margin-left:auto;align-items:center}
+.led{display:flex;flex-direction:column;align-items:center;gap:3px}
+.led i{width:12px;height:12px;border-radius:50%;background:#26303D;
+  border:1px solid var(--line);transition:background .15s,box-shadow .15s}
+.led small{font-size:9px;letter-spacing:.12em;color:var(--dim)}
+.led.on.g i{background:var(--green);box-shadow:0 0 8px var(--green)}
+.led.on.a i{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+.led.on.r i{background:var(--red);box-shadow:0 0 9px var(--red)}
+@keyframes hb{0%,60%{opacity:.25}70%,90%{opacity:1}100%{opacity:.25}}
+.led.hb i{background:var(--green);animation:hb 1.4s infinite}
+.grid{display:grid;grid-template-columns:2fr 1fr;gap:14px}
+@media(max-width:820px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);
+  border-radius:6px;padding:12px}
+.panel h2{font-size:10px;letter-spacing:.22em;color:var(--dim);
+  font-weight:600;margin-bottom:8px}
+canvas{width:100%;height:300px;display:block}
+.legend{display:flex;gap:16px;font-size:11px;color:var(--dim);margin-top:6px}
+.legend b{font-weight:400}
+.k-price{color:var(--amber)}.k-f{color:var(--cyan)}.k-s{color:var(--violet)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
+  gap:10px;margin:14px 0}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+  padding:9px 12px}
+.stat small{display:block;font-size:9px;letter-spacing:.18em;color:var(--dim)}
+.stat b{font-size:17px;font-weight:600}
+.pos b{color:var(--amber)} .good b{color:var(--green)} .bad b{color:var(--red)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+td,th{padding:3px 6px;text-align:right;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:600;font-size:10px;letter-spacing:.14em}
+td:first-child,th:first-child{text-align:left}
+.buy{color:var(--green)} .sell{color:var(--red)}
+.log{font-size:11px;max-height:180px;overflow-y:auto}
+.log div{padding:2px 0;border-bottom:1px solid var(--line);color:var(--dim)}
+.log .bad{color:var(--red)}
+.killwrap{margin-top:14px;display:flex;align-items:center;gap:12px}
+#kill{background:none;border:2px solid var(--red);color:var(--red);
+  font:inherit;font-weight:700;letter-spacing:.2em;padding:10px 22px;
+  border-radius:4px;cursor:pointer}
+#kill.armed{background:var(--red);color:#fff}
+#kill:disabled{border-color:var(--line);color:var(--dim);cursor:default}
+#banner{display:none;background:var(--red);color:#fff;font-weight:700;
+  letter-spacing:.15em;text-align:center;padding:8px;border-radius:4px;
+  margin-bottom:12px}
+#warm{color:var(--dim);font-size:11px}
+@media(prefers-reduced-motion:reduce){.led.hb i{animation:none;opacity:1}}
+</style></head><body>
+<header>
+  <h1>TICK ENGINE <span id="sym">····</span></h1>
+  <span id="warm"></span>
+  <div class="leds">
+    <div class="led r" id="led0"><i></i><small>TRBL</small></div>
+    <div class="led a" id="led1"><i></i><small>TICK</small></div>
+    <div class="led g" id="led2"><i></i><small>LINK</small></div>
+    <div class="led hb"><i></i><small>HB</small></div>
+  </div>
+</header>
+<div id="banner"></div>
+<div class="stats" id="stats"></div>
+<div class="grid">
+  <div class="panel"><h2>PRICE / SMA / EMA — LAST 240 TICKS</h2>
+    <canvas id="chart"></canvas>
+    <div class="legend"><b class="k-price">— price</b>
+      <b class="k-f">— sma fast</b><b class="k-s">— sma slow</b>
+      <b class="k-f">┄ ema fast</b><b class="k-s">┄ ema slow</b>
+      <b class="buy">▲ buy</b><b class="sell">▼ sell</b></div>
+    <div id="cmp" style="margin-top:10px"></div>
+  </div>
+  <div>
+    <div class="panel"><h2>SIGNALS</h2>
+      <table><thead><tr><th>t</th><th>strat</th><th>side</th><th>price</th>
+      <th>fast</th><th>slow</th></tr></thead><tbody id="sigs"></tbody></table>
+    </div>
+    <div class="panel" style="margin-top:14px"><h2>EVENTS</h2>
+      <div class="log" id="log"><div>console up — waiting for ticks</div></div>
+    </div>
+  </div>
+</div>
+<div class="killwrap">
+  <button id="kill">KILL SWITCH</button>
+  <span id="killhint" style="color:var(--dim);font-size:11px">
+    latching — halts all orders; re-arm requires deleting om.kill</span>
+</div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const usd=e4=>'$'+(e4/1e4).toFixed(2);
+const money=v=>(v<0?'-':'')+'$'+Math.abs(v).toFixed(2);
+
+function drawChart(series,signals){
+  const c=$('chart'),dpr=window.devicePixelRatio||1;
+  const W=c.clientWidth,H=c.clientHeight;
+  c.width=W*dpr;c.height=H*dpr;
+  const g=c.getContext('2d');g.scale(dpr,dpr);g.clearRect(0,0,W,H);
+  if(series.length<2)return;
+  let lo=1/0,hi=-1/0;
+  for(const pt of series){lo=Math.min(lo,pt[0]);hi=Math.max(hi,pt[0]);
+    if(pt[3]){lo=Math.min(lo,pt[1],pt[2]);hi=Math.max(hi,pt[1],pt[2]);}
+    if(pt[6]){lo=Math.min(lo,pt[4],pt[5]);hi=Math.max(hi,pt[4],pt[5]);}}
+  const pad=(hi-lo)*0.08||1;lo-=pad;hi+=pad;
+  const X=i=>i/(series.length-1)*(W-46),Y=v=>H-8-(v-lo)/(hi-lo)*(H-16);
+  g.strokeStyle='#232C38';g.fillStyle='#66788E';
+  g.font='10px ui-monospace,monospace';g.textAlign='left';
+  for(let k=0;k<4;k++){const v=lo+(hi-lo)*k/3,y=Y(v);
+    g.beginPath();g.moveTo(0,y);g.lineTo(W-46,y);g.stroke();
+    g.fillText((v/1e4).toFixed(2),W-42,y+3);}
+  const line=(idx,color,wid,gate,dash)=>{g.strokeStyle=color;g.lineWidth=wid;
+    g.setLineDash(dash||[]);g.beginPath();let started=false;
+    series.forEach((pt,i)=>{if(gate>=0&&!pt[gate])return;
+      const x=X(i),y=Y(pt[idx]);
+      started?g.lineTo(x,y):(g.moveTo(x,y),started=true);});
+    g.stroke();g.setLineDash([]);};
+  line(0,'#E5B454',1.6,-1);line(1,'#5CC8FF',1.1,3);line(2,'#B18CFF',1.1,3);
+  line(4,'#5CC8FF',1.0,6,[4,4]);line(5,'#B18CFF',1.0,6,[4,4]);
+  // signal markers: match by price on recent points, newest first
+  g.textAlign='center';
+  for(const s of signals){
+    for(let i=series.length-1;i>=0;i--){
+      if(series[i][0]===s.price_e4){
+        const x=X(i),y=Y(s.price_e4),up=s.side===1;
+        g.fillStyle=up?'#4CC38A':'#E5484D';g.beginPath();
+        if(up){g.moveTo(x,y+16);g.lineTo(x-5,y+24);g.lineTo(x+5,y+24);}
+        else {g.moveTo(x,y-16);g.lineTo(x-5,y-24);g.lineTo(x+5,y-24);}
+        g.closePath();g.fill();break;}}}
+}
+
+function stat(label,val,cls){return '<div class="stat '+(cls||'')+'">'+
+  '<small>'+label+'</small><b>'+val+'</b></div>';}
+
+let killArmed=false,killTimer=null;
+$('kill').onclick=async()=>{
+  if(!killArmed){killArmed=true;$('kill').classList.add('armed');
+    $('kill').textContent='CONFIRM KILL';
+    killTimer=setTimeout(()=>{killArmed=false;
+      $('kill').classList.remove('armed');
+      $('kill').textContent='KILL SWITCH';},3000);return;}
+  clearTimeout(killTimer);
+  await fetch('/api/kill',{method:'POST'});
+};
+
+async function poll(){
+  try{
+    const s=await (await fetch('/api/state')).json();
+    $('sym').textContent=s.symbol+' · up '+
+      Math.floor(s.uptime_s/60)+'m'+(s.uptime_s%60)+'s';
+    $('warm').textContent=s.warmed_up?'SMA windows full':
+      'warming up '+s.fill+'/'+s.slow_n;
+    $('led0').classList.toggle('on',s.led.trouble);
+    $('led1').classList.toggle('on',s.led.activity);
+    $('led2').classList.toggle('on',s.led.link);
+    if(s.halted){$('banner').style.display='block';
+      $('banner').textContent='HALTED — '+s.halt_reason;
+      $('kill').disabled=true;$('kill').textContent='TRIPPED';
+      $('killhint').textContent='delete om.kill and restart to re-arm';}
+    $('stats').innerHTML=
+      stat('POSITION',s.position+' sh','pos')+
+      stat('NET P&L',money(s.pnl_net),s.pnl_net>=0?'good':'bad')+
+      stat('FEES',money(s.fees))+
+      stat('FILLS / BLOCKED',s.orders+' / '+s.blocked)+
+      stat('VERIFIED',s.verified+' / '+s.fpga_signals,
+           s.divergences?'bad':'good')+
+      stat('RTT µs',s.rtt?s.rtt.med+' ('+s.rtt.min+'–'+s.rtt.max+')':'—')+
+      stat('ECHO / SENT',s.echoes+' / '+s.sent,
+           s.echoes===s.sent?'':'bad');
+    drawChart(s.series,s.signals);
+    if(s.strategies&&s.strategies.length)
+      $('cmp').innerHTML='<table><thead><tr><th>strategy</th><th>signals'+
+        '</th><th>trips</th><th>wins</th><th>net $</th></tr></thead><tbody>'+
+        s.strategies.map(c=>'<tr><td>'+c.name+(c.open?' *':'')+'</td><td>'+
+        c.signals+'</td><td>'+c.trips+'</td><td>'+c.wins+'</td><td class="'+
+        (c.net>=0?'buy':'sell')+'">'+c.net.toFixed(2)+
+        '</td></tr>').join('')+'</tbody></table>';
+    $('sigs').innerHTML=s.signals.map(x=>'<tr><td>'+x.t+'</td>'+
+      '<td>'+x.strategy.toUpperCase()+'</td>'+
+      '<td class="'+(x.side===1?'buy">BUY':'sell">SELL')+'</td>'+
+      '<td>'+usd(x.price_e4)+'</td><td>'+usd(x.sma_fast)+'</td>'+
+      '<td>'+usd(x.sma_slow)+'</td></tr>').join('');
+    if(s.events.length)$('log').innerHTML=s.events.map(e=>
+      '<div class="'+(e.bad?'bad':'')+'">'+e.t+'  '+e.text+'</div>').join('');
+  }catch(e){$('led2').classList.remove('on');}
+  setTimeout(poll,500);
+}
+poll();
+</script></body></html>
+"""
