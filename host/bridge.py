@@ -297,25 +297,63 @@ def run_sim(br: Bridge, n: int, rate: float, start_price: float):
 def run_selftest(br: Bridge):
     """Hardware acceptance test: descending warm-up then a spike.
 
-    Expected: exactly one BUY whose SMAs match the local model — computed
-    by the model itself, so this works for any FAST_N/SLOW_N build.
+    The spike crosses BOTH strategies (deliberately — it also exercises the
+    same-cycle collision arbiter in fabric), so the expectation is one BUY
+    per strategy, each matching its local mirror model. Expected values are
+    computed by the models themselves, so any FAST/SLOW/EMA-K build passes
+    as long as the CLI params match the bitstream.
+
+    On failure, the diagnosis lines map each fingerprint to its usual
+    cause: no echoes = link/programming; echoes but no signals = bitstream
+    predates the indicator drops; SMA fine but EMA orphaned = bitstream
+    predates the EMA drop (rebuild with ema_engine.sv); counts equal but
+    divergent = CLI params don't match the bitstream's.
     """
-    print(f"[selftest] engine {br.model.fast_n}/{br.model.slow_n} on "
-          f"'{br.symbol}'")
+    print(f"[selftest] SMA {br.models['sma'].fast_n}/"
+          f"{br.models['sma'].slow_n}, EMA k={br.models['ema'].k_fast}/"
+          f"{br.models['ema'].k_slow} on '{br.symbol}'")
     p0 = to_e4(200.0)
-    for k in range(br.model.slow_n):                 # descending warm-up
+    for k in range(br.models["sma"].slow_n):         # descending warm-up
         br.send_trade(p0 - k * to_e4(1.0), 1)
         br.pump(timeout=0.05)
-    br.send_trade(to_e4(500.0), 1)                   # spike -> golden cross
+    br.send_trade(to_e4(500.0), 1)                   # spike: both cross
     br.pump(timeout=0.05)
     br.send_trade(to_e4(510.0), 1)                   # hold above: no retrigger
-    br.pump(timeout=1.0)
-    if br.fpga_signals == 1 and br.verifier.verified == 1 \
-            and br.verifier.divergences == 0:
-        print("[selftest] PASS — board decodes, computes, and signals "
-              "in agreement with the model")
+    br.pump(timeout=1.5)
+
+    ok = True
+    if br.echoes != br.sent:
+        ok = False
+        print(f"[selftest] DIAG: {br.echoes}/{br.sent} echoes — "
+              + ("no link: check --port and that the board is programmed "
+                 "(LD7 heartbeat?)" if br.echoes == 0 else
+                 "frames lost: check cabling/baud"))
+    for name in ("sma", "ema"):
+        m, v = br.models[name], br.verifiers[name]
+        f = br.fpga_by_strategy[name]
+        if f == m.signals == v.verified and v.divergences == 0:
+            continue
+        ok = False
+        print(f"[selftest] DIAG [{name}]: fpga={f} model={m.signals} "
+              f"verified={v.verified} diverged={v.divergences}")
+        if f == 0 and m.signals > 0:
+            print(f"[selftest]   -> board never sent a {name.upper()} "
+                  "signal: bitstream likely predates this engine — "
+                  "rebuild with all rtl/*.sv files")
+        elif v.divergences:
+            print(f"[selftest]   -> values disagree: CLI params "
+                  "(--fast/--slow/--ema-kf/--ema-ks) don't match the "
+                  "bitstream's build parameters")
+    if br.models["sma"].signals != 1:
+        ok = False
+        print("[selftest] DIAG: stimulus should produce exactly one SMA "
+              "BUY — check --symbol matches the bitstream's TARGET_SYMBOL")
+
+    if ok:
+        print("[selftest] PASS — board decodes, computes, and signals both "
+              "strategies in agreement with the models")
     else:
-        print("[selftest] FAIL — see summary")
+        print("[selftest] FAIL — see DIAG lines above and the summary")
 
 
 def run_alpaca(br: Bridge, feed: str = "iex"):

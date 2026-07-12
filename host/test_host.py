@@ -204,6 +204,24 @@ br.close()
 emu.stop()
 
 # ---------------------------------------------------------------------------
+print("[G5] run_selftest passes against a dual-engine board")
+import io, contextlib
+from bridge import run_selftest
+emu5 = FPGAEmulator(symbol="SPY ", fast_n=8, slow_n=32)
+br5 = Bridge(emu5.start(), "SPY", fast_n=8, slow_n=32)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    run_selftest(br5)
+out5 = buf.getvalue()
+check("selftest PASS on healthy board", "[selftest] PASS" in out5, True)
+check("both strategies signaled once",
+      (br5.fpga_by_strategy["sma"], br5.fpga_by_strategy["ema"]), (1, 1))
+check("all verified, no divergence",
+      (sum(v.verified for v in br5.verifiers.values()),
+       sum(v.divergences for v in br5.verifiers.values())), (2, 0))
+br5.close(); emu5.stop()
+
+# ---------------------------------------------------------------------------
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")
