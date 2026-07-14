@@ -43,6 +43,26 @@ python3 host/order_manager.py --port /dev/pts/N --source sim --broker mock \
 python3 host/bridge.py --port /dev/ttyUSB1 --source selftest --fast 8 --slow 32
 ```
 
+**Stopping the system:** **Ctrl+C** in the terminal running `order_manager.py`.
+It shuts down gracefully rather than just dying:
+- the bridge stops sending/reading ticks
+- the full session summary prints — echo/sent counts, per-strategy
+  verified/diverged, the comparison table, fees, and the tax estimate
+- the serial port, Alpaca WebSocket (if running), and the dashboard's HTTP
+  server all close cleanly
+- `--log`/`--audit` JSONL files get their final lines flushed and closed
+
+Press it once and wait for the summary to print before the prompt returns —
+a second Ctrl+C mid-shutdown can occasionally cut the summary off. After
+stopping, `tail audit.jsonl` shows the shutdown event and final positions,
+and `ls om.kill` should find nothing unless the kill switch tripped. If a
+dashboard tab is still open in the browser, it'll just show fetch errors
+in the console — harmless; close the tab or refresh once a new session is
+running. If Ctrl+C doesn't return control within a few seconds (rare —
+usually a serial port stuck in a bad state), Ctrl+C again, or as a last
+resort Ctrl+Z then `kill %1` from that terminal — but that skips the
+summary, so treat it as an escape hatch, not routine.
+
 ---
 
 # FPGA Tick Parser — Integration Layer (MANUAL.md §4)
