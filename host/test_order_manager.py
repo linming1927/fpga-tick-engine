@@ -45,9 +45,9 @@ def tmp(name):
     return os.path.join(tempfile.mkdtemp(), name)
 
 
-def sig(side, price_e4=1_000_000):
+def sig(side, price_e4=1_000_000, symbol="SPY"):
     return {"side": side, "price_e4": price_e4, "sma_fast": 0, "sma_slow": 0,
-            "symbol": "SPY ", "fpga_ts": 0}
+            "symbol": symbol, "fpga_ts": 0, "strategy": "sma"}
 
 
 LIM = dict(order_qty=2, max_shares=4, max_notional_e4=5_000_000,
@@ -132,8 +132,8 @@ om4 = OrderManager(broker, "SPY",
                               max_orders_per_day=99, cooldown_s=0.0,
                               require_market_hours=False),
                    audit_path=audit4, killfile=kf4)
-br.verifier.on_verified = om4.on_signal
-br.verifier.on_divergence = om4.on_divergence
+br.on_verified = om4.on_signal          # bridge-level hooks: late-bound,
+br.on_divergence = om4.on_divergence    # survive slot reconfiguration
 
 rng = random.Random(7)                      # same walk as test_host G4
 price = 1_500_000
@@ -147,8 +147,22 @@ br.pump(timeout=0.2)
 
 check("no divergence, kill still armed", om4.halted, False)
 check("signals reached the OM",
-      om4.orders + om4.blocked, br.verifier.verified)
+      om4.orders + om4.blocked,
+      sum(v.verified for v in br.verifiers.values()))
 check("fills alternate: position is 0 or 1", om4.position_qty in (0, 1), True)
+# v2: per-symbol position isolation
+d5 = tempfile.mkdtemp()
+om5 = OrderManager(MockBroker(), ["SPY", "QQQ"],
+                   RiskLimits(order_qty=1, max_shares=1,
+                              max_notional_e4=10**12, max_orders_per_day=99,
+                              cooldown_s=0.0, require_market_hours=False),
+                   audit_path=os.path.join(d5, "a.jsonl"),
+                   killfile=os.path.join(d5, "om.kill"))
+om5.on_signal(sig(SIDE_BUY, 1_000_000, "SPY"))
+om5.on_signal(sig(SIDE_BUY, 2_000_000, "QQQ"))   # long-only PER SYMBOL
+check("both symbols opened", om5.positions, {"SPY": 1, "QQQ": 1})
+om5.on_signal(sig(SIDE_SELL, 1_100_000, "QQQ"))
+check("QQQ closed, SPY untouched", om5.positions, {"SPY": 1, "QQQ": 0})
 sides = [f["side"] for f in broker.fills]
 check("first fill is a buy (long-only)", sides[0] if sides else None, "buy")
 check("no two consecutive same-side fills",
@@ -160,7 +174,7 @@ check("audit has startup", "startup" in events, True)
 check("audit fills match broker", events.count("order_filled"),
       len(broker.fills))
 check("audit records the refusals too", events.count("blocked"), om4.blocked)
-print(f"       {br.verifier.verified} verified signals -> "
+print(f"       {sum(v.verified for v in br.verifiers.values())} verified signals -> "
       f"{om4.orders} fills, {om4.blocked} blocked "
       f"(SELL-when-flat before first cross, etc.)")
 

@@ -38,7 +38,7 @@ module top_arty #(
     parameter int          BAUD           = 115_200,
     parameter int          TX_FIFO_DEPTH  = 16,      // echo FIFO; power of 2
     parameter int          SIG_FIFO_DEPTH = 4,       // signal FIFO; power of 2
-    parameter logic [31:0] TARGET_SYMBOL  = "SPY ",  // both engines' symbol
+    parameter logic [47:0] DEFAULT_SYM0   = "SPY   ", // slot 0 reset value
     parameter int          FAST_N         = 8,       // fast SMA window (pow 2)
     parameter int          SLOW_N         = 32,      // slow SMA window (pow 2)
     parameter int          EMA_KF         = 3,       // fast EMA: alpha 2^-KF
@@ -93,7 +93,7 @@ module top_arty #(
     );
 
     logic [7:0]  msg_type;
-    logic [31:0] symbol;
+    logic [47:0] symbol;
     logic [31:0] price;
     logic [15:0] qty;
     logic [7:0]  side;
@@ -141,7 +141,7 @@ module top_arty #(
     //-------------------------------------------------------------------------
     (* mark_debug = "true" *) logic        tick_valid;
     (* mark_debug = "true" *) logic [7:0]  tick_type;
-    (* mark_debug = "true" *) logic [31:0] tick_symbol;
+    (* mark_debug = "true" *) logic [47:0] tick_symbol;
     (* mark_debug = "true" *) logic [31:0] tick_price;
     (* mark_debug = "true" *) logic [15:0] tick_qty;
     (* mark_debug = "true" *) logic [7:0]  tick_side;
@@ -176,143 +176,105 @@ module top_arty #(
     end
 
     //-------------------------------------------------------------------------
-    // Indicator engine: SMA crossover on TARGET_SYMBOL trades. The template
-    // comment that used to sit here became this instantiation — the tick_*
-    // bus was its negotiated interface all along.
+    // v2.0: runtime symbol register file (8 slots, written by TYPE 0x10
+    // frames — see symcfg.sv) feeding 8 parallel instances of EACH engine.
+    // One tick carries one symbol, so at most one slot per strategy fires
+    // per tick (host enforces slot uniqueness); a lowest-slot priority
+    // encoder folds the 8 lanes into one record per strategy.
     //-------------------------------------------------------------------------
-    (* mark_debug = "true" *) logic        signal_valid;
-    (* mark_debug = "true" *) logic [7:0]  signal_side;
-    (* mark_debug = "true" *) logic [31:0] signal_price;
-    (* mark_debug = "true" *) logic [31:0] sma_fast;
-    (* mark_debug = "true" *) logic [31:0] sma_slow;
-    (* mark_debug = "true" *) logic        smas_valid;
-    logic [63:0] signal_host_ts, signal_fpga_ts;
+    logic [7:0]   slot_valid;
+    logic [7:0]   slot_wr;
+    logic [383:0] slots_flat;      // slot g at [g*48 +: 48] — see symcfg.sv
 
-    indicator_engine #(
-        .TARGET_SYMBOL ( TARGET_SYMBOL ),
-        .FAST_N        ( FAST_N        ),
-        .SLOW_N        ( SLOW_N        )
-    ) u_indicator (
-        .clk            ( clk100         ),
-        .rst_n          ( rst_n          ),
-        .tick_valid     ( tick_valid     ),
-        .msg_type       ( tick_type      ),
-        .symbol         ( tick_symbol    ),
-        .price          ( tick_price     ),
-        .host_ts        ( tick_host_ts   ),
-        .fpga_ts        ( tick_fpga_ts   ),
-        .signal_valid   ( signal_valid   ),
-        .signal_side    ( signal_side    ),
-        .signal_price   ( signal_price   ),
-        .signal_host_ts ( signal_host_ts ),
-        .signal_fpga_ts ( signal_fpga_ts ),
-        .sma_fast       ( sma_fast       ),
-        .sma_slow       ( sma_slow       ),
-        .smas_valid     ( smas_valid     )
+    symcfg #( .DEFAULT_SYM0 ( DEFAULT_SYM0 ) ) u_symcfg (
+        .clk        ( clk100      ),
+        .rst_n      ( rst_n       ),
+        .tick_valid ( tick_valid  ),
+        .msg_type   ( tick_type   ),
+        .symbol     ( tick_symbol ),
+        .qty        ( tick_qty    ),
+        .side       ( tick_side   ),
+        .slot_valid ( slot_valid  ),
+        .slot_wr    ( slot_wr     ),
+        .slots_flat ( slots_flat  )
     );
 
+    logic [7:0]  sma_v_a, ema_v_a;
+    logic [47:0] sma_sym_a [0:7];   logic [47:0] ema_sym_a [0:7];
+    logic [7:0]  sma_side_a [0:7];  logic [7:0]  ema_side_a [0:7];
+    logic [31:0] sma_price_a [0:7]; logic [31:0] ema_price_a [0:7];
+    logic [63:0] sma_fts_a [0:7];   logic [63:0] ema_fts_a [0:7];
+    logic [31:0] sma_f_a [0:7], sma_s_a [0:7];
+    logic [31:0] ema_f_a [0:7], ema_s_a [0:7];
+
+    generate
+        for (genvar g = 0; g < 8; g++) begin : g_engines
+            indicator_engine #(
+                .FAST_N ( FAST_N ), .SLOW_N ( SLOW_N )
+            ) u_sma (
+                .clk(clk100), .rst_n(rst_n),
+                .target_symbol ( slots_flat[g*48 +: 48] ),
+                .slot_en       ( slot_valid[g] ),
+                .state_rst     ( slot_wr[g]    ),
+                .tick_valid(tick_valid), .msg_type(tick_type),
+                .symbol(tick_symbol), .price(tick_price),
+                .host_ts(tick_host_ts), .fpga_ts(tick_fpga_ts),
+                .signal_valid(sma_v_a[g]), .signal_symbol(sma_sym_a[g]),
+                .signal_side(sma_side_a[g]), .signal_price(sma_price_a[g]),
+                .signal_host_ts(), .signal_fpga_ts(sma_fts_a[g]),
+                .sma_fast(sma_f_a[g]), .sma_slow(sma_s_a[g]),
+                .smas_valid()
+            );
+            ema_engine #(
+                .K_FAST ( EMA_KF ), .K_SLOW ( EMA_KS ),
+                .WARMUP_N ( EMA_WARMUP )
+            ) u_ema (
+                .clk(clk100), .rst_n(rst_n),
+                .target_symbol ( slots_flat[g*48 +: 48] ),
+                .slot_en       ( slot_valid[g] ),
+                .state_rst     ( slot_wr[g]    ),
+                .tick_valid(tick_valid), .msg_type(tick_type),
+                .symbol(tick_symbol), .price(tick_price),
+                .host_ts(tick_host_ts), .fpga_ts(tick_fpga_ts),
+                .signal_valid(ema_v_a[g]), .signal_symbol(ema_sym_a[g]),
+                .signal_side(ema_side_a[g]), .signal_price(ema_price_a[g]),
+                .signal_host_ts(), .signal_fpga_ts(ema_fts_a[g]),
+                .ema_fast(ema_f_a[g]), .ema_slow(ema_s_a[g]),
+                .emas_valid()
+            );
+        end
+    endgenerate
+
     //-------------------------------------------------------------------------
-    // Second strategy: EMA crossover, running in PARALLEL on the same
-    // tick_* bus. Record type 0x04 -> 0x84 on the wire. Same symbol and a
-    // warm-up matched to the SMA's SLOW_N so both come online together and
-    // a session scores the two strategies from identical data.
+    // Per-strategy lowest-slot priority encoder -> one record per strategy,
+    // then the existing SMA-vs-EMA same-cycle pend arbiter (unchanged logic,
+    // wider records: REC_W = 8+48+32+16+8+64+64 = 240).
     //-------------------------------------------------------------------------
-    (* mark_debug = "true" *) logic        ema_sig_valid;
-    (* mark_debug = "true" *) logic [7:0]  ema_sig_side;
-    (* mark_debug = "true" *) logic [31:0] ema_sig_price;
-    (* mark_debug = "true" *) logic [31:0] ema_fast;
-    (* mark_debug = "true" *) logic [31:0] ema_slow;
-    logic [63:0] ema_sig_host_ts, ema_sig_fpga_ts;
-    logic        emas_valid;
+    localparam int REC_W = 240;
 
-    ema_engine #(
-        .TARGET_SYMBOL ( TARGET_SYMBOL ),
-        .K_FAST        ( EMA_KF        ),
-        .K_SLOW        ( EMA_KS        ),
-        .WARMUP_N      ( EMA_WARMUP    )
-    ) u_ema (
-        .clk            ( clk100          ),
-        .rst_n          ( rst_n           ),
-        .tick_valid     ( tick_valid      ),
-        .msg_type       ( tick_type       ),
-        .symbol         ( tick_symbol     ),
-        .price          ( tick_price      ),
-        .host_ts        ( tick_host_ts    ),
-        .fpga_ts        ( tick_fpga_ts    ),
-        .signal_valid   ( ema_sig_valid   ),
-        .signal_side    ( ema_sig_side    ),
-        .signal_price   ( ema_sig_price   ),
-        .signal_host_ts ( ema_sig_host_ts ),
-        .signal_fpga_ts ( ema_sig_fpga_ts ),
-        .ema_fast       ( ema_fast        ),
-        .ema_slow       ( ema_slow        ),
-        .emas_valid     ( emas_valid      )
-    );
+    logic             signal_valid, ema_sig_valid;
+    logic [REC_W-1:0] sma_rec, ema_rec;
 
-    //-------------------------------------------------------------------------
-    // TX chain: tick record -> FIFO -> frame serializer -> UART out
-    //-------------------------------------------------------------------------
-    localparam int REC_W = 224;   // 8+32+32+16+8+64+64
-
-    logic [REC_W-1:0] fifo_wr_data, fifo_rd_data;
-    logic             fifo_full, fifo_empty, fifo_rd_en;
-
-    assign fifo_wr_data = { tick_type, tick_symbol, tick_price,
-                            tick_qty, tick_side, tick_host_ts, tick_fpga_ts };
-
-    sync_fifo #(
-        .WIDTH ( REC_W         ),
-        .DEPTH ( TX_FIFO_DEPTH )
-    ) u_tx_fifo (
-        .clk     ( clk100       ),
-        .rst_n   ( rst_n        ),
-        .wr_en   ( tick_valid   ),   // write attempted on every decoded tick
-        .wr_data ( fifo_wr_data ),
-        .full    ( fifo_full    ),
-        .rd_data ( fifo_rd_data ),
-        .rd_en   ( fifo_rd_en   ),
-        .empty   ( fifo_empty   )
-    );
-
-    // drop accounting: a tick that lands while the FIFO is full is lost from
-    // the echo stream (never from the tick_* bus). Saturating, ILA-readable.
-    (* mark_debug = "true" *) logic [15:0] tx_drop_count;
-
-    always_ff @(posedge clk100) begin
-        if (!rst_n)
-            tx_drop_count <= '0;
-        else if (tick_valid && fifo_full && tx_drop_count != 16'hFFFF)
-            tx_drop_count <= tx_drop_count + 1'b1;
+    always_comb begin
+        signal_valid = |sma_v_a;
+        sma_rec = '0;
+        for (int i = 7; i >= 0; i--)
+            if (sma_v_a[i])
+                sma_rec = { 8'h03, sma_sym_a[i], sma_price_a[i],
+                            16'h0000, sma_side_a[i],
+                            sma_f_a[i], sma_s_a[i], sma_fts_a[i] };
+        ema_sig_valid = |ema_v_a;
+        ema_rec = '0;
+        for (int i = 7; i >= 0; i--)
+            if (ema_v_a[i])
+                ema_rec = { 8'h04, ema_sym_a[i], ema_price_a[i],
+                            16'h0000, ema_side_a[i],
+                            ema_f_a[i], ema_s_a[i], ema_fts_a[i] };
     end
 
-    //-------------------------------------------------------------------------
-    // Signal FIFO — small, HI priority at the serializer. Record type 0x03
-    // (-> 0x83 on the wire). TS_A field carries the FPGA-computed SMAs
-    // (tagged union, see frame_tx.sv header). Signals are rare events, so
-    // this FIFO essentially never fills — but the drop counter exists
-    // anyway, because "essentially never" is an assumption, and assumptions
-    // get counters.
-    //-------------------------------------------------------------------------
     logic [REC_W-1:0] sig_rd_data;
     logic             sig_full, sig_empty, sig_rd_en;
 
-    logic [REC_W-1:0] sma_rec, ema_rec;
-    assign sma_rec = { 8'h03, TARGET_SYMBOL, signal_price,
-                       16'h0000, signal_side,
-                       sma_fast, sma_slow,            // TS_A slot: SMA pair
-                       signal_fpga_ts };
-    assign ema_rec = { 8'h04, TARGET_SYMBOL, ema_sig_price,
-                       16'h0000, ema_sig_side,
-                       ema_fast, ema_slow,            // TS_A slot: EMA pair
-                       ema_sig_fpga_ts };
-
-    // Two writers, one FIFO port. Both engines can fire on the SAME tick
-    // (both pipelines are 3 stages deep, so their pulses land on the same
-    // cycle) — the FIFO accepts one write per cycle, so a same-cycle
-    // collision writes the SMA record now and holds the EMA record in a
-    // one-deep pend register for the next cycle. Signals from consecutive
-    // ticks are ~191k cycles apart, so the pend register can never be
-    // occupied when a new collision arrives.
     logic             pend_v;
     logic [REC_W-1:0] pend_d;
     logic             sig_wr_en;
@@ -331,12 +293,47 @@ module top_arty #(
             pend_d <= '0;
         end else begin
             if (signal_valid && ema_sig_valid) begin
-                pend_v <= 1'b1;                 // collision: park the EMA rec
+                pend_v <= 1'b1;
                 pend_d <= ema_rec;
             end else if (pend_v && !signal_valid && !ema_sig_valid) begin
-                pend_v <= 1'b0;                 // parked record written above
+                pend_v <= 1'b0;
             end
         end
+    end
+
+    //-------------------------------------------------------------------------
+    // Echo FIFO (LO priority): every decoded frame — trades, quotes, and
+    // symcfg commands — is echoed to the host. A symcfg echo (wire 0x90)
+    // is the host's configuration ACK: it reads back the slot index and
+    // symbol the fabric actually latched.
+    //-------------------------------------------------------------------------
+    logic [REC_W-1:0] fifo_wr_data, fifo_rd_data;
+    logic             fifo_full, fifo_empty, fifo_rd_en;
+
+    assign fifo_wr_data = { tick_type, tick_symbol, tick_price,
+                            tick_qty, tick_side, tick_host_ts, tick_fpga_ts };
+
+    sync_fifo #(
+        .WIDTH ( REC_W         ),
+        .DEPTH ( TX_FIFO_DEPTH )
+    ) u_tx_fifo (
+        .clk     ( clk100       ),
+        .rst_n   ( rst_n        ),
+        .wr_en   ( tick_valid   ),
+        .wr_data ( fifo_wr_data ),
+        .full    ( fifo_full    ),
+        .rd_data ( fifo_rd_data ),
+        .rd_en   ( fifo_rd_en   ),
+        .empty   ( fifo_empty   )
+    );
+
+    (* mark_debug = "true" *) logic [15:0] tx_drop_count;
+
+    always_ff @(posedge clk100) begin
+        if (!rst_n)
+            tx_drop_count <= '0;
+        else if (tick_valid && fifo_full && tx_drop_count != 16'hFFFF)
+            tx_drop_count <= tx_drop_count + 1'b1;
     end
 
     sync_fifo #(

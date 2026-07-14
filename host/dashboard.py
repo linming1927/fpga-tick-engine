@@ -41,7 +41,9 @@ class DashboardServer:
         self.scorecards = scorecards
         self.port = port
         self._lock = threading.Lock()
-        self._series = deque(maxlen=points)     # (price, smaf, smas, warmed)
+        self._points = points
+        self._series = {}                       # symbol -> deque of 7-tuples
+        self.chart_symbol = bridge.symbol
         self._signals = deque(maxlen=20)
         self._events = deque(maxlen=30)
         self._last_echo_t = 0.0
@@ -52,18 +54,22 @@ class DashboardServer:
 
     # ---- feed hooks (called from bridge threads) ------------------------------
     def _on_echo(self, fr: dict):
-        m = self.bridge.models["sma"]
-        e = self.bridge.models["ema"]
+        sym = fr["symbol"].strip()
+        m = self.bridge.models["sma"].get(sym)
+        e = self.bridge.models["ema"].get(sym)
+        if m is None:
+            return
         with self._lock:
-            self._series.append((fr["price_e4"], m.sma_fast, m.sma_slow,
-                                 m.warmed_up, e.ema_fast, e.ema_slow,
-                                 e.warmed_up))
+            d = self._series.setdefault(sym, deque(maxlen=self._points))
+            d.append((fr["price_e4"], m.sma_fast, m.sma_slow, m.warmed_up,
+                      e.ema_fast, e.ema_slow, e.warmed_up))
             self._last_echo_t = time.time()
 
     def on_signal(self, fr: dict):
         with self._lock:
             self._signals.appendleft({"t": time.strftime("%H:%M:%S"),
                                       "strategy": fr.get("strategy", "sma"),
+                                      "symbol": fr["symbol"].strip(),
                                       "side": fr["side"],
                                       "price_e4": fr["price_e4"],
                                       "sma_fast": fr["sma_fast"],
@@ -77,19 +83,25 @@ class DashboardServer:
                 self._last_trouble_t = time.time()
 
     # ---- snapshot for the poll ---------------------------------------------------
-    def snapshot(self) -> dict:
+    def snapshot(self, sym: str | None = None) -> dict:
         br, om = self.bridge, self.om
+        sym = (sym or self.chart_symbol).strip().upper()
+        if sym not in br.models["sma"]:
+            sym = br.symbol
+        self.chart_symbol = sym
+        m = br.models["sma"][sym]
         now = time.time()
         rtt = sorted(br.rtt_us[-200:]) if br.rtt_us else []
         with self._lock:
-            series = list(self._series)
+            series = list(self._series.get(sym, ()))
             signals = list(self._signals)
             events = list(self._events)
             echo_age = now - self._last_echo_t if self._last_echo_t else 1e9
             trouble_age = (now - self._last_trouble_t
                            if self._last_trouble_t else 1e9)
         return {
-            "symbol": om.symbol,
+            "symbol": sym,
+            "symbols": list(br.symbols),
             "uptime_s": int(now - self.t0),
             "series": series,
             "signals": signals,
@@ -105,11 +117,11 @@ class DashboardServer:
                  "wins": c.wins, "net": round(c.net_usd, 2),
                  "open": c.open_e4 is not None}
                 for c in (self.scorecards or {}).values()],
-            "warmed_up": br.model.warmed_up,
-            "fill": br.model.fill, "slow_n": br.model.slow_n,
+            "warmed_up": m.warmed_up,
+            "fill": m.fill, "slow_n": m.slow_n,
             "rtt": {"min": rtt[0], "med": rtt[len(rtt)//2],
                     "max": rtt[-1]} if rtt else None,
-            "position": om.position_qty,
+            "positions": {k: v for k, v in om.positions.items() if v},
             "orders": om.orders, "blocked": om.blocked,
             "pnl_gross": om.costs.realized_pnl_usd,
             "fees": om.costs.total_fees,
@@ -138,14 +150,46 @@ class DashboardServer:
             def do_GET(self):
                 if self.path == "/":
                     self._send(200, PAGE.encode(), "text/html; charset=utf-8")
-                elif self.path == "/api/state":
-                    self._send(200, json.dumps(dash.snapshot()).encode(),
+                elif self.path.startswith("/api/state"):
+                    q = self.path.split("sym=")
+                    sym = q[1] if len(q) > 1 else None
+                    self._send(200, json.dumps(dash.snapshot(sym)).encode(),
                                "application/json")
                 else:
                     self._send(404, b"not found", "text/plain")
 
             def do_POST(self):
-                if self.path == "/api/kill":
+                if self.path == "/api/symbols":
+                    # GUI symbol editor -> FPGA slot registers over UART.
+                    # configure_symbols blocks until all 8 slots ACK (0x90
+                    # echoes), so the HTTP response reports ground truth:
+                    # what the fabric actually latched, not what we asked.
+                    n = int(self.headers.get("Content-Length", 0))
+                    try:
+                        req = json.loads(self.rfile.read(n) or "{}")
+                        syms = [t for t in req.get("symbols", [])
+                                if t and t.strip()]
+                        from tick_protocol import sym_wire
+                        for t in syms:
+                            sym_wire(t)            # validate before sending
+                        ok = bool(syms) and dash.bridge.configure_symbols(syms)
+                    except (ValueError, json.JSONDecodeError) as e:
+                        self._send(400, json.dumps(
+                            {"ok": False, "error": str(e)}).encode(),
+                            "application/json")
+                        return
+                    if ok:
+                        dash.on_event("slots reconfigured: "
+                                      + ",".join(dash.bridge.symbols))
+                        with dash._lock:
+                            dash._series.clear()   # new models = new warmup
+                    else:
+                        dash.on_event("slot reconfiguration FAILED", True)
+                    self._send(200, json.dumps(
+                        {"ok": ok,
+                         "symbols": list(dash.bridge.symbols)}).encode(),
+                        "application/json")
+                elif self.path == "/api/kill":
                     dash.om.halt("manual kill from dashboard")
                     dash.on_event("KILL SWITCH — manual, from dashboard",
                                   bad=True)
@@ -220,6 +264,15 @@ td:first-child,th:first-child{text-align:left}
 .log{font-size:11px;max-height:180px;overflow-y:auto}
 .log div{padding:2px 0;border-bottom:1px solid var(--line);color:var(--dim)}
 .log .bad{color:var(--red)}
+.slot{background:var(--bg);border:1px solid var(--line);color:var(--amber);
+  font:inherit;width:76px;padding:5px 7px;border-radius:4px;
+  text-transform:uppercase}
+#apply{background:none;border:1px solid var(--green);color:var(--green);
+  font:inherit;letter-spacing:.12em;padding:5px 14px;border-radius:4px;
+  cursor:pointer}
+#cfgmsg{color:var(--dim);font-size:11px;align-self:center}
+#csym{background:var(--bg);border:1px solid var(--line);color:var(--ink);
+  font:inherit;padding:2px 6px;border-radius:4px;margin-left:8px}
 .killwrap{margin-top:14px;display:flex;align-items:center;gap:12px}
 #kill{background:none;border:2px solid var(--red);color:var(--red);
   font:inherit;font-weight:700;letter-spacing:.2em;padding:10px 22px;
@@ -243,9 +296,19 @@ td:first-child,th:first-child{text-align:left}
   </div>
 </header>
 <div id="banner"></div>
+<div class="panel" style="margin-bottom:14px"><h2>SYMBOL SLOTS — WRITTEN TO FPGA OVER UART (8 MAX)</h2>
+  <div id="slots" style="display:flex;gap:8px;flex-wrap:wrap">
+    <input class="slot" maxlength="6"><input class="slot" maxlength="6">
+    <input class="slot" maxlength="6"><input class="slot" maxlength="6">
+    <input class="slot" maxlength="6"><input class="slot" maxlength="6">
+    <input class="slot" maxlength="6"><input class="slot" maxlength="6">
+    <button id="apply">APPLY</button><span id="cfgmsg"></span>
+  </div>
+</div>
 <div class="stats" id="stats"></div>
 <div class="grid">
-  <div class="panel"><h2>PRICE / SMA / EMA — LAST 240 TICKS</h2>
+  <div class="panel"><h2>PRICE / SMA / EMA — LAST 240 TICKS
+      <select id="csym"></select></h2>
     <canvas id="chart"></canvas>
     <div class="legend"><b class="k-price">— price</b>
       <b class="k-f">— sma fast</b><b class="k-s">— sma slow</b>
@@ -255,8 +318,9 @@ td:first-child,th:first-child{text-align:left}
   </div>
   <div>
     <div class="panel"><h2>SIGNALS</h2>
-      <table><thead><tr><th>t</th><th>strat</th><th>side</th><th>price</th>
-      <th>fast</th><th>slow</th></tr></thead><tbody id="sigs"></tbody></table>
+      <table><thead><tr><th>t</th><th>sym</th><th>strat</th><th>side</th>
+      <th>price</th><th>fast</th><th>slow</th></tr></thead>
+      <tbody id="sigs"></tbody></table>
     </div>
     <div class="panel" style="margin-top:14px"><h2>EVENTS</h2>
       <div class="log" id="log"><div>console up — waiting for ticks</div></div>
@@ -314,6 +378,21 @@ function drawChart(series,signals){
 function stat(label,val,cls){return '<div class="stat '+(cls||'')+'">'+
   '<small>'+label+'</small><b>'+val+'</b></div>';}
 
+let slotsSeeded=false,chartSym=null;
+document.getElementById('csym').onchange=e=>{chartSym=e.target.value};
+document.getElementById('apply').onclick=async()=>{
+  const syms=[...document.querySelectorAll('.slot')]
+    .map(i=>i.value.trim().toUpperCase()).filter(v=>v);
+  $('cfgmsg').textContent='writing slots + waiting for FPGA acks…';
+  try{
+    const r=await(await fetch('/api/symbols',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbols:syms})})).json();
+    $('cfgmsg').textContent=r.ok?'acked: '+r.symbols.join(', ')
+      :(r.error||'FAILED — see events');
+    if(r.ok){chartSym=r.symbols[0];slotsSeeded=false;}
+  }catch(e){$('cfgmsg').textContent='error: '+e;}
+};
 let killArmed=false,killTimer=null;
 $('kill').onclick=async()=>{
   if(!killArmed){killArmed=true;$('kill').classList.add('armed');
@@ -327,7 +406,14 @@ $('kill').onclick=async()=>{
 
 async function poll(){
   try{
-    const s=await (await fetch('/api/state')).json();
+    const s=await (await fetch('/api/state'+
+      (chartSym?'?sym='+chartSym:''))).json();
+    if(!slotsSeeded&&s.symbols){
+      const boxes=document.querySelectorAll('.slot');
+      s.symbols.forEach((t,i)=>{if(boxes[i])boxes[i].value=t;});
+      $('csym').innerHTML=s.symbols.map(t=>'<option'+
+        (t===s.symbol?' selected':'')+'>'+t+'</option>').join('');
+      slotsSeeded=true;}
     $('sym').textContent=s.symbol+' · up '+
       Math.floor(s.uptime_s/60)+'m'+(s.uptime_s%60)+'s';
     $('warm').textContent=s.warmed_up?'SMA windows full':
@@ -340,7 +426,9 @@ async function poll(){
       $('kill').disabled=true;$('kill').textContent='TRIPPED';
       $('killhint').textContent='delete om.kill and restart to re-arm';}
     $('stats').innerHTML=
-      stat('POSITION',s.position+' sh','pos')+
+      stat('POSITIONS',Object.keys(s.positions).length?
+           Object.entries(s.positions).map(([k,v])=>k+':'+v).join(' '):
+           'flat','pos')+
       stat('NET P&L',money(s.pnl_net),s.pnl_net>=0?'good':'bad')+
       stat('FEES',money(s.fees))+
       stat('FILLS / BLOCKED',s.orders+' / '+s.blocked)+
@@ -358,6 +446,7 @@ async function poll(){
         (c.net>=0?'buy':'sell')+'">'+c.net.toFixed(2)+
         '</td></tr>').join('')+'</tbody></table>';
     $('sigs').innerHTML=s.signals.map(x=>'<tr><td>'+x.t+'</td>'+
+      '<td>'+x.symbol+'</td>'+
       '<td>'+x.strategy.toUpperCase()+'</td>'+
       '<td class="'+(x.side===1?'buy">BUY':'sell">SELL')+'</td>'+
       '<td>'+usd(x.price_e4)+'</td><td>'+usd(x.sma_fast)+'</td>'+

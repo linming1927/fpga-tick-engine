@@ -3,15 +3,16 @@
 //
 // Wire format (MANUAL.md §2), all multi-byte fields big-endian:
 //
-//   Offset  Field    Size
+//   Offset  Field    Size          (wire format v2 — 24 bytes)
 //     0     SOF      1  (0xAA)
-//     1     TYPE     1  (0x01 trade / 0x02 quote)
-//    2-5    SYMBOL   4  (ASCII, MSB first, space padded)
-//    6-9    PRICE    4  (uint32, price x 10000)
-//   10-11   QTY      2  (uint16)
-//    12     SIDE     1  (0x01 buy / 0x02 sell / 0x00 neutral)
-//   13-20   TSTAMP   8  (uint64, host microseconds)
-//    21     EOF      1  (0x55)
+//     1     TYPE     1  (0x01 trade / 0x02 quote / 0x10 symbol config)
+//    2-7    SYMBOL   6  (ASCII, MSB first, space padded — fits every
+//                        S&P 500 ticker incl. GOOGL, BRK.B)
+//    8-11   PRICE    4  (uint32, price x 10000)
+//   12-13   QTY      2  (uint16; for TYPE 0x10: bits[2:0] = slot index)
+//    14     SIDE     1  (trade side; for TYPE 0x10: 0x01 set / 0x00 clear)
+//   15-22   TSTAMP   8  (uint64, host microseconds)
+//    23     EOF      1  (0x55)
 //
 // Behavior:
 //   * Outputs latch ONLY on a good EOF -> msg_valid pulses one cycle.
@@ -37,7 +38,7 @@ module tick_parser (
 
     // decoded tick, stable between msg_valid pulses
     output logic [7:0]  msg_type,     // 0x01 trade / 0x02 quote
-    output logic [31:0] symbol,       // 4 ASCII bytes packed, MSB first
+    output logic [47:0] symbol,       // 6 ASCII bytes packed, MSB first
     output logic [31:0] price,        // price x 10000
     output logic [15:0] qty,          // share count
     output logic [7:0]  side,         // 0x01 buy / 0x02 sell / 0x00 neutral
@@ -58,7 +59,7 @@ module tick_parser (
 
     // working accumulators — assembled by left-shift (big-endian on the wire)
     logic [7:0]  r_type;
-    logic [31:0] r_symbol;
+    logic [47:0] r_symbol;
     logic [31:0] r_price;
     logic [15:0] r_qty;
     logic [7:0]  r_side;
@@ -113,8 +114,8 @@ module tick_parser (
                     // Multi-byte fields: shift left 8, OR new byte into LSB.
                     // After N bytes the register holds the big-endian value.
                     S_SYMBOL: begin
-                        r_symbol <= { r_symbol[23:0], rx_data };
-                        if (byte_cnt == 3'd3) begin
+                        r_symbol <= { r_symbol[39:0], rx_data };
+                        if (byte_cnt == 3'd5) begin
                             state    <= S_PRICE;
                             byte_cnt <= '0;
                         end else begin

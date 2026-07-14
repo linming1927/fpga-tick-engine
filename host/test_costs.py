@@ -84,19 +84,25 @@ check("gross mode taxable base", t_tax["taxable_base"], 100_000 - 32_200)
 # ---------------------------------------------------------------------------
 print("[G4] CostTracker P&L accounting")
 ct = CostTracker()
-check("buy returns no fees", ct.on_fill("buy", 2, 1_000_000), None)   # $100
-fees = ct.on_fill("sell", 2, 1_100_000)                               # $110
+check("buy returns no fees", ct.on_fill("buy", 2, 1_000_000, "SPY"), None)
+fees = ct.on_fill("sell", 2, 1_100_000, "SPY")
 check("sell returns fee dict", fees is not None, True)
 check("realized P&L $20", ct.realized_pnl_usd, 20.0)                  # 2 x $10
 check("fees accumulated", ct.total_fees > 0, True)
 check("net = gross - fees", ct.net_pnl_usd, 20.0 - ct.total_fees)
-check("position closed resets entry", ct._entry_qty, 0)
+check("position closed resets entry", ct._entries["SPY"][0], 0)
 # averaging: two buys at different prices
 ct2 = CostTracker()
-ct2.on_fill("buy", 1, 1_000_000)
-ct2.on_fill("buy", 1, 2_000_000)
-ct2.on_fill("sell", 2, 1_500_000)                # sell at exactly the average
+ct2.on_fill("buy", 1, 1_000_000, "SPY")
+ct2.on_fill("buy", 1, 2_000_000, "SPY")
+ct2.on_fill("sell", 2, 1_500_000, "SPY")         # sell at exactly the average
 check("avg-entry P&L is zero", ct2.realized_pnl_usd, 0.0)
+# v2: entries are independent per symbol
+ct3 = CostTracker()
+ct3.on_fill("buy", 1, 1_000_000, "SPY")
+ct3.on_fill("buy", 1, 5_000_000, "QQQ")
+ct3.on_fill("sell", 1, 1_100_000, "SPY")     # +$10 vs SPY entry, not QQQ's
+check("per-symbol entries isolated", ct3.realized_pnl_e4, 100_000)
 
 # report renders with and without income
 r = ct.report(None)

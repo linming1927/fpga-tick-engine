@@ -25,7 +25,8 @@ module tb_top_integration;
 
     // ---- clock / DUT ---------------------------------------------------------
     localparam int CLK_HZ      = 100_000_000;
-    localparam int BAUD        = 115_200;
+    localparam int BAUD        = 1_152_000;  // 10x sim speed (see note in
+                                            // tb_tx_integration.sv)
     localparam real CLK_PERIOD = 10.0;                       // ns
     localparam real BIT_NS     = 1e9 / BAUD;                 // 8680.6 ns / bit
 
@@ -94,7 +95,7 @@ module tb_top_integration;
 
     task automatic send_frame(
         input logic [7:0]  ftype,
-        input logic [31:0] fsym,
+        input logic [47:0] fsym,
         input logic [31:0] fprice,
         input logic [15:0] fqty,
         input logic [7:0]  fside,
@@ -103,7 +104,7 @@ module tb_top_integration;
     );
         uart_send_byte(8'hAA);                       // SOF
         uart_send_byte(ftype);
-        for (int i = 3; i >= 0; i--) uart_send_byte(fsym[8*i +: 8]);
+        for (int i = 5; i >= 0; i--) uart_send_byte(fsym[8*i +: 8]);
         for (int i = 3; i >= 0; i--) uart_send_byte(fprice[8*i +: 8]);
         for (int i = 1; i >= 0; i--) uart_send_byte(fqty[8*i +: 8]);
         uart_send_byte(fside);
@@ -135,12 +136,12 @@ module tb_top_integration;
 
         //-----------------------------------------------------------------------
         $display("\n[T1] Valid trade: AAPL $182.34 x 100 BUY");
-        send_frame(8'h01, "AAPL", 32'd1_823_400, 16'd100, 8'h01,
+        send_frame(8'h01, "AAPL  ", 32'd1_823_400, 16'd100, 8'h01,
                    64'd1_750_000_000_123_456, 8'h55);
         repeat (10) @(posedge clk100);
 
         check64("msg_type",    {56'd0, dut.msg_type},   64'h01);
-        check64("symbol",      {32'd0, dut.symbol},     {32'd0, 32'h4141_504C});
+        check64("symbol",      {16'd0, dut.symbol},     {16'd0, 48'h4141_504C_2020});
         check64("price",       {32'd0, dut.price},      64'd1_823_400);
         check64("qty",         {48'd0, dut.qty},        64'd100);
         check64("side",        {56'd0, dut.side},       64'h01);
@@ -155,12 +156,12 @@ module tb_top_integration;
 
         //-----------------------------------------------------------------------
         $display("\n[T3] Valid quote: TSLA $248.99 x 250 SELL");
-        send_frame(8'h02, "TSLA", 32'd2_489_900, 16'd250, 8'h02,
+        send_frame(8'h02, "TSLA  ", 32'd2_489_900, 16'd250, 8'h02,
                    64'd1_750_000_001_000_000, 8'h55);
         repeat (10) @(posedge clk100);
 
         check64("msg_type", {56'd0, dut.msg_type}, 64'h02);
-        check64("symbol",   {32'd0, dut.symbol},   {32'd0, 32'h54534C41});
+        check64("symbol",   {16'd0, dut.symbol},   {16'd0, 48'h5453_4C41_2020});
         check64("price",    {32'd0, dut.price},    64'd2_489_900);
         check64("qty",      {48'd0, dut.qty},      64'd250);
         check64("side",     {56'd0, dut.side},     64'h02);
@@ -178,13 +179,13 @@ module tb_top_integration;
 
         //-----------------------------------------------------------------------
         $display("\n[T4] Corrupted EOF (0xFF): error counted, outputs held at T3");
-        send_frame(8'h01, "NVDA", 32'd9_999_999, 16'd1, 8'h01,
+        send_frame(8'h01, "NVDA  ", 32'd9_999_999, 16'd1, 8'h01,
                    64'd1_750_000_002_000_000, 8'hFF);        // bad EOF
         repeat (10) @(posedge clk100);
 
         check64("parse_error count", parse_error_seen,      64'd1);
         check64("error counter reg", {48'd0, dut.parse_error_count}, 64'd1);
-        check64("symbol still TSLA", {32'd0, dut.symbol},   {32'd0, 32'h54534C41});
+        check64("symbol still TSLA", {16'd0, dut.symbol},   {16'd0, 48'h5453_4C41_2020});
         check64("price still TSLA",  {32'd0, dut.price},    64'd2_489_900);
         if (led[0] === 1'b1) begin
             pass_count++;  $display("  PASS  LED0 lit on parse_error (stretched)");
@@ -194,11 +195,11 @@ module tb_top_integration;
 
         //-----------------------------------------------------------------------
         $display("\n[T5] Recovery: valid SPY frame immediately after the bad one");
-        send_frame(8'h01, "SPY ", 32'd5_000_000, 16'd500, 8'h01,
+        send_frame(8'h01, "SPY   ", 32'd5_000_000, 16'd500, 8'h01,
                    64'd1_750_000_003_000_000, 8'h55);
         repeat (10) @(posedge clk100);
 
-        check64("symbol",  {32'd0, dut.symbol}, {32'd0, 32'h53505920});
+        check64("symbol",  {16'd0, dut.symbol}, {16'd0, 48'h5350_5920_2020});
         check64("price",   {32'd0, dut.price},  64'd5_000_000);
         check64("qty",     {48'd0, dut.qty},    64'd500);
         check64("msg_valid count", msg_valid_seen, 64'd3);
@@ -210,15 +211,15 @@ module tb_top_integration;
         uart_send_byte(8'h37);
         uart_send_byte(8'hDE);
         // finish out the spurious frame so it hits S_EOF and errors out:
-        // 0x37 + 0xDE + 19 zeros = 21 bytes after the spurious SOF, so the
-        // 21st (a 0x00) lands in S_EOF and fires parse_error -> IDLE
-        repeat (19) uart_send_byte(8'h00);
+        // v2 frame body is 23 bytes after SOF (1+6+4+2+1+8+1), so
+        // 0x37 + 0xDE + 21 zeros lands the 23rd byte in S_EOF -> parse_error
+        repeat (21) uart_send_byte(8'h00);
         #(BIT_NS * 3);
-        send_frame(8'h01, "MSFT", 32'd4_251_200, 16'd75, 8'h02,
+        send_frame(8'h01, "MSFT  ", 32'd4_251_200, 16'd75, 8'h02,
                    64'd1_750_000_004_000_000, 8'h55);
         repeat (10) @(posedge clk100);
 
-        check64("symbol",  {32'd0, dut.symbol}, {32'd0, 32'h4D534654});
+        check64("symbol",  {16'd0, dut.symbol}, {16'd0, 48'h4D53_4654_2020});
         check64("price",   {32'd0, dut.price},  64'd4_251_200);
         check64("qty",     {48'd0, dut.qty},    64'd75);
         check64("side",    {56'd0, dut.side},   64'h02);

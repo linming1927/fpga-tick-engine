@@ -26,7 +26,11 @@
 module tb_indicator_e2e;
 
     localparam int  CLK_HZ     = 100_000_000;
-    localparam int  BAUD       = 115_200;
+    localparam int  BAUD       = 1_152_000;  // 10x sim speed: TB bit period
+                                             // and DUT param both derive
+                                             // from this one constant, so
+                                             // the timing relationship is
+                                             // preserved (86 clk/bit)
     localparam real CLK_PERIOD = 10.0;
     localparam real BIT_NS     = 1e9 / BAUD;
 
@@ -41,8 +45,7 @@ module tb_indicator_e2e;
     top_arty #(
         .CLK_HZ        ( CLK_HZ ),
         .BAUD          ( BAUD   ),
-        .TARGET_SYMBOL ( "SPY " ),
-        .FAST_N        ( 4      ),
+                .FAST_N        ( 4      ),
         .SLOW_N        ( 8      ),
         .EMA_KF        ( 1      ),
         .EMA_KS        ( 3      ),
@@ -84,11 +87,24 @@ module tb_indicator_e2e;
 
     localparam logic [63:0] HOST_TS_CONST = 64'd1_750_000_000_000_000;
 
-    task automatic send_trade(input logic [31:0] fsym, input logic [31:0] fprice,
+    // TYPE 0x10 symbol configuration frame: QTY[2:0]=slot, SIDE=set/clear
+    task automatic send_symcfg(input int slot, input logic [47:0] sym,
+                               input logic set);
+        uart_send_byte(8'hAA);
+        uart_send_byte(8'h10);
+        for (int i = 5; i >= 0; i--) uart_send_byte(sym[8*i +: 8]);
+        for (int i = 3; i >= 0; i--) uart_send_byte(8'h00);      // PRICE
+        uart_send_byte(8'h00); uart_send_byte(slot[7:0]);         // QTY
+        uart_send_byte({7'b0, set});                              // SIDE
+        for (int i = 7; i >= 0; i--) uart_send_byte(8'h00);       // TSTAMP
+        uart_send_byte(8'h55);
+    endtask
+
+    task automatic send_trade(input logic [47:0] fsym, input logic [31:0] fprice,
                               input logic [15:0] fqty);
         uart_send_byte(8'hAA);
         uart_send_byte(8'h01);
-        for (int i = 3; i >= 0; i--) uart_send_byte(fsym[8*i +: 8]);
+        for (int i = 5; i >= 0; i--) uart_send_byte(fsym[8*i +: 8]);
         for (int i = 3; i >= 0; i--) uart_send_byte(fprice[8*i +: 8]);
         for (int i = 1; i >= 0; i--) uart_send_byte(fqty[8*i +: 8]);
         uart_send_byte(8'h01);
@@ -126,7 +142,7 @@ module tb_indicator_e2e;
         logic [63:0] v;
         v = '0;
         for (int i = 0; i < nbytes; i++)
-            v = (v << 8) | echo_bytes[frame*30 + offset + i];
+            v = (v << 8) | echo_bytes[frame*32 + offset + i];
         return v;
     endfunction
 
@@ -141,6 +157,7 @@ module tb_indicator_e2e;
 
     // ---- sequence -----------------------------------------------------------------
     int n_frames, n_sig, sig_f, n_echo, n_ema, ema_f;
+    int base_frames, q_sma, q_ema, q_f;
 
     initial begin
         $dumpfile("tb_indicator_e2e.vcd");
@@ -152,24 +169,24 @@ module tb_indicator_e2e;
         repeat (40) @(posedge clk100);
 
         $display("\n[E2E] warm-up: 8 descending SPY trades (+1 AAPL interloper)");
-        send_trade("SPY ", 32'd2000, 16'd1);
-        send_trade("SPY ", 32'd1900, 16'd2);
-        send_trade("SPY ", 32'd1800, 16'd3);
-        send_trade("SPY ", 32'd1700, 16'd4);
-        send_trade("AAPL", 32'd9999, 16'd5);   // engine must ignore this one
-        send_trade("SPY ", 32'd1600, 16'd6);
-        send_trade("SPY ", 32'd1500, 16'd7);
-        send_trade("SPY ", 32'd1400, 16'd8);
-        send_trade("SPY ", 32'd1300, 16'd9);
+        send_trade("SPY   ", 32'd2000, 16'd1);
+        send_trade("SPY   ", 32'd1900, 16'd2);
+        send_trade("SPY   ", 32'd1800, 16'd3);
+        send_trade("SPY   ", 32'd1700, 16'd4);
+        send_trade("AAPL  ", 32'd9999, 16'd5);   // engine must ignore this one
+        send_trade("SPY   ", 32'd1600, 16'd6);
+        send_trade("SPY   ", 32'd1500, 16'd7);
+        send_trade("SPY   ", 32'd1400, 16'd8);
+        send_trade("SPY   ", 32'd1300, 16'd9);
 
         $display("[E2E] spike to force the golden cross, then hold above");
-        send_trade("SPY ", 32'd3000, 16'd10);
-        send_trade("SPY ", 32'd3100, 16'd11);
+        send_trade("SPY   ", 32'd3000, 16'd10);
+        send_trade("SPY   ", 32'd3100, 16'd11);
 
         wait_drain();
 
         //-----------------------------------------------------------------------
-        n_frames = echo_count / 30;
+        n_frames = echo_count / 32;
         n_sig    = 0;  sig_f = -1;
         n_ema    = 0;  ema_f = -1;
         n_echo   = 0;
@@ -181,7 +198,7 @@ module tb_indicator_e2e;
         $display("\n  INFO  %0d frames on the wire: %0d echoes, %0d signal(s)",
                  n_frames, n_echo, n_sig);
 
-        check64("all bytes framed",       echo_count % 30, 64'd0);
+        check64("all bytes framed",       echo_count % 32, 64'd0);
         check64("echo count (11 ticks)",  n_echo,          64'd11);
         check64("exactly one 0x83",       n_sig,           64'd1);
         check64("exactly one 0x84",       n_ema,           64'd1);
@@ -190,14 +207,14 @@ module tb_indicator_e2e;
 
         if (sig_f >= 0) begin
             check64("sig SOF",        fld(sig_f,  0, 1), 64'hBB);
-            check64("sig SYMBOL",     fld(sig_f,  2, 4), 64'h5350_5920); // "SPY "
-            check64("sig PRICE",      fld(sig_f,  6, 4), 64'd3000);
-            check64("sig QTY==0",     fld(sig_f, 10, 2), 64'd0);
-            check64("sig SIDE==BUY",  fld(sig_f, 12, 1), 64'h01);
-            check64("sig SMA_FAST",   fld(sig_f, 13, 4), 64'd1800);  // hand-computed
-            check64("sig SMA_SLOW",   fld(sig_f, 17, 4), 64'd1775);  // hand-computed
-            check64("sig EOF",        fld(sig_f, 29, 1), 64'hCC);
-            if (fld(sig_f, 13, 4) > fld(sig_f, 17, 4)) begin
+            check64("sig SYMBOL",     fld(sig_f,  2, 4), 64'h5350_5920); // "SPY   "
+            check64("sig PRICE",      fld(sig_f,  8, 4), 64'd3000);
+            check64("sig QTY==0",     fld(sig_f, 12, 2), 64'd0);
+            check64("sig SIDE==BUY",  fld(sig_f, 14, 1), 64'h01);
+            check64("sig SMA_FAST",   fld(sig_f, 15, 4), 64'd1800);  // hand-computed
+            check64("sig SMA_SLOW",   fld(sig_f, 19, 4), 64'd1775);  // hand-computed
+            check64("sig EOF",        fld(sig_f, 31, 1), 64'hCC);
+            if (fld(sig_f, 15, 4) > fld(sig_f, 19, 4)) begin
                 pass_count++;
                 $display("  PASS  SMA_FAST > SMA_SLOW inside signal frame");
             end else begin
@@ -211,15 +228,88 @@ module tb_indicator_e2e;
         // is written first, the EMA record via the pend register.
         if (ema_f >= 0) begin
             check64("ema SOF",       fld(ema_f,  0, 1), 64'hBB);
-            check64("ema SYMBOL",    fld(ema_f,  2, 4), 64'h5350_5920);
-            check64("ema PRICE",     fld(ema_f,  6, 4), 64'd3000);
-            check64("ema SIDE==BUY", fld(ema_f, 12, 1), 64'h01);
-            check64("ema FAST anchor", fld(ema_f, 13, 4), 64'd2200);
-            check64("ema SLOW anchor", fld(ema_f, 17, 4), 64'd1884);
-            check64("ema EOF",       fld(ema_f, 29, 1), 64'hCC);
+            check64("ema SYMBOL",    fld(ema_f,  2, 6), 64'h5350_5920_2020);
+            check64("ema PRICE",     fld(ema_f,  8, 4), 64'd3000);
+            check64("ema SIDE==BUY", fld(ema_f, 14, 1), 64'h01);
+            check64("ema FAST anchor", fld(ema_f, 15, 4), 64'd2200);
+            check64("ema SLOW anchor", fld(ema_f, 19, 4), 64'd1884);
+            check64("ema EOF",       fld(ema_f, 31, 1), 64'hCC);
             check64("collision order: SMA frame precedes EMA",
                     sig_f < ema_f, 64'd1);
         end
+
+        //-----------------------------------------------------------------------
+        // RUNTIME SYMBOL CONFIGURATION PHASE (v2.0): write slot 1 over
+        // UART, verify the 0x90 ack, trade the new symbol to a crossover,
+        // then clear the slot and verify silence.
+        //-----------------------------------------------------------------------
+        $display("\n[CFG] configure slot 1 = QQQ over UART, verify ack");
+        base_frames = echo_count / 32;
+        send_symcfg(1, "QQQ   ", 1'b1);
+        wait (echo_count >= (base_frames + 1) * 32);
+        #(BIT_NS * 3);
+        check64("ack TYPE 0x90",   fld(base_frames, 1, 1), 64'h90);
+        check64("ack SYMBOL",      fld(base_frames, 2, 6),
+                64'h5151_5120_2020);                     // "QQQ   "
+        check64("ack slot in QTY", fld(base_frames, 12, 2), 64'd1);
+        check64("ack SIDE=set",    fld(base_frames, 14, 1), 64'd1);
+
+        $display("[CFG] trade QQQ to a golden cross on the new slot");
+        send_trade("QQQ   ", 32'd2000, 16'd1);
+        send_trade("QQQ   ", 32'd1900, 16'd2);
+        send_trade("QQQ   ", 32'd1800, 16'd3);
+        send_trade("QQQ   ", 32'd1700, 16'd4);
+        send_trade("QQQ   ", 32'd1600, 16'd5);
+        send_trade("QQQ   ", 32'd1500, 16'd6);
+        send_trade("QQQ   ", 32'd1400, 16'd7);
+        send_trade("QQQ   ", 32'd1300, 16'd8);
+        send_trade("QQQ   ", 32'd3000, 16'd9);
+        wait_drain();
+
+        n_frames = echo_count / 32;
+        q_sma = 0; q_ema = 0; q_f = -1;
+        for (int f = 0; f < n_frames; f++) begin
+            if (fld(f, 1, 1) == 64'h83 &&
+                fld(f, 2, 6) == 64'h5151_5120_2020) begin
+                q_sma++; q_f = f;
+            end
+            if (fld(f, 1, 1) == 64'h84 &&
+                fld(f, 2, 6) == 64'h5151_5120_2020) q_ema++;
+        end
+        check64("one QQQ SMA signal", q_sma, 64'd1);
+        check64("one QQQ EMA signal", q_ema, 64'd1);
+        if (q_f >= 0) begin
+            check64("QQQ sig price",    fld(q_f, 8, 4),  64'd3000);
+            check64("QQQ sig SMA_FAST", fld(q_f, 15, 4), 64'd1800);
+            check64("QQQ sig SMA_SLOW", fld(q_f, 19, 4), 64'd1775);
+        end
+        // slot 0 (SPY) engines must be untouched by slot-1 traffic:
+        check64("still exactly one SPY 0x83", n_sig, 64'd1);
+
+        $display("[CFG] clear slot 1, verify QQQ now ignored");
+        base_frames = echo_count / 32;
+        send_symcfg(1, "QQQ   ", 1'b0);
+        send_trade("QQQ   ", 32'd100, 16'd10);   // would be a death cross
+        wait_drain();
+        n_frames = echo_count / 32;
+        q_sma = 0;
+        for (int f = base_frames; f < n_frames; f++)
+            if (fld(f, 1, 1) == 64'h83 || fld(f, 1, 1) == 64'h84) q_sma++;
+        check64("no signals from cleared slot", q_sma, 64'd0);
+        check64("cleared-slot tick still echoed",
+                n_frames - base_frames, 64'd2);   // ack + trade echo
+
+        $display("[CFG] rewriting slot 0 must RESET its engines");
+        base_frames = echo_count / 32;
+        send_symcfg(0, "SPY   ", 1'b1);          // same symbol, fresh state
+        send_trade("SPY   ", 32'd100, 16'd11);   // would death-cross if the
+        send_trade("SPY   ", 32'd100, 16'd12);   // old warm state survived
+        wait_drain();
+        n_frames = echo_count / 32;
+        q_sma = 0;
+        for (int f = base_frames; f < n_frames; f++)
+            if (fld(f, 1, 1) == 64'h83 || fld(f, 1, 1) == 64'h84) q_sma++;
+        check64("no signal: slot write reset state", q_sma, 64'd0);
 
         //-----------------------------------------------------------------------
         $display("\n==============================================");

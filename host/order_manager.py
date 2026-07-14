@@ -84,19 +84,20 @@ class MockBroker:
     """Instant fills at the signal price; injectable rejections for tests."""
 
     def __init__(self, reject_next: int = 0):
-        self.position_qty = 0
+        self.positions: dict[str, int] = {}
         self.fills: list[dict] = []
         self.reject_next = reject_next     # tests: fail this many submissions
 
     def get_position_qty(self, symbol: str) -> int:
-        return self.position_qty
+        return self.positions.get(symbol, 0)
 
     def submit_market_order(self, symbol: str, qty: int, side: str,
                             ref_price_e4: int) -> dict:
         if self.reject_next > 0:
             self.reject_next -= 1
             raise BrokerError("mock rejection (injected)")
-        self.position_qty += qty if side == "buy" else -qty
+        self.positions[symbol] = self.positions.get(symbol, 0) + \
+            (qty if side == "buy" else -qty)
         fill = {"symbol": symbol, "qty": qty, "side": side,
                 "fill_price_e4": ref_price_e4, "t": now_us()}
         self.fills.append(fill)
@@ -311,11 +312,14 @@ class RiskPolicy:
 class OrderManager:
     MAX_CONSECUTIVE_REJECTS = 3
 
-    def __init__(self, broker, symbol: str, limits: RiskLimits,
+    def __init__(self, broker, symbols, limits: RiskLimits,
                  audit_path: str = "om_audit.jsonl",
                  killfile: str = "om.kill"):
         self.broker = broker
-        self.symbol = symbol.strip()
+        if isinstance(symbols, str):
+            symbols = [symbols]
+        self.symbols = [t.strip().upper() for t in symbols]
+        self.symbol = self.symbols[0]
         self.policy = RiskPolicy(limits)
         self.killfile = killfile
         self.halted = False
@@ -332,12 +336,13 @@ class OrderManager:
                 f"kill marker '{killfile}' exists — a previous session "
                 "halted. Investigate, then delete the file to re-arm.")
 
-        # broker is the source of truth: reconcile, don't remember
-        self.position_qty = self.broker.get_position_qty(self.symbol)
-        self._audit("startup", position_qty=self.position_qty,
-                    limits=vars(limits))
-        print(f"[om] reconciled position from broker: "
-              f"{self.position_qty} {self.symbol}")
+        # broker is the source of truth: reconcile EVERY symbol, don't
+        # remember (v2: per-symbol positions, long-only each)
+        self.positions = {t: self.broker.get_position_qty(t)
+                          for t in self.symbols}
+        self._audit("startup", positions=self.positions,
+                    limits={k: v for k, v in vars(limits).items()})
+        print(f"[om] reconciled positions from broker: {self.positions}")
 
     # ---- audit ---------------------------------------------------------------
     def _audit(self, event: str, **kw):
@@ -360,31 +365,41 @@ class OrderManager:
     def on_divergence(self, info: dict):
         self.halt(f"model/hardware divergence: {info.get('reason')}")
 
+    @property
+    def position_qty(self) -> int:            # back-compat: primary symbol
+        return self.positions.get(self.symbol, 0)
+
     # ---- the signal path ---------------------------------------------------------
     def on_signal(self, fr: dict):
         """Callback for VERIFIED FPGA signals (bridge SignalVerifier)."""
         side = fr["side"]
         price_e4 = fr["price_e4"]
+        sym = fr.get("symbol", self.symbol).strip() or self.symbol
+        if sym not in self.positions:          # symbol added at runtime
+            self.positions[sym] = self.broker.get_position_qty(sym)
         if self.halted:
             self.blocked += 1
             self._audit("blocked", reason=f"halted: {self.halt_reason}",
-                        side=side, price_e4=price_e4)
+                        symbol=sym, side=side, price_e4=price_e4)
             return
 
-        allowed, reason, qty = self.policy.evaluate(side, self.position_qty,
+        allowed, reason, qty = self.policy.evaluate(side,
+                                                    self.positions[sym],
                                                     price_e4)
         if not allowed:
             self.blocked += 1
-            self._audit("blocked", reason=reason, side=side,
-                        price_e4=price_e4, position_qty=self.position_qty)
-            print(f"[om] blocked {('BUY' if side == SIDE_BUY else 'SELL')}: "
-                  f"{reason}")
+            self._audit("blocked", reason=reason, symbol=sym, side=side,
+                        price_e4=price_e4,
+                        position_qty=self.positions[sym])
+            print(f"[om] blocked {sym} "
+                  f"{('BUY' if side == SIDE_BUY else 'SELL')}: {reason}")
             return
 
         verb = "buy" if side == SIDE_BUY else "sell"
-        self._audit("order_submit", side=verb, qty=qty, price_e4=price_e4)
+        self._audit("order_submit", symbol=sym, side=verb, qty=qty,
+                    price_e4=price_e4)
         try:
-            fill = self.broker.submit_market_order(self.symbol, qty, verb,
+            fill = self.broker.submit_market_order(sym, qty, verb,
                                                    price_e4)
         except BrokerError as e:
             self.consecutive_rejects += 1
@@ -399,14 +414,15 @@ class OrderManager:
         self.consecutive_rejects = 0
         self.orders += 1
         self.policy.record_order()
-        self.position_qty += qty if verb == "buy" else -qty
-        fees = self.costs.on_fill(verb, qty, fill["fill_price_e4"])
-        self._audit("order_filled", **fill, position_qty=self.position_qty,
-                    fees=fees, realized_pnl_e4=self.costs.realized_pnl_e4)
+        self.positions[sym] += qty if verb == "buy" else -qty
+        fees = self.costs.on_fill(verb, qty, fill["fill_price_e4"], sym)
+        self._audit("order_filled", **fill,
+                    position_qty=self.positions[sym], fees=fees,
+                    realized_pnl_e4=self.costs.realized_pnl_e4)
         fee_str = f"  fees ${fees['total']:.2f}" if fees else ""
-        print(f"[om] FILLED {verb.upper()} {qty} {self.symbol} @ "
+        print(f"[om] FILLED {verb.upper()} {qty} {sym} @ "
               f"${dollars(fill['fill_price_e4']):.4f}  "
-              f"-> position {self.position_qty}{fee_str}")
+              f"-> position {self.positions[sym]}{fee_str}")
         # daily loss halt: realized net P&L breaching the bound stops the
         # session — losses can only be REALIZED on sells, so this check
         # after each fill is sufficient for a long-only strategy
@@ -422,15 +438,16 @@ class OrderManager:
         print("\n---- order manager summary " + "-" * 33)
         print(f"  orders filled    {self.orders}")
         print(f"  signals blocked  {self.blocked}")
-        print(f"  final position   {self.position_qty} {self.symbol}"
-              + ("  (open — P&L below is REALIZED only)"
-                 if self.position_qty else ""))
+        openpos = {k: v for k, v in self.positions.items() if v}
+        print(f"  final positions  "
+              f"{openpos if openpos else 'flat'}"
+              + ("  (open — P&L below is REALIZED only)" if openpos else ""))
         print(f"  kill switch      "
               f"{'TRIPPED: ' + self.halt_reason if self.halted else 'armed'}")
         print(self.costs.report(household_income, filing_status,
                                 state_rate_pct, income_is_gross))
         self._audit("shutdown", orders=self.orders, blocked=self.blocked,
-                    position_qty=self.position_qty, halted=self.halted,
+                    positions=self.positions, halted=self.halted,
                     total_fees=self.costs.total_fees,
                     realized_pnl_e4=self.costs.realized_pnl_e4)
         self._audit_f.close()
@@ -445,7 +462,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="FPGA signal -> risk-checked paper order")
     ap.add_argument("--port", required=True)
-    ap.add_argument("--symbol", default="SPY")
+    ap.add_argument("--symbol", "--symbols", dest="symbols", default="SPY",
+                    help="comma-separated, up to 8 (e.g. SPY,QQQ,AAPL)")
     ap.add_argument("--fast", type=int, default=8)
     ap.add_argument("--slow", type=int, default=32)
     ap.add_argument("--ema-kf", type=int, default=3,
@@ -513,10 +531,11 @@ def main():
     else:
         broker = MockBroker()
         print("[om] broker: mock (no orders leave this machine)")
-    om = OrderManager(broker, args.symbol, limits, audit_path=args.audit)
+    symbols = [t for t in args.symbols.split(",") if t.strip()]
+    om = OrderManager(broker, symbols, limits, audit_path=args.audit)
 
     from compare import StrategyScorecard, comparison_report
-    br = Bridge(args.port, args.symbol, args.fast, args.slow,
+    br = Bridge(args.port, symbols, args.fast, args.slow,
                 ema_kf=args.ema_kf, ema_ks=args.ema_ks, log_path=args.log)
     cards = {"sma": StrategyScorecard(f"SMA {args.fast}/{args.slow}"),
              "ema": StrategyScorecard(
@@ -539,9 +558,8 @@ def main():
             dash.on_event("DIVERGENCE: " + info.get("reason", "?"), True)
         om.on_divergence(info)
 
-    for v in br.verifiers.values():
-        v.on_verified = on_verified
-        v.on_divergence = on_divergence
+    br.on_verified = on_verified          # survives slot reconfiguration:
+    br.on_divergence = on_divergence      # _build_models re-attaches these
     print(f"[om] trading strategy: {args.strategy.upper()} "
           f"(the other is scored, not traded)")
 

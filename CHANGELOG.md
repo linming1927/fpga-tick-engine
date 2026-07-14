@@ -18,3 +18,14 @@ commit, tagged v1.0.
 | 9 | — | EMA engine (extended-precision leaky integrator) + collision arbiter + 0x84 frames + EMAMirror + StrategyScorecard comparison. | 1900 + 23 (+host updates) |
 
 **v1.0** — initial repository commit: all of the above. 2990 checks / 0 failures.
+
+**v1.1** — selftest fixed for dual-strategy boards (per-strategy model
+comparison + DIAG failure fingerprints); G5 regression covers selftest
+itself.
+
+**v2.0** — runtime symbol configuration. Wire format v2 (6-byte symbols for
+all S&P 500 tickers; 24/32-byte frames; TYPE 0x10 slot writes ACKed by 0x90
+echoes). 8-slot register file + 8x both engines + priority encoders in
+fabric; slot writes reset slot engine state. Per-symbol models, verifiers,
+positions, costs, scorecards; multi-symbol sim + Alpaca sources; GUI slot
+editor. 3030 checks / 0 failures. BITSTREAM REBUILD REQUIRED.

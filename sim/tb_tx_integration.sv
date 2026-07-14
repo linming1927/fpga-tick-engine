@@ -31,7 +31,11 @@
 module tb_tx_integration;
 
     localparam int  CLK_HZ     = 100_000_000;
-    localparam int  BAUD       = 115_200;
+    localparam int  BAUD       = 1_152_000;  // 10x sim speed: TB bit period
+                                             // and DUT param both derive
+                                             // from this one constant, so
+                                             // the timing relationship is
+                                             // preserved (86 clk/bit)
     localparam real CLK_PERIOD = 10.0;
     localparam real BIT_NS     = 1e9 / BAUD;
 
@@ -84,7 +88,7 @@ module tb_tx_integration;
 
     task automatic send_frame(
         input logic [7:0]  ftype,
-        input logic [31:0] fsym,
+        input logic [47:0] fsym,
         input logic [31:0] fprice,
         input logic [15:0] fqty,
         input logic [7:0]  fside,
@@ -93,7 +97,7 @@ module tb_tx_integration;
     );
         uart_send_byte(8'hAA);
         uart_send_byte(ftype);
-        for (int i = 3; i >= 0; i--) uart_send_byte(fsym[8*i +: 8]);
+        for (int i = 5; i >= 0; i--) uart_send_byte(fsym[8*i +: 8]);
         for (int i = 3; i >= 0; i--) uart_send_byte(fprice[8*i +: 8]);
         for (int i = 1; i >= 0; i--) uart_send_byte(fqty[8*i +: 8]);
         uart_send_byte(fside);
@@ -134,7 +138,7 @@ module tb_tx_integration;
         logic [63:0] v;
         v = '0;
         for (int i = 0; i < nbytes; i++)
-            v = (v << 8) | echo_bytes[frame*30 + offset + i];
+            v = (v << 8) | echo_bytes[frame*32 + offset + i];
         return v;
     endfunction
 
@@ -177,37 +181,37 @@ module tb_tx_integration;
 
         //-----------------------------------------------------------------------
         $display("\n[T1] One valid frame -> one fully-checked echo");
-        send_frame(8'h01, "AAPL", 32'd1_823_400, 16'd100, 8'h01,
+        send_frame(8'h01, "AAPL  ", 32'd1_823_400, 16'd100, 8'h01,
                    64'd1_750_000_000_123_456, 8'h55);
-        wait (echo_count >= 30);
+        wait (echo_count >= 32);
         #(BIT_NS * 3);
 
         check64("echo SOF",      fld(0,  0, 1), 64'hBB);
         check64("echo TYPE",     fld(0,  1, 1), 64'h81);           // 0x80|trade
-        check64("echo SYMBOL",   fld(0,  2, 4), 64'h4141_504C);    // "AAPL"
-        check64("echo PRICE",    fld(0,  6, 4), 64'd1_823_400);
-        check64("echo QTY",      fld(0, 10, 2), 64'd100);
-        check64("echo SIDE",     fld(0, 12, 1), 64'h01);
-        check64("echo HOST_TS",  fld(0, 13, 8), 64'd1_750_000_000_123_456);
-        t1_fpga_ts = fld(0, 21, 8);
+        check64("echo SYMBOL",   fld(0,  2, 4), 64'h4141_504C);    // "AAPL  "
+        check64("echo PRICE",    fld(0,  8, 4), 64'd1_823_400);
+        check64("echo QTY",      fld(0, 12, 2), 64'd100);
+        check64("echo SIDE",     fld(0, 14, 1), 64'h01);
+        check64("echo HOST_TS",  fld(0, 15, 8), 64'd1_750_000_000_123_456);
+        t1_fpga_ts = fld(0, 23, 8);
         check64("echo FPGA_TS",  t1_fpga_ts,    arrivals[0]);      // exact
-        check64("echo EOF",      fld(0, 29, 1), 64'hCC);
-        check64("byte count",    echo_count,    64'd30);
+        check64("echo EOF",      fld(0, 31, 1), 64'hCC);
+        check64("byte count",    echo_count,    64'd32);
 
         //-----------------------------------------------------------------------
         $display("\n[T2] Second frame -> second echo, arrival advanced");
-        send_frame(8'h02, "TSLA", 32'd2_489_900, 16'd250, 8'h02,
+        send_frame(8'h02, "TSLA  ", 32'd2_489_900, 16'd250, 8'h02,
                    64'd1_750_000_001_000_000, 8'h55);
-        wait (echo_count >= 60);
+        wait (echo_count >= 64);
         #(BIT_NS * 3);
 
         check64("echo TYPE",    fld(1,  1, 1), 64'h82);            // 0x80|quote
-        check64("echo SYMBOL",  fld(1,  2, 4), 64'h5453_4C41);     // "TSLA"
-        check64("echo FPGA_TS", fld(1, 21, 8), arrivals[1]);
-        if (fld(1, 21, 8) > t1_fpga_ts) begin
+        check64("echo SYMBOL",  fld(1,  2, 4), 64'h5453_4C41);     // "TSLA  "
+        check64("echo FPGA_TS", fld(1, 23, 8), arrivals[1]);
+        if (fld(1, 23, 8) > t1_fpga_ts) begin
             pass_count++;
             $display("  PASS  FPGA_TS advanced: %0d -> %0d us (delta %0d us)",
-                     t1_fpga_ts, fld(1,21,8), fld(1,21,8) - t1_fpga_ts);
+                     t1_fpga_ts, fld(1,23,8), fld(1,23,8) - t1_fpga_ts);
         end else begin
             fail_count++;
             $display("  FAIL  FPGA_TS did not advance");
@@ -215,25 +219,25 @@ module tb_tx_integration;
 
         //-----------------------------------------------------------------------
         $display("\n[T3] Corrupt frame -> NO echo");
-        send_frame(8'h01, "NVDA", 32'd9_999_999, 16'd1, 8'h01,
+        send_frame(8'h01, "NVDA  ", 32'd9_999_999, 16'd1, 8'h01,
                    64'd1_750_000_002_000_000, 8'hFF);   // bad EOF
         #(6_000_000);                                    // 6 ms: > frame + echo
-        check64("byte count unchanged", echo_count, 64'd60);
+        check64("byte count unchanged", echo_count, 64'd64);
         check64("parse_error count", {48'd0, dut.parse_error_count}, 64'd1);
 
         //-----------------------------------------------------------------------
         $display("\n[T4] Burst of 12 back-to-back frames into a depth-2 FIFO");
         for (int k = 1; k <= 12; k++) begin
-            send_frame(8'h01, "SPY ", 32'd5_000_000 + k, 16'(k), 8'h01,
+            send_frame(8'h01, "SPY   ", 32'd5_000_000 + k, 16'(k), 8'h01,
                        64'd1_750_000_003_000_000 + k, 8'h55);
         end
         wait_drain();
 
-        t4_frames = (echo_count - 60) / 30;
+        t4_frames = (echo_count - 64) / 32;
         $display("  INFO  %0d of 12 burst frames echoed, tx_drop_count = %0d",
                  t4_frames, dut.tx_drop_count);
 
-        check64("all bytes framed (count %% 30)", echo_count % 30, 64'd0);
+        check64("all bytes framed (count %% 32)", echo_count % 32, 64'd0);
         check64("echoes + drops == ticks",
                 t4_frames + dut.tx_drop_count, 64'd12);
         if (dut.tx_drop_count >= 1) begin
@@ -248,12 +252,12 @@ module tb_tx_integration;
         ok = 1'b1;
         q_prev = 0;
         for (int f = 2; f < 2 + t4_frames; f++) begin
-            if (fld(f, 0, 1) != 64'hBB || fld(f, 29, 1) != 64'hCC ||
-                fld(f, 1, 1) != 64'h81 || fld(f, 2, 4) != 64'h5350_5920) begin
+            if (fld(f, 0, 1) != 64'hBB || fld(f, 31, 1) != 64'hCC ||
+                fld(f, 1, 1) != 64'h81 || fld(f, 2, 6) != 64'h5350_5920_2020) begin
                 ok = 1'b0;
                 $display("  FAIL  echo frame %0d malformed", f);
             end
-            q_now = fld(f, 10, 2);
+            q_now = fld(f, 12, 2);
             if (q_now <= q_prev) begin
                 ok = 1'b0;
                 $display("  FAIL  qty not strictly increasing at frame %0d", f);

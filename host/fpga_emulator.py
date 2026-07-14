@@ -41,17 +41,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tick_protocol import (FrameParser, SMAMirror, EMAMirror,
                            pack_fpga_echo, pack_fpga_signal, parse_tick,
                            TICK_SOF, TICK_EOF, TICK_LEN, TYPE_TRADE,
-                           TYPE_SIGNAL_SMA, TYPE_SIGNAL_EMA, dollars)
+                           TYPE_SYMCFG, TYPE_SIGNAL_SMA, TYPE_SIGNAL_EMA,
+                           SYM_LEN, dollars)
 
 
 class FPGAEmulator:
-    def __init__(self, symbol: str = "SPY ", fast_n: int = 8,
+    def __init__(self, symbol: str = "SPY", fast_n: int = 8,
                  slow_n: int = 32, ema_kf: int = 3, ema_ks: int = 5,
                  verbose: bool = False):
-        self.symbol = symbol.ljust(4)[:4]
-        self.model = SMAMirror(fast_n=fast_n, slow_n=slow_n)
-        self.model_ema = EMAMirror(k_fast=ema_kf, k_slow=ema_ks,
-                                   warmup_n=slow_n)
+        self.params = (fast_n, slow_n, ema_kf, ema_ks)
+        # slot register file, mirroring symcfg.sv: slot 0 seeded
+        self.slots = {0: symbol.strip().upper()}
+        self.models = {"sma": {}, "ema": {}}
+        self._ensure_models(self.slots[0])
         self.verbose = verbose
         self.t0 = time.monotonic_ns()
         self.parser = FrameParser(sof=TICK_SOF, eof=TICK_EOF,
@@ -74,6 +76,16 @@ class FPGAEmulator:
             except OSError:
                 pass
 
+    def _ensure_models(self, sym: str, fresh: bool = False):
+        """fresh=True mirrors the v2 hardware rule: writing a slot RESETS
+        that slot's engine state (symcfg.sv slot_wr -> engine state_rst),
+        so host mirror models can rebuild in lockstep."""
+        f, sl, kf, ks = self.params
+        if fresh or sym not in self.models["sma"]:
+            self.models["sma"][sym] = SMAMirror(fast_n=f, slow_n=sl)
+            self.models["ema"][sym] = EMAMirror(k_fast=kf, k_slow=ks,
+                                                warmup_n=sl)
+
     # ---- the board ---------------------------------------------------------
     def _fpga_ts(self) -> int:
         return (time.monotonic_ns() - self.t0) // 1000
@@ -93,19 +105,26 @@ class FPGAEmulator:
         ts = self._fpga_ts()
         out = pack_fpga_echo(tick["type"], tick["symbol"],
                              tick["price_e4"], tick["qty"], tick["side"],
-                             tick["host_ts"], ts)
-        # engine accept filter — same rule as indicator_engine.sv
-        if tick["type"] == TYPE_TRADE and tick["symbol"] == self.symbol:
-            for model, ftype, name in ((self.model, TYPE_SIGNAL_SMA, "SMA"),
-                                       (self.model_ema, TYPE_SIGNAL_EMA,
-                                        "EMA")):
-                sig = model.ingest(tick["price_e4"])
+                             tick["host_ts"], ts)          # 0x10 -> 0x90 ack
+        sym = tick["symbol"].strip()
+        if tick["type"] == TYPE_SYMCFG:                    # slot write
+            slot = tick["qty"] & 7
+            if tick["side"] & 1:
+                self.slots[slot] = sym
+                self._ensure_models(sym, fresh=True)
+            else:
+                self.slots.pop(slot, None)
+        elif tick["type"] == TYPE_TRADE and sym in self.slots.values():
+            for name, ftype in (("sma", TYPE_SIGNAL_SMA),
+                                ("ema", TYPE_SIGNAL_EMA)):
+                sig = self.models[name][sym].ingest(tick["price_e4"])
                 if sig:
-                    out += pack_fpga_signal(self.symbol, sig.price_e4,
-                                            sig.side, sig.sma_fast,
-                                            sig.sma_slow, ts, ftype)
+                    out += pack_fpga_signal(sym, sig.price_e4, sig.side,
+                                            sig.sma_fast, sig.sma_slow,
+                                            ts, ftype)
                     if self.verbose:
-                        print(f"[emu] {name} SIGNAL {sig.side_name} @ "
+                        print(f"[emu] {name.upper()} {sym} SIGNAL "
+                              f"{sig.side_name} @ "
                               f"${dollars(sig.price_e4):.4f}")
         try:
             os.write(self.master_fd, out)
@@ -115,7 +134,7 @@ class FPGAEmulator:
 
 def main():
     ap = argparse.ArgumentParser(description="Virtual Arty tick engine on a pty")
-    ap.add_argument("--symbol", default="SPY ")
+    ap.add_argument("--symbol", default="SPY")
     ap.add_argument("--fast", type=int, default=8)
     ap.add_argument("--slow", type=int, default=32)
     args = ap.parse_args()
@@ -123,8 +142,8 @@ def main():
     emu = FPGAEmulator(args.symbol, args.fast, args.slow, verbose=True)
     path = emu.start()
     print(f"virtual FPGA listening on: {path}")
-    print(f"  engine: {args.fast}/{args.slow} SMA crossover on "
-          f"'{emu.symbol}' trades")
+    print(f"  engines: SMA {args.fast}/{args.slow} + EMA, 8 runtime slots "
+          f"(slot 0 = '{emu.slots[0]}')")
     print(f"  point bridge.py at it:  python3 bridge.py --port {path} "
           f"--source sim --symbol {args.symbol.strip()}")
     try:

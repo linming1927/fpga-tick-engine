@@ -372,3 +372,48 @@ RTL:   31 + 20 + 850 + 1900 + 23        = 2824
 Host:  65 + 25 + 25 + 30 + 21           =  166
 Total                                   = 2990 checks, 0 failures
 ```
+
+---
+
+# v2.0 — Runtime Symbol Configuration (wire format v2)
+
+The traded symbol set is now RUNTIME state, not a synthesis constant: eight
+slots in a fabric register file (`rtl/symcfg.sv`), written over the same
+UART link, edited live from the dashboard.
+
+**Wire format v2** (breaking): SYMBOL grows 4 -> 6 bytes to fit every
+S&P 500 ticker (GOOGL, BRK.B). Tick frames 22 -> 24 B (SYMBOL at 2-7),
+FPGA frames 30 -> 32 B. New TYPE 0x10 = slot write (QTY[2:0] = slot,
+SIDE = set/clear); its echo (0x90) is the write ACK — the host reads back
+what the fabric actually latched, through the same path as data.
+
+**Semantics that matter:**
+- Writing a slot ALWAYS resets that slot's engines (`slot_wr` ->
+  `state_rst`): a reconfigured symbol starts with empty windows on both
+  sides, so host mirror models rebuild in lockstep. Proven in
+  tb_indicator_e2e (rewrite slot 0, verify the old warm state is gone).
+- One tick = one symbol, so per strategy at most one of the 8 lanes fires
+  per tick; a lowest-slot priority encoder folds lanes into one record.
+  The SMA-vs-EMA same-cycle pend arbiter is unchanged.
+- `Bridge.configure_symbols()` writes all 8 slots, blocks for all 8 ACKs,
+  then rebuilds models/verifiers/counters — hardware and host change
+  atomically or the call fails loudly.
+
+**Host:** per-(strategy, symbol) mirror models and verifiers; per-symbol
+positions (long-only each), cost entries, and scorecard opens; multi-walk
+sim source; Alpaca subscribes the whole list and resubscribes on live
+reconfiguration. `--symbols SPY,QQQ,AAPL` everywhere.
+
+**GUI:** an 8-slot editor writes the FPGA over UART and reports the acked
+ground truth; chart gains a symbol selector; signal tables gain SYM.
+
+**Bitstream rebuild is REQUIRED** (new symcfg.sv + parser/frame width
+changes). A v1 bitstream against v2 host software fails selftest with
+framing/ack DIAG lines — that mismatch is detected, not silent.
+
+## Final test census (v2.0)
+```
+RTL:   31 + 20 + 850 + 1900 + 36        = 2837
+Host:  83 + 27 + 31 + 31 + 21           =  193
+Total                                   = 3030 checks, 0 failures
+```

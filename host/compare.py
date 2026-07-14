@@ -40,22 +40,26 @@ class StrategyScorecard:
     wins: int = 0
     pnl_e4: int = 0                 # gross, fixed-point x10000
     fees_usd: float = 0.0
-    open_e4: int | None = None      # entry price of the open hypothetical
+    opens: dict = field(default_factory=dict)   # symbol -> entry price
+
+    @property
+    def open_e4(self):              # back-compat for single-symbol tests
+        return next(iter(self.opens.values()), None)
 
     def on_signal(self, fr: dict):
         self.signals += 1
         side, price = fr["side"], fr["price_e4"]
-        if side == SIDE_BUY and self.open_e4 is None:
-            self.open_e4 = price
-        elif side == SIDE_SELL and self.open_e4 is not None:
-            trip = (price - self.open_e4) * self.qty
+        sym = fr.get("symbol", "").strip()
+        if side == SIDE_BUY and sym not in self.opens:
+            self.opens[sym] = price
+        elif side == SIDE_SELL and sym in self.opens:
+            trip = (price - self.opens.pop(sym)) * self.qty
             self.pnl_e4 += trip
             self.trips += 1
             if trip > 0:
                 self.wins += 1
             self.fees_usd += self.fees.sell_fees(
                 self.qty, self.qty * price / 10_000.0)["total"]
-            self.open_e4 = None
 
     @property
     def net_usd(self) -> float:
@@ -63,8 +67,7 @@ class StrategyScorecard:
 
     def row(self) -> str:
         wr = f"{100*self.wins/self.trips:.0f}%" if self.trips else "  —"
-        open_s = (f"open @ ${dollars(self.open_e4):.2f}"
-                  if self.open_e4 is not None else "flat")
+        open_s = (f"{len(self.opens)} open" if self.opens else "flat")
         return (f"  {self.name:<14} {self.signals:>7} {self.trips:>6} "
                 f"{wr:>5}  {self.pnl_e4/10_000:>+10.2f} {self.fees_usd:>7.2f} "
                 f"{self.net_usd:>+10.2f}  {open_s}")

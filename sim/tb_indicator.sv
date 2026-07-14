@@ -30,7 +30,7 @@ module tb_indicator;
 
     localparam int FAST_N = 4;
     localparam int SLOW_N = 8;
-    localparam logic [31:0] SYM = "TEST";
+    localparam logic [47:0] SYM = "TEST  ";
 
     logic clk = 1'b0;
     logic rst_n;
@@ -39,8 +39,12 @@ module tb_indicator;
     // DUT interface
     logic        tick_valid = 1'b0;
     logic [7:0]  msg_type;
-    logic [31:0] symbol;
+    logic [47:0] symbol;
     logic [31:0] price;
+    logic [47:0] target_symbol = SYM;     // runtime slot (v2)
+    logic        slot_en = 1'b1;
+    logic        state_rst = 1'b0;
+    logic [47:0] signal_symbol;
     logic [63:0] host_ts = 64'd0;
     logic [63:0] fpga_ts = 64'd0;
 
@@ -52,9 +56,8 @@ module tb_indicator;
     logic        smas_valid;
 
     indicator_engine #(
-        .TARGET_SYMBOL ( SYM    ),
-        .FAST_N        ( FAST_N ),
-        .SLOW_N        ( SLOW_N )
+        .FAST_N ( FAST_N ),
+        .SLOW_N ( SLOW_N )
     ) dut (.*);
 
     // ---- scoreboard ----------------------------------------------------------
@@ -118,7 +121,7 @@ module tb_indicator;
 
     // ---- stimulus --------------------------------------------------------------
     // drive one tick into the DUT (any type/symbol), wait out the pipeline
-    task automatic dut_tick(input logic [7:0] t, input logic [31:0] s,
+    task automatic dut_tick(input logic [7:0] t, input logic [47:0] s,
                             input logic [31:0] p);
         @(negedge clk);
         msg_type   = t;
@@ -192,7 +195,7 @@ module tb_indicator;
 
         //-----------------------------------------------------------------------
         $display("\n[P3] Filtering: wrong symbol + quotes must not disturb state");
-        dut_tick(8'h01, "XXXX", 32'd9_999_999);     // wrong symbol trade
+        dut_tick(8'h01, "XXXX  ", 32'd9_999_999);     // wrong symbol trade
         dut_tick(8'h02, SYM,    32'd9_999_999);     // right symbol, QUOTE
         // model untouched — SMA compare on the next real trade catches any leak
         trade(32'd200_000);

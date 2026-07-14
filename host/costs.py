@@ -143,26 +143,27 @@ class CostTracker:
     fees: FeeSchedule = field(default_factory=FeeSchedule)
     total_fees: float = 0.0             # $ accumulated (sells only)
     realized_pnl_e4: int = 0            # fixed-point x10000, gross of fees
-    _entry_e4: int = 0                  # avg entry of the open long position
-    _entry_qty: int = 0
+    _entries: dict = field(default_factory=dict)  # sym -> [qty, avg_e4]
     buys: int = 0
     sells: int = 0
 
-    def on_fill(self, side: str, qty: int, fill_price_e4: int) -> dict | None:
-        """Called by OrderManager after each fill. Returns the fee breakdown
-        for a sell, None for a buy (long-only: buys open, sells close)."""
+    def on_fill(self, side: str, qty: int, fill_price_e4: int,
+                symbol: str = "") -> dict | None:
+        """Called by OrderManager after each fill. Per-symbol average-entry
+        accounting (v2: up to 8 symbols trade concurrently). Returns the
+        fee breakdown for a sell, None for a buy."""
+        e = self._entries.setdefault(symbol, [0, 0])
         if side == "buy":
-            # weighted-average entry (order_qty can vary between fills)
-            tot = self._entry_e4 * self._entry_qty + fill_price_e4 * qty
-            self._entry_qty += qty
-            self._entry_e4 = tot // self._entry_qty
+            tot = e[1] * e[0] + fill_price_e4 * qty
+            e[0] += qty
+            e[1] = tot // e[0]
             self.buys += 1
             return None
-        # sell: realize P&L against the average entry, charge sell-side fees
-        self.realized_pnl_e4 += (fill_price_e4 - self._entry_e4) * qty
-        self._entry_qty = max(0, self._entry_qty - qty)
-        if self._entry_qty == 0:
-            self._entry_e4 = 0
+        # sell: realize P&L against this symbol's average entry
+        self.realized_pnl_e4 += (fill_price_e4 - e[1]) * qty
+        e[0] = max(0, e[0] - qty)
+        if e[0] == 0:
+            e[1] = 0
         f = self.fees.sell_fees(qty, qty * fill_price_e4 / 10_000.0)
         self.total_fees += f["total"]
         self.sells += 1

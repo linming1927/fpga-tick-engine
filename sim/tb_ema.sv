@@ -25,7 +25,7 @@ module tb_ema;
     localparam int K_FAST   = 1;
     localparam int K_SLOW   = 3;
     localparam int WARMUP_N = 8;
-    localparam logic [31:0] SYM = "TEST";
+    localparam logic [47:0] SYM = "TEST  ";
 
     logic clk = 1'b0;
     logic rst_n;
@@ -33,8 +33,12 @@ module tb_ema;
 
     logic        tick_valid = 1'b0;
     logic [7:0]  msg_type;
-    logic [31:0] symbol;
+    logic [47:0] symbol;
     logic [31:0] price;
+    logic [47:0] target_symbol = SYM;     // runtime slot (v2)
+    logic        slot_en = 1'b1;
+    logic        state_rst = 1'b0;
+    logic [47:0] signal_symbol;
     logic [63:0] host_ts = 0, fpga_ts = 0;
     logic        signal_valid;
     logic [7:0]  signal_side;
@@ -44,7 +48,7 @@ module tb_ema;
     logic        emas_valid;
 
     ema_engine #(
-        .TARGET_SYMBOL(SYM), .K_FAST(K_FAST), .K_SLOW(K_SLOW),
+        .K_FAST(K_FAST), .K_SLOW(K_SLOW),
         .WARMUP_N(WARMUP_N)
     ) dut (.*);
 
@@ -96,7 +100,7 @@ module tb_ema;
         end
     endtask
 
-    task automatic dut_tick(input logic [7:0] t, input logic [31:0] s,
+    task automatic dut_tick(input logic [7:0] t, input logic [47:0] s,
                             input logic [31:0] p);
         @(negedge clk);
         msg_type = t; symbol = s; price = p;
@@ -152,7 +156,7 @@ module tb_ema;
         if (m_sigs == 2) check("death cross SELL", {56'd0, last_side}, 64'h02);
 
         $display("\n[P3] filtering");
-        dut_tick(8'h01, "XXXX", 32'd9_999_999);
+        dut_tick(8'h01, "XXXX  ", 32'd9_999_999);
         dut_tick(8'h02, SYM,    32'd9_999_999);
         trade(32'd100);
 

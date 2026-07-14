@@ -40,22 +40,32 @@
 `default_nettype none
 
 module ema_engine #(
-    parameter logic [31:0] TARGET_SYMBOL = "SPY ",
-    parameter int          K_FAST   = 3,     // alpha = 1/8
+        parameter int          K_FAST   = 3,     // alpha = 1/8
     parameter int          K_SLOW   = 5,     // alpha = 1/32  (> K_FAST)
     parameter int          WARMUP_N = 32     // trades before signals allowed
 )(
     input  wire  logic        clk,
     input  wire  logic        rst_n,
 
+    // runtime symbol slot (from the symcfg register file, v2.0):
+    input  wire  logic [47:0] target_symbol,   // 6 ASCII bytes, space padded
+    input  wire  logic        slot_en,         // slot is configured/valid
+    input  wire  logic        state_rst,       // 1-cycle: this slot was
+                                               // (re)written — start fresh.
+                                               // Writing a slot ALWAYS
+                                               // resets its engine state,
+                                               // so host mirror models can
+                                               // rebuild in lockstep.
+
     input  wire  logic        tick_valid,
     input  wire  logic [7:0]  msg_type,
-    input  wire  logic [31:0] symbol,
+    input  wire  logic [47:0] symbol,
     input  wire  logic [31:0] price,
     input  wire  logic [63:0] host_ts,
     input  wire  logic [63:0] fpga_ts,
 
     output logic        signal_valid,     // 1-cycle pulse
+    output logic [47:0] signal_symbol,    // which symbol crossed
     output logic [7:0]  signal_side,      // 0x01 buy / 0x02 sell
     output logic [31:0] signal_price,
     output logic [63:0] signal_host_ts,
@@ -75,7 +85,8 @@ module ema_engine #(
 
     logic accept;
     assign accept = tick_valid
-                 && (symbol   == TARGET_SYMBOL)
+                 && slot_en
+                 && (symbol   == target_symbol)
                  && (msg_type == TYPE_TRADE);
 
     //-------------------------------------------------------------------------
@@ -87,6 +98,7 @@ module ema_engine #(
     logic [$clog2(WARMUP_N+1)-1:0] warm_cnt;
 
     logic [31:0] meta_price;
+    logic [47:0] meta_symbol;
     logic [63:0] meta_host_ts, meta_fpga_ts;
     logic p1, p2;
 
@@ -97,9 +109,18 @@ module ema_engine #(
             seeded       <= 1'b0;
             warm_cnt     <= '0;
             meta_price   <= '0;
+            meta_symbol  <= '0;
             meta_host_ts <= '0;
             meta_fpga_ts <= '0;
             p1           <= 1'b0;
+        end else if (state_rst) begin
+            // slot rewritten: clear all window state (same as reset,
+            // minus the clock-domain plumbing)
+            acc_fast <= '0;
+            acc_slow <= '0;
+            seeded   <= 1'b0;
+            warm_cnt <= '0;
+            p1       <= 1'b0;
         end else begin
             p1 <= 1'b0;
             if (accept) begin
@@ -116,6 +137,7 @@ module ema_engine #(
                 if (warm_cnt != WARMUP_N[$clog2(WARMUP_N+1)-1:0])
                     warm_cnt <= warm_cnt + 1'b1;
                 meta_price   <= price;
+                meta_symbol  <= symbol;
                 meta_host_ts <= host_ts;
                 meta_fpga_ts <= fpga_ts;
                 p1           <= 1'b1;
@@ -153,15 +175,21 @@ module ema_engine #(
             above_prev     <= 1'b0;
             primed         <= 1'b0;
             signal_valid   <= 1'b0;
+            signal_symbol  <= '0;
             signal_side    <= '0;
             signal_price   <= '0;
             signal_host_ts <= '0;
             signal_fpga_ts <= '0;
+        end else if (state_rst) begin
+            above_prev   <= 1'b0;
+            primed       <= 1'b0;
+            signal_valid <= 1'b0;
         end else begin
             signal_valid <= 1'b0;
             if (p2 && emas_valid) begin
                 if (primed && (above_now != above_prev)) begin
                     signal_valid   <= 1'b1;
+                    signal_symbol  <= meta_symbol;
                     signal_side    <= above_now ? SIDE_BUY : SIDE_SELL;
                     signal_price   <= meta_price;
                     signal_host_ts <= meta_host_ts;

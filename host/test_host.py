@@ -29,7 +29,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tick_protocol import (FrameParser, SMAMirror, EMAMirror, pack_tick,
                            parse_tick, pack_fpga_echo, pack_fpga_signal,
-                           TICK_SOF, TICK_EOF, TICK_LEN, TYPE_SIGNAL_EMA,
+                           pack_symcfg, sym_wire,
+                           TICK_SOF, TICK_EOF, TICK_LEN, FPGA_LEN,
+                           TYPE_SIGNAL_EMA, TYPE_SYMCFG,
                            SIDE_BUY, SIDE_SELL, TYPE_TRADE)
 
 PASS = FAIL = 0
@@ -107,12 +109,32 @@ check("tick SOF/EOF", (f[0], f[-1]), (TICK_SOF, TICK_EOF))
 d = parse_tick(f)
 check("tick roundtrip", (d["symbol"], d["price_e4"], d["qty"], d["side"],
                          d["host_ts"]),
-      ("AAPL", 1_823_400, 100, 1, 1_750_000_000_123_456))
+      ("AAPL  ", 1_823_400, 100, 1, 1_750_000_000_123_456))
 check("qty clamps to uint16",
       parse_tick(pack_tick(TYPE_TRADE, "SPY", 1, 999_999, 0, 0))["qty"],
       0xFFFF)
-check("3-char symbol pads", parse_tick(pack_tick(1, "SPY", 1, 1, 0, 0))["symbol"],
-      "SPY ")
+check("3-char symbol pads to 6",
+      parse_tick(pack_tick(1, "SPY", 1, 1, 0, 0))["symbol"], "SPY   ")
+check("5-char S&P ticker fits",
+      parse_tick(pack_tick(1, "GOOGL", 1, 1, 0, 0))["symbol"], "GOOGL ")
+check("dotted class shares fit",
+      parse_tick(pack_tick(1, "BRK.B", 1, 1, 0, 0))["symbol"], "BRK.B ")
+try:
+    sym_wire("TOOLONG1")
+    check("7-char ticker rejected", "accepted", "rejected")
+except ValueError:
+    check("7-char ticker rejected", "rejected", "rejected")
+# symcfg frame + its 0x90 ack decode
+cf = pack_symcfg(3, "QQQ", True)
+dc = parse_tick(cf)
+check("symcfg frame fields", (dc["type"], dc["symbol"], dc["qty"],
+                              dc["side"]), (TYPE_SYMCFG, "QQQ   ", 3, 1))
+fpk = FrameParser()
+ack = pack_fpga_echo(TYPE_SYMCFG, "QQQ   ", 0, 3, 1, 0, 42)
+r = fpk.feed(ack)
+check("0x90 ack parses", (r[0]["kind"], r[0]["slot"], r[0]["enabled"],
+                          r[0]["symbol"].strip()),
+      ("symcfg_ack", 3, True, "QQQ"))
 
 fp = FrameParser()
 e = pack_fpga_echo(TYPE_TRADE, "TSLA", 2_489_900, 250, 2,
@@ -121,7 +143,7 @@ r = fp.feed(e)
 check("echo parses", len(r), 1)
 check("echo fields", (r[0]["kind"], r[0]["type"], r[0]["symbol"],
                       r[0]["price_e4"], r[0]["host_ts"], r[0]["fpga_ts"]),
-      ("echo", 0x81, "TSLA", 2_489_900, 111, 222))
+      ("echo", 0x81, "TSLA  ", 2_489_900, 111, 222))
 s = pack_fpga_signal("SPY ", 3000, SIDE_BUY, 1800, 1775, 999)
 r = fp.feed(s)
 check("signal parses", len(r), 1)
@@ -157,7 +179,7 @@ from bridge import Bridge
 
 emu = FPGAEmulator(symbol="SPY ", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3)
 path = emu.start()
-br = Bridge(path, "SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3)
+br = Bridge(path, ["SPY"], fast_n=4, slow_n=8, ema_kf=1, ema_ks=3)
 
 rng = random.Random(7)
 price = 1_500_000
@@ -173,14 +195,37 @@ check("all ticks echoed", br.echoes, br.sent)
 check("stream needed no resync", br.parser.resync_count, 0)
 for name in ("sma", "ema"):
     check(f"[{name}] fpga == model signals",
-          br.fpga_by_strategy[name], br.models[name].signals)
+          br.fpga_by_key.get((name, "SPY"), 0),
+          br.models[name]["SPY"].signals)
     check(f"[{name}] every signal verified",
-          br.verifiers[name].verified, br.fpga_by_strategy[name])
+          br.verifiers[(name, "SPY")].verified,
+          br.fpga_by_key.get((name, "SPY"), 0))
     check(f"[{name}] zero divergences",
-          br.verifiers[name].divergences, 0)
-    check(f"[{name}] signals occurred", br.fpga_by_strategy[name] > 0, True)
+          br.verifiers[(name, "SPY")].divergences, 0)
+    check(f"[{name}] signals occurred",
+          br.fpga_by_key.get((name, "SPY"), 0) > 0, True)
 print(f"       {br.sent} ticks; sma {br.fpga_by_strategy['sma']} / "
       f"ema {br.fpga_by_strategy['ema']} signals, all verified")
+
+# ---- v2: runtime reconfiguration to TWO symbols over the wire ----------
+check("configure_symbols acked", br.configure_symbols(["SPY", "QQQ"]), True)
+walk2 = {"SPY": 1_500_000, "QQQ": 4_000_000}
+for i in range(160):
+    t = ("SPY", "QQQ")[i % 2]
+    walk2[t] = max(100_000, walk2[t] + rng.randint(-60_000, 60_000))
+    br.send_trade(walk2[t], 1, symbol=t)
+    br.pump(timeout=0.004)
+br.pump(timeout=0.5); time.sleep(0.2); br.pump(timeout=0.2)
+for t in ("SPY", "QQQ"):
+    for name in ("sma", "ema"):
+        check(f"[{name} {t}] fpga == model",
+              br.fpga_by_key.get((name, t), 0), br.models[name][t].signals)
+        check(f"[{name} {t}] no divergence",
+              br.verifiers[(name, t)].divergences, 0)
+check("both symbols produced signals",
+      all(br.models["sma"][t].signals + br.models["ema"][t].signals > 0
+          for t in ("SPY", "QQQ")), True)
+print(f"       reconfig phase: per-key counts {br.fpga_by_key}")
 
 # scorecards score both strategies from the same verified stream
 from compare import StrategyScorecard, comparison_report
@@ -208,14 +253,15 @@ print("[G5] run_selftest passes against a dual-engine board")
 import io, contextlib
 from bridge import run_selftest
 emu5 = FPGAEmulator(symbol="SPY ", fast_n=8, slow_n=32)
-br5 = Bridge(emu5.start(), "SPY", fast_n=8, slow_n=32)
+br5 = Bridge(emu5.start(), ["SPY"], fast_n=8, slow_n=32)
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     run_selftest(br5)
 out5 = buf.getvalue()
 check("selftest PASS on healthy board", "[selftest] PASS" in out5, True)
 check("both strategies signaled once",
-      (br5.fpga_by_strategy["sma"], br5.fpga_by_strategy["ema"]), (1, 1))
+      (br5.fpga_by_key.get(("sma", "SPY"), 0),
+       br5.fpga_by_key.get(("ema", "SPY"), 0)), (1, 1))
 check("all verified, no divergence",
       (sum(v.verified for v in br5.verifiers.values()),
        sum(v.divergences for v in br5.verifiers.values())), (2, 0))

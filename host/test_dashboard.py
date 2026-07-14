@@ -12,7 +12,8 @@ the latching kill switch.
 """
 
 from __future__ import annotations
-import json, os, random, sys, tempfile, time, urllib.request
+import contextlib, io, json, os, random, sys, tempfile, time
+import urllib.error, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fpga_emulator import FPGAEmulator
@@ -45,17 +46,17 @@ def get(path):
 d = tempfile.mkdtemp()
 emu = FPGAEmulator(symbol="SPY ", fast_n=4, slow_n=8)
 br = Bridge(emu.start(), "SPY", fast_n=4, slow_n=8)
-om = OrderManager(MockBroker(), "SPY",
+om = OrderManager(MockBroker(), ["SPY"],
                   RiskLimits(order_qty=1, max_shares=1,
                              max_notional_e4=10**13, max_orders_per_day=99,
                              cooldown_s=0.0, require_market_hours=False),
                   audit_path=os.path.join(d, "a.jsonl"),
                   killfile=os.path.join(d, "om.kill"))
 dash = DashboardServer(br, om, PORT).start()
-for v in br.verifiers.values():
-    v.on_verified = lambda fr: (dash.on_signal(fr), om.on_signal(fr))
-    v.on_divergence = lambda i: (dash.on_event("DIV", True),
-                                 om.on_divergence(i))
+br.on_verified = lambda fr: (dash.on_signal(fr), om.on_signal(fr))
+br.on_divergence = lambda i: (dash.on_event("DIV", True),
+                              om.on_divergence(i))
+br._build_models()          # re-attach hooks set after construction
 
 rng = random.Random(7)
 price = 1_500_000
@@ -86,9 +87,36 @@ check("signals mirror verifiers", s["verified"],
 check("series carries both strategies", len(s["series"][0]), 7)
 check("signals carry strategy tags",
       all(x["strategy"] in ("sma", "ema") for x in s["signals"]), True)
+check("signals carry symbols",
+      all(x["symbol"] == "SPY" for x in s["signals"]), True)
+check("slot list in state", s["symbols"], ["SPY"])
+
+# ---- v2: the GUI symbol editor endpoint reconfigures the FPGA ----------
+print("[G1b] POST /api/symbols writes slots and rebuilds models")
+req = urllib.request.Request(
+    f"http://localhost:{PORT}/api/symbols", method="POST",
+    data=json.dumps({"symbols": ["SPY", "QQQ"]}).encode(),
+    headers={"Content-Type": "application/json"})
+with contextlib.redirect_stdout(io.StringIO()):
+    r = json.loads(urllib.request.urlopen(req, timeout=5).read())
+check("symbols endpoint acked", (r["ok"], r["symbols"]),
+      (True, ["SPY", "QQQ"]))
+s2 = json.loads(get("/api/state?sym=QQQ"))
+check("state reflects new slots", s2["symbols"], ["SPY", "QQQ"])
+check("chart follows ?sym=", s2["symbol"], "QQQ")
+bad = urllib.request.Request(
+    f"http://localhost:{PORT}/api/symbols", method="POST",
+    data=json.dumps({"symbols": ["TOOLONG7"]}).encode(),
+    headers={"Content-Type": "application/json"})
+try:
+    urllib.request.urlopen(bad, timeout=5)
+    check("bad ticker rejected with 400", "200", "400")
+except urllib.error.HTTPError as e:
+    check("bad ticker rejected with 400", str(e.code), "400")
 check("pnl matches tracker", s["pnl_net"], om.costs.net_pnl_usd)
 check("fees match tracker", s["fees"], om.costs.total_fees)
-check("position matches OM", s["position"], om.position_qty)
+check("positions match OM",
+      s["positions"], {k: v for k, v in om.positions.items() if v})
 check("warmed up", s["warmed_up"], True)
 check("rtt reported", s["rtt"] is not None, True)
 check("not halted yet", s["halted"], False)

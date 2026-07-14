@@ -35,10 +35,12 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 # Wire-format constants (must match tick_parser.sv / frame_tx.sv)
 # ---------------------------------------------------------------------------
-TICK_SOF, TICK_EOF, TICK_LEN = 0xAA, 0x55, 22     # host -> FPGA
-FPGA_SOF, FPGA_EOF, FPGA_LEN = 0xBB, 0xCC, 30     # FPGA -> host
+TICK_SOF, TICK_EOF, TICK_LEN = 0xAA, 0x55, 24     # host -> FPGA (v2)
+FPGA_SOF, FPGA_EOF, FPGA_LEN = 0xBB, 0xCC, 32     # FPGA -> host (v2)
+SYM_LEN = 6            # fits every S&P 500 ticker (GOOGL, BRK.B, ...)
 
 TYPE_TRADE, TYPE_QUOTE = 0x01, 0x02
+TYPE_SYMCFG, TYPE_SYMCFG_ACK = 0x10, 0x90   # runtime symbol slots (v2)
 TYPE_ECHO_TRADE, TYPE_ECHO_QUOTE = 0x81, 0x82
 TYPE_SIGNAL_SMA, TYPE_SIGNAL_EMA = 0x83, 0x84
 TYPE_SIGNAL = TYPE_SIGNAL_SMA                    # back-compat alias
@@ -51,10 +53,20 @@ SIDE_NAME = {SIDE_BUY: "BUY", SIDE_SELL: "SELL", SIDE_NEUTRAL: "NEUTRAL"}
 # ---------------------------------------------------------------------------
 # host -> FPGA tick frame
 # ---------------------------------------------------------------------------
+def sym_wire(symbol: str) -> bytes:
+    """Symbol -> 6-byte wire form: upper-cased, space padded. Rejects
+    anything that can't round-trip (>6 chars, non-ticker characters)."""
+    t = symbol.strip().upper()
+    if not (1 <= len(t) <= SYM_LEN) or \
+            not all(c.isalnum() or c == "." for c in t):
+        raise ValueError(f"bad ticker {symbol!r}")
+    return t.encode("ascii").ljust(SYM_LEN)
+
+
 def pack_tick(msg_type: int, symbol: str, price_e4: int, qty: int,
               side: int, host_ts_us: int) -> bytes:
-    """Build one 22-byte tick frame. price_e4 is price x 10 000 (int)."""
-    sym = symbol.encode("ascii").ljust(4)[:4]
+    """Build one 24-byte tick frame. price_e4 is price x 10 000 (int)."""
+    sym = sym_wire(symbol)
     if not (0 <= price_e4 < 2**32):
         raise ValueError(f"price_e4 out of uint32 range: {price_e4}")
     qty = min(max(qty, 0), 0xFFFF)                 # clamp to uint16
@@ -63,10 +75,20 @@ def pack_tick(msg_type: int, symbol: str, price_e4: int, qty: int,
             bytes([TICK_EOF]))
 
 
+def pack_symcfg(slot: int, symbol: str, enable: bool = True,
+                host_ts_us: int = 0) -> bytes:
+    """TYPE 0x10 symbol-configuration frame: QTY[2:0]=slot, SIDE=set/clear.
+    The FPGA's echo of this frame (wire TYPE 0x90) is the write ACK."""
+    if not 0 <= slot <= 7:
+        raise ValueError(f"slot {slot} out of range 0-7")
+    return pack_tick(TYPE_SYMCFG, symbol if enable else symbol or "X",
+                     0, slot, 0x01 if enable else 0x00, host_ts_us)
+
+
 def parse_tick(frame: bytes) -> dict:
-    """Decode one aligned 22-byte tick frame (used by the emulator)."""
-    price_e4, qty, side, host_ts = struct.unpack(">IHBQ", frame[6:21])
-    return {"type": frame[1], "symbol": frame[2:6].decode("ascii"),
+    """Decode one aligned 24-byte tick frame (used by the emulator)."""
+    price_e4, qty, side, host_ts = struct.unpack(">IHBQ", frame[8:23])
+    return {"type": frame[1], "symbol": frame[2:8].decode("ascii"),
             "price_e4": price_e4, "qty": qty, "side": side,
             "host_ts": host_ts}
 
@@ -76,8 +98,8 @@ def parse_tick(frame: bytes) -> dict:
 # ---------------------------------------------------------------------------
 def pack_fpga_echo(msg_type: int, symbol: str, price_e4: int, qty: int,
                    side: int, host_ts_us: int, fpga_ts_us: int) -> bytes:
-    """Build a 30-byte echo frame (used by the emulator)."""
-    sym = symbol.encode("ascii").ljust(4)[:4]
+    """Build a 32-byte echo frame (used by the emulator)."""
+    sym = symbol.encode("ascii").ljust(SYM_LEN)[:SYM_LEN]
     return (bytes([FPGA_SOF, 0x80 | msg_type]) + sym +
             struct.pack(">IHBQQ", price_e4, qty, side, host_ts_us,
                         fpga_ts_us) +
@@ -87,9 +109,9 @@ def pack_fpga_echo(msg_type: int, symbol: str, price_e4: int, qty: int,
 def pack_fpga_signal(symbol: str, price_e4: int, side: int,
                      sma_fast: int, sma_slow: int,
                      fpga_ts_us: int, ftype: int = TYPE_SIGNAL_SMA) -> bytes:
-    """Build a 30-byte signal frame, 0x83 (SMA) or 0x84 (EMA) — used by the
-    emulator. The TS_A slot (bytes 13-20) carries the {fast, slow} pair."""
-    sym = symbol.encode("ascii").ljust(4)[:4]
+    """Build a 32-byte signal frame, 0x83 (SMA) or 0x84 (EMA) — used by the
+    emulator. The TS_A slot (bytes 15-22) carries the {fast, slow} pair."""
+    sym = symbol.encode("ascii").ljust(SYM_LEN)[:SYM_LEN]
     return (bytes([FPGA_SOF, ftype]) + sym +
             struct.pack(">IHBIIQ", price_e4, 0, side,
                         sma_fast & 0xFFFFFFFF, sma_slow & 0xFFFFFFFF,
@@ -98,20 +120,24 @@ def pack_fpga_signal(symbol: str, price_e4: int, side: int,
 
 
 def _decode_fpga_frame(frame: bytes) -> dict:
-    """Decode one aligned 30-byte FPGA frame into a dict keyed by kind."""
+    """Decode one aligned 32-byte FPGA frame into a dict keyed by kind."""
     ftype = frame[1]
-    symbol = frame[2:6].decode("ascii", errors="replace")
-    price_e4, qty = struct.unpack(">IH", frame[6:12])
-    side = frame[12]
-    fpga_ts = struct.unpack(">Q", frame[21:29])[0]
+    symbol = frame[2:8].decode("ascii", errors="replace")
+    price_e4, qty = struct.unpack(">IH", frame[8:14])
+    side = frame[14]
+    fpga_ts = struct.unpack(">Q", frame[23:31])[0]
     if ftype in (TYPE_SIGNAL_SMA, TYPE_SIGNAL_EMA):
-        sma_fast, sma_slow = struct.unpack(">II", frame[13:21])
+        sma_fast, sma_slow = struct.unpack(">II", frame[15:23])
         return {"kind": "signal", "type": ftype,
                 "strategy": STRATEGY_NAME[ftype], "symbol": symbol,
                 "price_e4": price_e4, "side": side,
                 "sma_fast": sma_fast, "sma_slow": sma_slow,
                 "fpga_ts": fpga_ts}
-    host_ts = struct.unpack(">Q", frame[13:21])[0]
+    host_ts = struct.unpack(">Q", frame[15:23])[0]
+    if ftype == TYPE_SYMCFG_ACK:
+        return {"kind": "symcfg_ack", "type": ftype, "symbol": symbol,
+                "slot": qty & 7, "enabled": bool(side & 1),
+                "fpga_ts": fpga_ts}
     return {"kind": "echo", "type": ftype, "symbol": symbol,
             "price_e4": price_e4, "qty": qty, "side": side,
             "host_ts": host_ts, "fpga_ts": fpga_ts}
