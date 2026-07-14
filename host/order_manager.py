@@ -519,7 +519,8 @@ def main():
     if args.live:
         if args.broker != "alpaca":
             sys.exit("--live requires --broker alpaca")
-        broker = arm_live_trading(args.symbol, limits)
+        broker = arm_live_trading(args.symbols.split(",")[0].strip().upper(),
+                                  limits)
         print(f"[om] broker: Alpaca *** LIVE *** ({LIVE_URL})")
     elif args.broker == "alpaca":
         key = os.environ.get("ALPACA_KEY")

@@ -511,10 +511,13 @@ def main():
     ap.add_argument("--rate", type=float, default=10.0, help="sim: ticks/s")
     ap.add_argument("--start-price", type=float, default=500.0)
     ap.add_argument("--log", default=None, help="JSONL tick log path")
+    ap.add_argument("--ema-kf", type=int, default=3,
+                    help="fast EMA shift of the built bitstream (alpha 2^-k)")
+    ap.add_argument("--ema-ks", type=int, default=5)
     args = ap.parse_args()
 
-    br = Bridge(args.port, args.symbol, args.fast, args.slow,
-                log_path=args.log)
+    br = Bridge(args.port, args.symbols.split(","), args.fast, args.slow,
+                ema_kf=args.ema_kf, ema_ks=args.ema_ks, log_path=args.log)
     try:
         if args.source == "sim":
             run_sim(br, args.n, args.rate, args.start_price)
