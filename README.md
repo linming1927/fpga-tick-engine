@@ -1,3 +1,50 @@
+# FPGA Tick Trading Engine
+
+A Digilent Arty A7-100T computes SMA + EMA crossover signals in fabric from
+real-time market ticks, streamed over UART from a Python host bridge to
+Alpaca (live IEX data, paper-trading orders). Runtime-configurable symbol
+slots (up to 8, any S&P 500 ticker), a risk-gated order manager, and a web
+console. See CHANGELOG.md for the full drop-by-drop history.
+
+## Quick Start
+
+**1. Start the whole system (bridge + risk-gated orders + web console):**
+```bash
+python3 host/order_manager.py --port /dev/ttyUSB1 --source alpaca --broker alpaca \
+    --symbols SPY,QQQ --strategy sma --dashboard 8000 \
+    --household-income 185000 --log ticks.jsonl --audit audit.jsonl
+```
+- `--symbols` — up to 8, comma-separated, any S&P 500 ticker (GOOGL, BRK.B, ...)
+- `--strategy sma|ema` — which one actually trades; the other is scored
+  through an identical risk-gated replay for a fair comparison
+- `--broker mock` instead of `alpaca` to paper-trade against a local mock
+  broker with no network calls at all (still uses real Alpaca market data)
+- `--source sim` instead of `alpaca` to drive it with a synthetic random
+  walk — no market hours, no network, no keys required
+
+**2. Open the GUI** (only exists once step 1 is running, since the console
+is served by the order-manager process itself):
+```
+http://localhost:8000
+```
+From your phone on the same LAN: `http://<this-machine's-LAN-IP>:8000`.
+
+**No hardware handy?** Run the virtual board first, then point the same
+command at it:
+```bash
+python3 host/fpga_emulator.py --symbol "SPY " --fast 8 --slow 32
+#   -> prints: virtual FPGA listening on: /dev/pts/N
+python3 host/order_manager.py --port /dev/pts/N --source sim --broker mock \
+    --cooldown 0 --n 300 --rate 20 --dashboard 8000
+```
+
+**Acceptance test after any bitstream rebuild:**
+```bash
+python3 host/bridge.py --port /dev/ttyUSB1 --source selftest --fast 8 --slow 32
+```
+
+---
+
 # FPGA Tick Parser — Integration Layer (MANUAL.md §4)
 
 ## New in this drop
