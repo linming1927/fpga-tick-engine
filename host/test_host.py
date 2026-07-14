@@ -302,6 +302,71 @@ check("all verified, no divergence",
        sum(v.divergences for v in br5.verifiers.values())), (2, 0))
 br5.close(); emu5.stop()
 
+# ---- v2.2: per-symbol grace window (fixes a real divergence bug) ----------
+print("[G7] grace window is scoped per-symbol, not a shared global counter")
+from bridge import SignalVerifier
+from tick_protocol import SMASignal, SIDE_BUY
+
+# Reproduce the failure mode directly against SignalVerifier: a model
+# signal is pending for QQQ; a BURST of unrelated SPY echo activity (more
+# than `grace` echoes) should NOT expire it, because SPY's echoes must
+# not advance QQQ's own grace-window clock.
+v = SignalVerifier(grace=3)
+qqq_sig = SMASignal(side=SIDE_BUY, price_e4=4_000_000, sma_fast=1, sma_slow=2)
+v.on_model_signal(qqq_sig, echo_seq=0)      # pending, stamped at QQQ-count 0
+
+# Old (buggy) behavior: passing a GLOBAL counter that races ahead due to
+# unrelated SPY traffic would blow through grace=3 and orphan this. New
+# behavior: the bridge now stamps/advances each verifier with that
+# SYMBOL's OWN echo count, so a burst on a different symbol must not
+# reach the verifier at all — simulate that correctly here by holding
+# QQQ's own count at 0 (no QQQ ticks arrived) regardless of how much SPY
+# traffic happened in between:
+for qqq_echo_count in (0, 0, 0, 0, 0, 0):   # SPY-only burst: QQQ count idle
+    v.on_echo(qqq_echo_count)
+check("no orphan from unrelated-symbol traffic", v.divergences, 0)
+check("QQQ signal still pending, not expired",
+      len(v.pending_model), 1)
+
+# Now QQQ's OWN next tick arrives (its count finally advances) and the
+# matching FPGA signal shows up within ITS OWN grace window:
+fpga_fr = {"side": SIDE_BUY, "price_e4": 4_000_000, "sma_fast": 1,
+          "sma_slow": 2, "symbol": "QQQ  "}
+v.on_fpga_signal(fpga_fr, echo_seq=1)       # QQQ's own count now 1
+check("late-but-within-grace FPGA signal verifies correctly",
+      v.verified, 1)
+check("still zero divergences", v.divergences, 0)
+
+# Sanity: the window DOES still expire a genuinely-unmatched signal once
+# that SAME symbol's own count exceeds grace (the mechanism still works,
+# just scoped correctly now):
+v2 = SignalVerifier(grace=3)
+v2.on_model_signal(qqq_sig, echo_seq=0)
+for qqq_echo_count in (1, 2, 3, 4):         # QQQ's OWN ticks advancing
+    v2.on_echo(qqq_echo_count)
+check("genuinely stale same-symbol signal still expires", v2.divergences, 1)
+
+# ---- integration: bridge tracks echoes_by_symbol, not just the global ----
+print("[G8] Bridge exposes a real per-symbol counter, reset on reconfigure")
+emu2 = FPGAEmulator(symbol="SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3)
+path2 = emu2.start()
+br2 = Bridge(path2, ["SPY", "QQQ"], fast_n=4, slow_n=8, ema_kf=1, ema_ks=3)
+check("echoes_by_symbol starts empty", br2.echoes_by_symbol, {})
+w = {"SPY": 1_500_000, "QQQ": 5_000_000}
+for i in range(40):
+    t = "SPY" if i % 4 else "QQQ"           # SPY ticks 3x more often
+    w[t] += rng.randint(-5_000, 5_000)
+    br2.send_trade(w[t], 1, symbol=t)
+    br2.pump(timeout=0.003)
+br2.pump(timeout=0.3)
+check("both symbols have their OWN counters",
+      set(br2.echoes_by_symbol.keys()) >= {"SPY", "QQQ"}, True)
+check("SPY's count reflects its own higher tick share",
+      br2.echoes_by_symbol["SPY"] > br2.echoes_by_symbol["QQQ"], True)
+check("reconfigure resets the per-symbol counters",
+      br2.configure_symbols(["SPY", "QQQ"]) and br2.echoes_by_symbol, {})
+br2.close(); emu2.stop()
+
 # ---------------------------------------------------------------------------
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

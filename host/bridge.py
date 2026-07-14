@@ -173,6 +173,10 @@ class Bridge:
         # the summary's fpga-vs-model comparison is always like-for-like
         # (session totals live in fpga_signals / fpga_by_strategy)
         self.fpga_by_key = {}
+        # per-SYMBOL echo counter (see _handle) — reset on every
+        # (re)build so a symbol's grace-window history never survives
+        # its own slot's state_rst
+        self.echoes_by_symbol = {}
         f, sl, kf, ks = self.params
         self.models = {
             "sma": {t: SMAMirror(fast_n=f, slow_n=sl) for t in self.symbols},
@@ -279,6 +283,19 @@ class Bridge:
             # slot compare applies
             sym = fr["symbol"].strip()
             if fr["type"] == TYPE_ECHO_TRADE and sym in self.models["sma"]:
+                # Per-symbol echo count, NOT the global self.echoes. Two
+                # symbols on one link means the global counter advances
+                # on the OTHER symbol's ticks too — a burst of SPY
+                # activity could expire a QQQ verifier's pending signal
+                # before QQQ's own next tick ever arrives. Scoping the
+                # grace window to "N more of THIS symbol's own ticks"
+                # fixes that: it can only advance on events that are
+                # actually relevant to what it's waiting for. (Found via
+                # a real divergence during a live 2-symbol session whose
+                # RTT spiked to 8.7s, triggering a burst that overran the
+                # old shared counter.)
+                self.echoes_by_symbol[sym] = \
+                    self.echoes_by_symbol.get(sym, 0) + 1
                 for name in ("sma", "ema"):
                     sig = self.models[name][sym].ingest(fr["price_e4"])
                     if sig:
@@ -286,9 +303,9 @@ class Bridge:
                               f"${dollars(sig.price_e4):.4f}  "
                               f"fast={sig.sma_fast} slow={sig.sma_slow}")
                         self.verifiers[(name, sym)].on_model_signal(
-                            sig, self.echoes)
-            for v in self.verifiers.values():
-                v.on_echo(self.echoes)
+                            sig, self.echoes_by_symbol[sym])
+            for (_, vsym), v in self.verifiers.items():
+                v.on_echo(self.echoes_by_symbol.get(vsym, 0))
             if self.on_echo:
                 self.on_echo(fr)
 
@@ -307,7 +324,8 @@ class Bridge:
                 self.log.write(json.dumps(
                     {"t": now_us(), "signal": True, **fr}) + "\n")
             if key in self.verifiers:
-                self.verifiers[key].on_fpga_signal(fr, self.echoes)
+                self.verifiers[key].on_fpga_signal(
+                    fr, self.echoes_by_symbol.get(sym, 0))
             else:
                 print(f"!! signal for unconfigured symbol {sym} — "
                       "host/FPGA slot mismatch?")
