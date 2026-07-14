@@ -113,9 +113,10 @@ class DashboardServer:
             "divergences": sum(v.divergences
                                for v in br.verifiers.values()),
             "strategies": [
-                {"name": c.name, "signals": c.signals, "trips": c.trips,
-                 "wins": c.wins, "net": round(c.net_usd, 2),
-                 "open": c.open_e4 is not None}
+                {"name": c.name, "live": c.live, "signals": c.signals,
+                 "trips": c.trips, "wins": c.wins, "blocked": c.blocked,
+                 "net": round(c.net_usd, 2),
+                 "open": sum(1 for v in c.positions.values() if v) > 0}
                 for c in (self.scorecards or {}).values()],
             "warmed_up": m.warmed_up,
             "fill": m.fill, "slow_n": m.slow_n,
@@ -440,10 +441,12 @@ async function poll(){
     drawChart(s.series,s.signals);
     if(s.strategies&&s.strategies.length)
       $('cmp').innerHTML='<table><thead><tr><th>strategy</th><th>signals'+
-        '</th><th>trips</th><th>wins</th><th>net $</th></tr></thead><tbody>'+
-        s.strategies.map(c=>'<tr><td>'+c.name+(c.open?' *':'')+'</td><td>'+
-        c.signals+'</td><td>'+c.trips+'</td><td>'+c.wins+'</td><td class="'+
-        (c.net>=0?'buy':'sell')+'">'+c.net.toFixed(2)+
+        '</th><th>trips</th><th>wins</th><th>blocked/gated</th>'+
+        '<th>net $</th></tr></thead><tbody>'+
+        s.strategies.map(c=>'<tr><td>'+c.name+(c.live?' [LIVE]':'')+
+        (c.open?' *':'')+'</td><td>'+c.signals+'</td><td>'+c.trips+
+        '</td><td>'+(c.wins===null?'—':c.wins)+'</td><td>'+c.blocked+
+        '</td><td class="'+(c.net>=0?'buy':'sell')+'">'+c.net.toFixed(2)+
         '</td></tr>').join('')+'</tbody></table>';
     $('sigs').innerHTML=s.signals.map(x=>'<tr><td>'+x.t+'</td>'+
       '<td>'+x.symbol+'</td>'+

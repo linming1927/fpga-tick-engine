@@ -537,9 +537,22 @@ def main():
     from compare import StrategyScorecard, comparison_report
     br = Bridge(args.port, symbols, args.fast, args.slow,
                 ema_kf=args.ema_kf, ema_ks=args.ema_ks, log_path=args.log)
-    cards = {"sma": StrategyScorecard(f"SMA {args.fast}/{args.slow}"),
-             "ema": StrategyScorecard(
-                 f"EMA 1/{1 << args.ema_kf}:1/{1 << args.ema_ks}")}
+
+    labels = {"sma": f"SMA {args.fast}/{args.slow}",
+              "ema": f"EMA 1/{1 << args.ema_kf}:1/{1 << args.ema_ks}"}
+    cards = {}
+    for name, label in labels.items():
+        live = (name == args.strategy)
+        cards[name] = StrategyScorecard(
+            name=label, live=live,
+            # the UNTRADED strategy is gated through its OWN RiskPolicy
+            # clone, built from the SAME RiskLimits the real OM enforces
+            # and ticking on the same wall clock — so this row answers
+            # "how would this strategy have fared under IDENTICAL
+            # constraints" rather than "if every signal became a trade".
+            # The live row is overwritten from om.costs at session end.
+            policy=None if live else RiskPolicy(limits))
+
     dash = None
     if args.dashboard:
         from dashboard import DashboardServer
@@ -547,11 +560,14 @@ def main():
         dash.start()
 
     def on_verified(fr):
-        cards[fr["strategy"]].on_signal(fr)      # both strategies scored
+        strat = fr["strategy"]
+        if strat == args.strategy:
+            cards[strat].signals += 1     # real routing/gating/fills below
+            om.on_signal(fr)
+        else:
+            cards[strat].on_signal(fr)    # hypothetical, gated identically
         if dash:
             dash.on_signal(fr)
-        if fr["strategy"] == args.strategy:      # only one trades
-            om.on_signal(fr)
 
     def on_divergence(info):
         if dash:
@@ -561,7 +577,7 @@ def main():
     br.on_verified = on_verified          # survives slot reconfiguration:
     br.on_divergence = on_divergence      # _build_models re-attaches these
     print(f"[om] trading strategy: {args.strategy.upper()} "
-          f"(the other is scored, not traded)")
+          f"(the other is scored, gated identically, not traded)")
 
     try:
         if args.source == "sim":
@@ -572,6 +588,14 @@ def main():
         pass
     finally:
         ok = br.summary()
+        live = cards[args.strategy]           # fill the live row for real
+        live.trips = om.costs.sells
+        live.wins = None                      # CostTracker has no per-trip
+                                              # win/loss; report honestly
+        live.pnl_e4 = om.costs.realized_pnl_e4
+        live.fees_usd = om.costs.total_fees
+        live.blocked = om.blocked
+        live.positions = dict(om.positions)
         print(comparison_report(cards))
         om.summary(args.household_income, args.filing_status,
                    args.state_rate, args.gross)

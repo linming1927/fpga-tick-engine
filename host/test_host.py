@@ -245,6 +245,41 @@ check("scorecard fees charged", sc.fees_usd > 0, True)
 check("scorecard flat after close", sc.open_e4, None)
 check("report renders", "strategy comparison" in
       comparison_report({"t": sc}), True)
+
+# ---- v2.1: gated replay through a RiskPolicy clone ---------------------
+from order_manager import RiskPolicy, RiskLimits
+tight = RiskLimits(order_qty=1, max_shares=10, max_notional_e4=10**12,
+                   max_orders_per_day=99, cooldown_s=1000.0,
+                   require_market_hours=False)
+gated = StrategyScorecard("G", policy=RiskPolicy(tight))
+gated.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000, "symbol": "SPY",
+                 "strategy": "ema"})
+check("gated: first signal allowed", (gated.trips, gated.blocked), (0, 0))
+check("gated: position opened", gated.positions.get("SPY"), 1)
+gated.on_signal({"side": SIDE_SELL, "price_e4": 2_000_000, "symbol": "SPY",
+                 "strategy": "ema"})
+check("gated: cooldown blocks the very next signal",
+      (gated.trips, gated.blocked), (0, 1))
+check("gated: block reason is cooldown",
+      "cooldown" in next(iter(gated.block_reasons)), True)
+check("gated: position still open (sell was blocked)",
+      gated.positions.get("SPY"), 1)
+
+loose = RiskLimits(order_qty=1, max_shares=10, max_notional_e4=10**12,
+                   max_orders_per_day=99, cooldown_s=0.0,
+                   require_market_hours=False)
+gated2 = StrategyScorecard("G2", policy=RiskPolicy(loose))
+gated2.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000, "symbol": "SPY",
+                  "strategy": "ema"})
+gated2.on_signal({"side": SIDE_SELL, "price_e4": 1_100_000, "symbol": "SPY",
+                  "strategy": "ema"})
+check("gated: zero-cooldown trip completes", gated2.trips, 1)
+check("gated: fee applied", gated2.fees_usd > 0, True)
+r = comparison_report({"live": StrategyScorecard("L", live=True, trips=3),
+                       "gated": gated})
+check("report tags LIVE row", "[LIVE]" in r, True)
+check("report shows gated count", "1 gated" in r, True)
+check("report explains block reasons", "gated-away signals" in r, True)
 br.close()
 emu.stop()
 
