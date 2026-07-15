@@ -170,6 +170,23 @@ set of backtest-only assumptions.
   can never be realized here) — that's not a quality signal, watch net
   $ and the `would realize a loss` count in the block-reason breakdown
   instead.
+- **`--htf-ltf`** adds a multi-timeframe trend-alignment strategy (see
+  `htf_ltf_strategy.py`): a higher-timeframe 20/50/200 EMA stack sets a
+  long-only bullish/bearish/none bias; a lower-timeframe fast/slow EMA
+  cross times entries, only in the bias direction; the position then
+  trails until a lower-timeframe bar closes back below its fast EMA —
+  independent of whether the higher-timeframe bias has technically
+  reversed yet. `--htf-interval`/`--ltf-interval` set each timeframe's
+  bar size in seconds (default 3600/300 = 1 hour / 5 minutes). Two
+  scope notes worth knowing: it's **long-only** (a bearish HTF bias
+  means stay flat, not short — nothing in this project shorts), and it
+  uses the **exact textbook EMA formula** (alpha = 2/(N+1)), not the
+  power-of-two alpha every other engine here uses for FPGA-friendly
+  shift arithmetic — this strategy never runs in fabric, so there's no
+  reason to force that approximation. This is also the first strategy
+  that needs OHLC bars rather than raw ticks, since "the daily chart"
+  and "the 15-minute chart" aren't concepts the tick-level engines have
+  any notion of.
 - **Combine incrementally-fetched ranges** without re-downloading, by
   passing multiple files in chronological order:
   ```bash

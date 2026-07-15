@@ -97,7 +97,8 @@ def iter_trades_multi(paths: list[str]):
 def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
                  ema_kf: int, ema_ks: int, limits: RiskLimits,
                  traded_strategy: str, progress_every: int = 500_000,
-                 profit_gate: bool = False
+                 profit_gate: bool = False, htf_ltf: bool = False,
+                 htf_interval_s: int = 3600, ltf_interval_s: int = 300
                  ) -> dict[str, StrategyScorecard]:
     if isinstance(trades_paths, str):
         trades_paths = [trades_paths]
@@ -123,6 +124,19 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
             "SMA profit-gated", live=False,
             policy=RiskPolicy(limits, now_fn=clocks["sma_pg"]))
         cards["sma_pg"] = profit_gated
+
+    htf_ltf_card = None
+    if htf_ltf:
+        from htf_ltf_strategy import HTFLTFScorecard
+        # its own RiskPolicy clone too, same limits as every other row,
+        # so the comparison isolates the STRATEGY LOGIC (multi-timeframe
+        # trend alignment) as the variable, not a difference in risk
+        # gating — same principle as every other shadow row
+        htf_ltf_card = HTFLTFScorecard(
+            "HTF/LTF trend", symbol=symbol, live=False,
+            policy=RiskPolicy(limits, now_fn=HistoricalClock()),
+            htf_interval_s=htf_interval_s, ltf_interval_s=ltf_interval_s)
+        cards["htf_ltf"] = htf_ltf_card
 
     n = 0
     first_t = last_t = None
@@ -150,6 +164,9 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
             clocks["ema"].set(t)
             cards["ema"].on_signal({"side": sig.side, "price_e4": sig.price_e4,
                                     "symbol": symbol, "strategy": "ema"})
+
+        if htf_ltf_card is not None:
+            htf_ltf_card.on_tick(t, price_e4)
 
     print(f"[backtest] {n:,} trades replayed for {symbol}", file=sys.stderr)
     cards["sma"].live = (traded_strategy == "sma")
@@ -201,6 +218,21 @@ def main():
                          "price is above the average cost of shares "
                          "held (see compare.py's ProfitGatedScorecard) "
                          "— always score-only, regardless of --strategy")
+    ap.add_argument("--htf-ltf", action="store_true",
+                    help="also backtest a multi-timeframe trend-"
+                         "alignment strategy: a higher-timeframe 20/50/"
+                         "200 EMA stack sets a long-only bullish/bearish/"
+                         "none bias, a lower-timeframe fast/slow EMA "
+                         "cross times entries (only with the bias), and "
+                         "the position trails until price closes back "
+                         "below the LTF fast EMA (see htf_ltf_strategy.py) "
+                         "— always score-only, regardless of --strategy")
+    ap.add_argument("--htf-interval", type=int, default=3600,
+                    help="higher-timeframe bar size in seconds "
+                         "(default 3600 = 1 hour)")
+    ap.add_argument("--ltf-interval", type=int, default=300,
+                    help="lower-timeframe bar size in seconds "
+                         "(default 300 = 5 minutes)")
     ap.add_argument("--results-dir", default=RESULTS_DIR_DEFAULT,
                     help="where saved runs go — browse them with "
                          "list_backtest_results.py")
@@ -221,7 +253,10 @@ def main():
     trades_paths = [p.strip() for p in args.trades.split(",") if p.strip()]
     cards, meta = run_backtest(trades_paths, args.symbol, args.fast,
                               args.slow, args.ema_kf, args.ema_ks, limits,
-                              args.strategy, profit_gate=args.profit_gate)
+                              args.strategy, profit_gate=args.profit_gate,
+                              htf_ltf=args.htf_ltf,
+                              htf_interval_s=args.htf_interval,
+                              ltf_interval_s=args.ltf_interval)
     print()
     print(comparison_report(cards))
 
@@ -235,6 +270,9 @@ def main():
             "max_orders_per_day": args.max_orders_per_day,
             "cooldown": args.cooldown,
             "profit_gate": args.profit_gate,
+            "htf_ltf": args.htf_ltf,
+            "htf_interval_s": args.htf_interval,
+            "ltf_interval_s": args.ltf_interval,
         }
         run_dir = save_backtest_result(cards, args.symbol, meta, params,
                                        results_dir=args.results_dir)

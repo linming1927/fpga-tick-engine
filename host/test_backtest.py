@@ -274,6 +274,45 @@ check("max_notional default is specifically $2,000, not the old "
      "effectively-unlimited $1,000,000",
      cli_default(bt_src, "--max-notional"), 2000.0)
 
+# ---- v3.7: --htf-ltf wired into backtest.py -------------------------------
+print("[G9] backtest.py can also score the HTF/LTF trend strategy")
+p9 = os.path.join(tmp, "t9.jsonl")
+t9 = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+rows9 = []
+price = 100.0
+for minute in range(0, 400, 5):     # small custom periods below need far
+    price += 0.3                    # less warmup than the real 20/50/200
+    rows9.append((t9 + timedelta(minutes=minute), price))
+write_jsonl(p9, rows9)
+
+cards9, meta9 = run_backtest(p9, "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                            ema_ks=3, limits=limits, traded_strategy="sma",
+                            htf_ltf=True)
+check("htf_ltf card is present when requested", "htf_ltf" in cards9, True)
+check("it is always score-only (live=False)", cards9["htf_ltf"].live, False)
+
+cards10, meta10 = run_backtest(p9, "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                              ema_ks=3, limits=limits, traded_strategy="sma")
+check("htf_ltf card is absent when NOT requested (default off)",
+      "htf_ltf" in cards10, False)
+
+r9 = comparison_report(cards9)
+check("comparison report includes the HTF/LTF row",
+      "HTF/LTF trend" in r9, True)
+
+print("[G10] the real backtest.py --htf-ltf CLI works end to end")
+r = subprocess.run(
+    [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "backtest.py"),
+     "--trades", p9, "--symbol", "SPY", "--strategy", "sma",
+     "--fast", "4", "--slow", "8", "--ema-kf", "1", "--ema-ks", "3",
+     "--htf-ltf", "--htf-interval", "3600", "--ltf-interval", "300",
+     "--no-save"],
+    capture_output=True, text=True, timeout=30)
+check("CLI run succeeded", r.returncode, 0)
+check("CLI output includes the HTF/LTF row", "HTF/LTF trend" in r.stdout,
+      True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")
