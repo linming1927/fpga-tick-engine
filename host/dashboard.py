@@ -276,7 +276,7 @@ td:first-child,th:first-child{text-align:left}
   font:inherit;letter-spacing:.12em;padding:5px 14px;border-radius:4px;
   cursor:pointer}
 #cfgmsg{color:var(--dim);font-size:11px;align-self:center}
-#csym{background:var(--bg);border:1px solid var(--line);color:var(--ink);
+#csym,#csym2{background:var(--bg);border:1px solid var(--line);color:var(--ink);
   font:inherit;padding:2px 6px;border-radius:4px;margin-left:8px}
 .killwrap{margin-top:14px;display:flex;align-items:center;gap:12px}
 #kill{background:none;border:2px solid var(--red);color:var(--red);

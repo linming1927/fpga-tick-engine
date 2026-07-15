@@ -76,6 +76,10 @@ check("page has the chart canvas", 'id="chart"' in page, True)
 check("page has the kill switch", "KILL SWITCH" in page, True)
 check("two chart canvases present, for two side-by-side symbols",
       page.count('<canvas id="chart') >= 2, True)
+check("both chart dropdowns share the same styling rule "
+     "(#csym2 previously fell back to unstyled browser defaults, "
+     "since the CSS only targeted #csym)",
+     "#csym,#csym2" in page or "#csym2,#csym" in page, True)
 check("second chart has its own independent symbol selector",
       'id="csym2"' in page, True)
 check("EVENTS section appears AFTER (below) the SIGNALS table in the "
