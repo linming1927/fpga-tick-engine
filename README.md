@@ -82,6 +82,21 @@ summary, so treat it as an escape hatch, not routine.
 
 ---
 
+**A fourth comparison row, `--profit-gate`,** scores the SAME SMA
+crossover signals with one added rule: a sell only executes if price
+is strictly above the average cost of shares currently held — refusing
+to realize a loss. Score-only, never trades, regardless of
+`--strategy`. Worth knowing before reading its numbers: its win rate is
+trivially 100% by construction (a loss can never be realized here, so
+every closed trip is definitionally a win) — that's not a sign of
+quality, it's just the rule. This is the textbook "disposition effect"
+from behavioral finance (holding losers too long, selling winners
+quickly); the published literature on it generally finds it *hurts*
+returns, since a position that never recovers just sits open
+indefinitely instead of realizing a small, bounded loss. Watch the
+`open` indicator (`*`) and the block-reason breakdown (`would realize
+a loss x...`) alongside net $, not just the win percentage.
+
 ## Historical Data & Backtesting
 
 Live sessions produce a handful of round trips at best — every

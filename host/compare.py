@@ -127,6 +127,93 @@ class StrategyScorecard:
                 f"{self.net_usd:>+10.2f}  {open_s}{blk}")
 
 
+@dataclass
+class ProfitGatedScorecard(StrategyScorecard):
+    """The SAME SMA (or EMA) crossover signals as any other scored row,
+    with one extra rule on the SELL side: a sell only executes if the
+    price is strictly ABOVE the weighted-average cost basis of the
+    shares held — i.e., this variant refuses to realize a loss. If the
+    crossover says sell but the position would come out underwater, the
+    position just stays open, waiting for a future price recovery (or a
+    later crossover) before it will ever close.
+
+    BUYS are untouched — identical to the base class, gated through the
+    same RiskPolicy clone as any other shadow row — so the comparison
+    isolates ONE variable: does refusing to sell at a loss help or hurt,
+    holding entry logic and risk limits constant.
+
+    Two things worth knowing about what this measures, not just what it
+    does:
+      * win rate here is trivially 100% by construction — a loss is
+        never realized, so every trip that DOES close is a win. That's
+        not a sign of a good strategy; it's definitionally true given
+        the rule. The number that actually matters is net P&L and how
+        many symbols end the session still stuck open underwater.
+      * this is the textbook "disposition effect" (behavioral finance's
+        name for holding losers too long, selling winners quickly) —
+        the published literature on it generally finds it hurts
+        returns, since a position that never recovers just ties up
+        capital indefinitely instead of realizing a small, bounded
+        loss. Built as asked; let the comparison numbers speak for
+        themselves rather than assuming either outcome.
+    """
+
+    def on_signal(self, fr: dict) -> str:
+        self.signals += 1
+        side, price = fr["side"], fr["price_e4"]
+        sym = fr.get("symbol", "").strip()
+        pos_qty = self.positions.get(sym, 0)
+
+        if self.policy is not None:
+            allowed, reason, qty = self.policy.evaluate(side, pos_qty,
+                                                         price)
+            if not allowed:
+                self.blocked += 1
+                self.block_reasons[reason.split(" (")[0]] += 1
+                return f"gated: {reason}"
+        else:
+            if side == SIDE_BUY and pos_qty > 0:
+                return "ignored: already open"
+            if side == SIDE_SELL and pos_qty <= 0:
+                return "ignored: flat"
+            qty = self.qty if side == SIDE_BUY else pos_qty
+
+        if side == SIDE_BUY:
+            old_qty = self.positions.get(sym, 0)
+            old_avg = self.opens.get(sym, price)
+            new_qty = old_qty + qty
+            self.opens[sym] = ((old_avg * old_qty + price * qty)
+                               // new_qty) if old_qty else price
+            self.positions[sym] = new_qty
+            if self.policy is not None:
+                self.policy.record_order()
+            return "FILLED (scored)"
+
+        # SIDE_SELL: the one rule this whole class exists to add
+        entry = self.opens.get(sym, price)
+        if price <= entry:
+            self.blocked += 1
+            self.block_reasons["would realize a loss"] += 1
+            # NOTE: record_order() is deliberately NOT called here — a
+            # suppressed sell never became an order at all, so it
+            # shouldn't consume cooldown or the daily cap the way a
+            # real rejected order would; only actual fills should.
+            return "gated: would realize a loss (price <= avg cost)"
+
+        if self.policy is not None:
+            self.policy.record_order()
+        qty_to_sell = self.positions.get(sym, 0)
+        trip = (price - entry) * qty_to_sell
+        self.pnl_e4 += trip
+        self.trips += 1
+        self.wins = (self.wins or 0) + 1        # always true here, by rule
+        self.fees_usd += self.fees.sell_fees(
+            qty_to_sell, qty_to_sell * price / 10_000.0)["total"]
+        self.positions[sym] = 0
+        self.opens.pop(sym, None)
+        return "FILLED (scored)"
+
+
 def comparison_report(cards: dict[str, StrategyScorecard]) -> str:
     lines = ["---- strategy comparison ([LIVE] = real fills; the other is "
              "replayed through an identical RiskPolicy clone) ----",

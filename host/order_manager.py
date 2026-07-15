@@ -601,6 +601,12 @@ def main():
                     "ladder_strategy").BASELINE_METHODS),
                     default="week_vwap",
                     help="how to compute each symbol's weekly baseline")
+    ap.add_argument("--profit-gate", action="store_true",
+                    help="also score the SAME SMA crossover signals with "
+                         "one added rule: a sell only executes if price "
+                         "is above the average cost of shares held — "
+                         "SCORE ONLY, never trades, regardless of "
+                         "--strategy")
     ap.add_argument("--baud", type=int, default=921_600,
                     help="must match the bitstream's BAUD parameter — "
                          "921600 (default) for the current build, 115200 "
@@ -724,6 +730,17 @@ def main():
                 print(f"[ladder] WARNING: no baseline for {sym} — pass "
                       f"--ladder-baseline {sym}:<price> for --source sim")
 
+    profit_gated = None
+    if args.profit_gate:
+        from compare import ProfitGatedScorecard
+        # its OWN RiskPolicy clone (same limits as every other shadow
+        # row) — this isolates the sell-side profit rule as the ONLY
+        # difference from the plain SMA row, not a difference in
+        # cooldown/daily-cap/position-sizing too
+        profit_gated = ProfitGatedScorecard(
+            "SMA profit-gated", policy=RiskPolicy(limits))
+        cards["sma_pg"] = profit_gated
+
     dash = None
     if args.dashboard:
         from dashboard import DashboardServer
@@ -753,6 +770,14 @@ def main():
             sync_live_card(cards, args.strategy, om)  # keep dashboard fresh
         else:
             outcome = cards[strat].on_signal(fr)  # hypothetical, gated
+        # profit_gated is ALWAYS score-only, regardless of --strategy —
+        # same as the ladder — so it gets fed in parallel, not instead
+        # of the normal routing above. It watches the SAME "sma"
+        # crossover signal stream (SMA is what the sell-above-cost rule
+        # was built against), whether or not "sma" happens to be the
+        # strategy actually trading.
+        if profit_gated is not None and strat == "sma":
+            profit_gated.on_signal(fr)
         if dash:
             dash.on_signal(fr, outcome)
 
