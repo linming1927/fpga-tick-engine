@@ -136,6 +136,33 @@ python3 host/backtest.py --trades historical_trades/SPY_2026-01-01_2026-07-01.tr
   "the indicator under these risk limits," not the raw indicator's
   unconstrained behavior.
 
+### 3. Every run is saved automatically — go back and review it later
+
+No extra flag needed — `backtest.py` saves each run to
+`./backtest_results/<symbol>_<start>_<end>_<timestamp>/` by default,
+containing:
+
+- **`summary.json`** — symbol, real date range (derived from the actual
+  trade data replayed, not guessed from a filename), every strategy
+  parameter used, and the full per-strategy results (signals, trips,
+  wins, win rate, gross/fees/net, block reasons, open positions)
+- **`report.txt`** — the exact human-readable comparison table, with
+  the parameters listed above it
+
+Rerunning the same symbol and date range with different parameters
+never overwrites an earlier result — each run gets its own folder,
+collision-proof even for two runs in the same second. Pass `--no-save`
+to skip saving a quick throwaway run, or `--results-dir` to save
+somewhere other than the default.
+
+Browse what you've saved:
+```bash
+python3 host/list_backtest_results.py                  # every run, newest first
+python3 host/list_backtest_results.py --symbol RKLB     # just one symbol
+python3 host/list_backtest_results.py --folder RKLB_2023-07-16_2026-07-13_20260715-161454
+                                                        # full report for one run
+```
+
 ---
 
 
