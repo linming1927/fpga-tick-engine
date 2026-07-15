@@ -12,7 +12,9 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 
+import subprocess
 from backtest import run_backtest, BacktestClock, iter_trades, iter_trades_multi
+from compare import comparison_report
 from order_manager import RiskLimits, RiskPolicy
 from tick_protocol import to_e4
 
@@ -197,6 +199,49 @@ try:
 except ValueError:
     check("out-of-order files raise instead of silently corrupting",
           "error", "error")
+
+# ---- v3.5: --profit-gate in backtest.py (wasn't wired in at all) --------
+print("[G6] backtest.py can also score the profit-gated variant "
+     "alongside SMA/EMA")
+p6 = os.path.join(tmp, "t6.jsonl")
+day6 = datetime(2020, 1, 2, 14, 30, tzinfo=timezone.utc)
+prices6 = [2000, 1900, 1800, 1700, 1600, 1500, 1400, 1300,  # warmup
+          3000, 3100,                                       # BUY, hold
+          2900, 2800]                                       # settle low
+rows6 = [(day6 + timedelta(seconds=i), p) for i, p in enumerate(prices6)]
+write_jsonl(p6, rows6)
+
+cards6, meta6 = run_backtest(p6, "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                            ema_ks=3, limits=limits, traded_strategy="sma",
+                            profit_gate=True)
+check("profit-gated card is present when requested", "sma_pg" in cards6,
+      True)
+check("it received the SAME sma crossover signal as the plain SMA card",
+      cards6["sma_pg"].signals, cards6["sma"].signals)
+check("profit-gated card is always score-only (live=False)",
+      cards6["sma_pg"].live, False)
+
+cards7, meta7 = run_backtest(p6, "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                            ema_ks=3, limits=limits, traded_strategy="sma")
+check("profit-gated card is absent when NOT requested (default off)",
+      "sma_pg" in cards7, False)
+
+r6 = comparison_report(cards6)
+check("comparison report includes the profit-gated row",
+      "SMA profit-gated" in r6, True)
+
+# ---- end-to-end: the actual CLI, not just the function -------------------
+print("[G7] the real backtest.py --profit-gate CLI works end to end")
+r = subprocess.run(
+    [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "backtest.py"),
+     "--trades", p6, "--symbol", "SPY", "--strategy", "sma",
+     "--fast", "4", "--slow", "8", "--ema-kf", "1", "--ema-ks", "3",
+     "--profit-gate", "--no-save"],
+    capture_output=True, text=True, timeout=30)
+check("CLI run succeeded", r.returncode, 0)
+check("CLI output includes the profit-gated row",
+      "SMA profit-gated" in r.stdout, True)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

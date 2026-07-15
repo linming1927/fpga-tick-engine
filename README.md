@@ -155,6 +155,15 @@ python3 host/backtest.py --trades historical_trades/SPY_2026-01-01_2026-07-01.tr
   gating evaluate against each trade's own *historical* timestamp, not
   wall-clock time while the script runs — replaying years of data in
   seconds still gets correct day-by-day and cooldown gating.
+- **`--profit-gate`** adds a third row, `SMA profit-gated` — the same
+  SMA crossover signals with one rule added: a sell only executes if
+  price is above the average cost of shares held (see
+  `compare.py`'s `ProfitGatedScorecard`; also available live via
+  `order_manager.py --profit-gate`). Always score-only, regardless of
+  `--strategy`. Its win rate is trivially 100% by construction (a loss
+  can never be realized here) — that's not a quality signal, watch net
+  $ and the `would realize a loss` count in the block-reason breakdown
+  instead.
 - **Combine incrementally-fetched ranges** without re-downloading, by
   passing multiple files in chronological order:
   ```bash

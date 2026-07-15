@@ -96,20 +96,33 @@ def iter_trades_multi(paths: list[str]):
 
 def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
                  ema_kf: int, ema_ks: int, limits: RiskLimits,
-                 traded_strategy: str, progress_every: int = 500_000
+                 traded_strategy: str, progress_every: int = 500_000,
+                 profit_gate: bool = False
                  ) -> dict[str, StrategyScorecard]:
     if isinstance(trades_paths, str):
         trades_paths = [trades_paths]
     sma_model = SMAMirror(fast_n=fast_n, slow_n=slow_n)
     ema_model = EMAMirror(k_fast=ema_kf, k_slow=ema_ks, warmup_n=slow_n)
 
-    clocks = {"sma": BacktestClock(), "ema": BacktestClock()}
+    clocks = {"sma": HistoricalClock(), "ema": HistoricalClock()}
     cards = {
         name: StrategyScorecard(
             f"{name.upper()} backtest", live=False,
             policy=RiskPolicy(limits, now_fn=clocks[name]))
         for name in ("sma", "ema")
     }
+    profit_gated = None
+    if profit_gate:
+        # SAME SMA crossover stream as cards["sma"], one added rule on
+        # sells (see compare.py's ProfitGatedScorecard) — its own
+        # RiskPolicy clone and its own historical clock, exactly
+        # mirroring how the live order_manager.py wires this in
+        clocks["sma_pg"] = HistoricalClock()
+        from compare import ProfitGatedScorecard
+        profit_gated = ProfitGatedScorecard(
+            "SMA profit-gated", live=False,
+            policy=RiskPolicy(limits, now_fn=clocks["sma_pg"]))
+        cards["sma_pg"] = profit_gated
 
     n = 0
     first_t = last_t = None
@@ -126,6 +139,11 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
             clocks["sma"].set(t)
             cards["sma"].on_signal({"side": sig.side, "price_e4": sig.price_e4,
                                     "symbol": symbol, "strategy": "sma"})
+            if profit_gated is not None:
+                clocks["sma_pg"].set(t)
+                profit_gated.on_signal({"side": sig.side,
+                                       "price_e4": sig.price_e4,
+                                       "symbol": symbol, "strategy": "sma"})
 
         sig = ema_model.ingest(price_e4)
         if sig:
@@ -172,6 +190,12 @@ def main():
     ap.add_argument("--max-notional", type=float, default=1_000_000.0)
     ap.add_argument("--max-orders-per-day", type=int, default=10)
     ap.add_argument("--cooldown", type=float, default=60.0)
+    ap.add_argument("--profit-gate", action="store_true",
+                    help="also backtest the SAME SMA crossover signals "
+                         "with one added rule: a sell only executes if "
+                         "price is above the average cost of shares "
+                         "held (see compare.py's ProfitGatedScorecard) "
+                         "— always score-only, regardless of --strategy")
     ap.add_argument("--results-dir", default=RESULTS_DIR_DEFAULT,
                     help="where saved runs go — browse them with "
                          "list_backtest_results.py")
@@ -192,7 +216,7 @@ def main():
     trades_paths = [p.strip() for p in args.trades.split(",") if p.strip()]
     cards, meta = run_backtest(trades_paths, args.symbol, args.fast,
                               args.slow, args.ema_kf, args.ema_ks, limits,
-                              args.strategy)
+                              args.strategy, profit_gate=args.profit_gate)
     print()
     print(comparison_report(cards))
 
@@ -205,6 +229,7 @@ def main():
             "max_notional": args.max_notional,
             "max_orders_per_day": args.max_orders_per_day,
             "cooldown": args.cooldown,
+            "profit_gate": args.profit_gate,
         }
         run_dir = save_backtest_result(cards, args.symbol, meta, params,
                                        results_dir=args.results_dir)
