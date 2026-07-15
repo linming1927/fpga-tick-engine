@@ -259,6 +259,7 @@ canvas{width:100%;height:300px;display:block}
 .stat b{font-size:17px;font-weight:600}
 .pos b{color:var(--amber)} .good b{color:var(--green)} .bad b{color:var(--red)}
 table{width:100%;border-collapse:collapse;font-size:12px}
+td.outcome{white-space:nowrap}
 td,th{padding:3px 6px;text-align:right;border-bottom:1px solid var(--line)}
 th{color:var(--dim);font-weight:600;font-size:10px;letter-spacing:.14em}
 td:first-child,th:first-child{text-align:left}
@@ -318,16 +319,15 @@ td:first-child,th:first-child{text-align:left}
       <b class="buy">▲ buy</b><b class="sell">▼ sell</b></div>
     <div id="cmp" style="margin-top:10px"></div>
   </div>
-  <div>
-    <div class="panel"><h2>SIGNALS</h2>
-      <table><thead><tr><th>t</th><th>sym</th><th>strat</th><th>side</th>
-      <th>price</th><th>fast</th><th>slow</th><th>outcome</th></tr></thead>
-      <tbody id="sigs"></tbody></table>
-    </div>
-    <div class="panel" style="margin-top:14px"><h2>EVENTS</h2>
-      <div class="log" id="log"><div>console up — waiting for ticks</div></div>
-    </div>
+  <div class="panel"><h2>EVENTS</h2>
+    <div class="log" id="log"><div>console up — waiting for ticks</div></div>
   </div>
+</div>
+<div class="panel" style="margin-top:14px"><h2>SIGNALS</h2>
+  <table><thead><tr><th>t</th><th>sym</th><th>strat</th><th>side</th>
+  <th>price</th><th>fast</th><th>slow</th><th>outcome</th></tr></thead>
+  <tbody id="sigs"></tbody></table>
+</div>
 </div>
 <div class="killwrap">
   <button id="kill">KILL SWITCH</button>
@@ -455,7 +455,7 @@ async function poll(){
       '<td class="'+(x.side===1?'buy">BUY':'sell">SELL')+'</td>'+
       '<td>'+usd(x.price_e4)+'</td><td>'+usd(x.sma_fast)+'</td>'+
       '<td>'+usd(x.sma_slow)+'</td>'+
-      '<td class="'+(x.outcome.startsWith('FILLED')?'buy':
+      '<td class="outcome '+(x.outcome.startsWith('FILLED')?'buy':
                      x.outcome.startsWith('rejected')?'sell':'')+
       '" style="'+(x.outcome.startsWith('blocked')||
                    x.outcome.startsWith('gated')?'color:var(--amber)':
