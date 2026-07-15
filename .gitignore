@@ -28,3 +28,7 @@ om.kill
 # line keeps it out of git forever (gitignore has no trailing
 # comments — patterns must sit alone on their line, like these)
 .env
+
+# downloaded historical market data — regenerable via
+# fetch_historical_trades.py + Alpaca's API, not source code
+historical_trades/
