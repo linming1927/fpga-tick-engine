@@ -183,6 +183,63 @@ br.close()
 emu.stop()
 
 # ---------------------------------------------------------------------------
+# ---- v2.6: sync_live_card keeps the dashboard's view CONTINUOUSLY
+# fresh, not just at session shutdown -- the actual reported bug: real
+# fills were happening, but the strategy comparison panel showed
+# 0 trips/0 wins/net $0 for the whole session because the live card
+# was only ever synced from om.costs ONCE, at the very end. --------
+print("[G6] sync_live_card reflects reality immediately after EACH "
+     "fill, not only when the session ends")
+from order_manager import sync_live_card
+from compare import StrategyScorecard
+
+d6 = tempfile.mkdtemp()
+om6 = OrderManager(MockBroker(), ["SPY", "QQQ"],
+                   RiskLimits(order_qty=1, max_shares=5,
+                              max_notional_e4=10**13, max_orders_per_day=99,
+                              cooldown_s=0.0, require_market_hours=False),
+                   audit_path=os.path.join(d6, "a.jsonl"),
+                   killfile=os.path.join(d6, "om.kill"))
+cards6 = {"sma": StrategyScorecard("SMA", live=True)}
+
+# BEFORE any fills: the card should still show the pre-fill truth (zero)
+sync_live_card(cards6, "sma", om6)
+check("before any fills: trips is 0", cards6["sma"].trips, 0)
+check("before any fills: positions show all configured symbols at 0",
+      cards6["sma"].positions, {"SPY": 0, "QQQ": 0})
+
+# fill #1: open SPY -- sync must reflect this IMMEDIATELY, mid-session,
+# not just at the end
+om6.on_signal(sig(SIDE_BUY, 1_000_000, "SPY"))
+sync_live_card(cards6, "sma", om6)
+check("after fill #1: position reflects the real OM state",
+      cards6["sma"].positions.get("SPY"), 1)
+check("after fill #1: still 0 trips (position is OPEN, not closed yet)",
+      cards6["sma"].trips, 0)
+
+# fill #2: open QQQ too -- exactly the user's reported scenario (two
+# open positions, no closes yet)
+om6.on_signal(sig(SIDE_BUY, 2_000_000, "QQQ"))
+sync_live_card(cards6, "sma", om6)
+check("two open positions reflected correctly",
+      cards6["sma"].positions, {"SPY": 1, "QQQ": 1})
+check("0 trips is CORRECT here (nothing has closed) -- the bug wasn't "
+     "that 0 trips could ever be shown, it's that stale zeros were "
+     "shown even AFTER real closes happened", cards6["sma"].trips, 0)
+
+# fill #3: CLOSE spy -- a real trip completes; sync must show it
+om6.on_signal(sig(SIDE_SELL, 1_100_000, "SPY"))
+sync_live_card(cards6, "sma", om6)
+check("after a real close: trips is now 1, not stuck at 0",
+      cards6["sma"].trips, 1)
+check("after a real close: net P&L reflects the REAL realized gain",
+      cards6["sma"].pnl_e4, om6.costs.realized_pnl_e4)
+check("after a real close: net P&L is nonzero (matches the reported "
+     "symptom: dashboard showed $0 despite real realized P&L)",
+      cards6["sma"].pnl_e4 != 0, True)
+check("QQQ position untouched by SPY's close",
+      cards6["sma"].positions.get("QQQ"), 1)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

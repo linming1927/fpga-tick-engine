@@ -465,6 +465,25 @@ class OrderManager:
 # ---------------------------------------------------------------------------
 # Integrated CLI: bridge + order manager in one process
 # ---------------------------------------------------------------------------
+def sync_live_card(cards: dict, strategy: str, om: "OrderManager"):
+    """Copy the traded strategy's REAL numbers from om.costs/om.positions
+    into its scorecard. Must be called after EVERY verified signal for
+    the live strategy, not just at shutdown — the dashboard polls this
+    same `cards` dict every 500ms throughout a live session, so only
+    syncing once at the end left it showing frozen zero defaults for the
+    entire session's duration: real fills and real P&L were happening,
+    but the strategy comparison panel showed 0 trips / 0 wins / net $0
+    the whole time regardless (a real reported bug)."""
+    live = cards[strategy]
+    live.trips = om.costs.sells
+    live.wins = None              # CostTracker has no per-trip win/loss;
+                                  # report honestly rather than guess
+    live.pnl_e4 = om.costs.realized_pnl_e4
+    live.fees_usd = om.costs.total_fees
+    live.blocked = om.blocked
+    live.positions = dict(om.positions)
+
+
 def main():
     from bridge import Bridge, run_sim, run_alpaca   # reuse everything
 
@@ -644,6 +663,7 @@ def main():
         if strat == args.strategy:
             cards[strat].signals += 1     # real routing/gating/fills below
             om.on_signal(fr)
+            sync_live_card(cards, args.strategy, om)  # keep dashboard fresh
         else:
             cards[strat].on_signal(fr)    # hypothetical, gated identically
         if dash:
@@ -668,14 +688,9 @@ def main():
         pass
     finally:
         ok = br.summary()
-        live = cards[args.strategy]           # fill the live row for real
-        live.trips = om.costs.sells
-        live.wins = None                      # CostTracker has no per-trip
-                                              # win/loss; report honestly
-        live.pnl_e4 = om.costs.realized_pnl_e4
-        live.fees_usd = om.costs.total_fees
-        live.blocked = om.blocked
-        live.positions = dict(om.positions)
+        sync_live_card(cards, args.strategy, om)  # final guarantee, even if
+                                                  # nothing arrived between
+                                                  # the last signal and Ctrl+C
         print(comparison_report(cards))
         om.summary(args.household_income, args.filing_status,
                    args.state_rate, args.gross)
