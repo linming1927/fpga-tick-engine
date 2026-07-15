@@ -73,6 +73,38 @@ def now_us() -> int:
     return time.time_ns() // 1000
 
 
+def _replay_todays_fills(audit_path: str) -> list[dict]:
+    """Read audit_path (if it exists) and return every "order_filled"
+    event from TODAY (ET calendar date, matching RiskPolicy's own daily
+    rollover convention) in chronological order. Used at startup to
+    restore CostTracker and RiskPolicy state across a restart — without
+    this, NET P&L and the daily order cap both silently reset to zero
+    every time the process restarts, even mid-day, even though
+    positions correctly reconcile from the broker. Malformed lines
+    (e.g. from a process killed mid-write) are skipped, not fatal."""
+    if not os.path.exists(audit_path):
+        return []
+    today = datetime.now(ET).date()
+    fills = []
+    with open(audit_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue          # corrupted line: skip, don't crash startup
+            if ev.get("event") != "order_filled" or "t" not in ev:
+                continue
+            ev_date = datetime.fromtimestamp(ev["t"] / 1_000_000,
+                                             tz=ET).date()
+            if ev_date == today:
+                fills.append(ev)
+    fills.sort(key=lambda e: e["t"])
+    return fills
+
+
 # ---------------------------------------------------------------------------
 # Brokers
 # ---------------------------------------------------------------------------
@@ -349,6 +381,31 @@ class OrderManager:
         # remember (v2: per-symbol positions, long-only each)
         self.positions = {t: self.broker.get_position_qty(t)
                           for t in self.symbols}
+
+        # Positions reconcile from the broker; realized P&L and the
+        # daily order count do NOT have an external source of truth like
+        # that, so without this they'd silently reset to zero on every
+        # restart, even mid-day (a real reported issue — NET P&L showed
+        # $0 immediately after a restart despite real trading earlier
+        # the same day). Replay today's real fills from the audit log
+        # through the SAME on_fill()/record_order() accounting used
+        # live, so a restart resumes the day's true cumulative state
+        # instead of starting over.
+        todays_fills = _replay_todays_fills(audit_path)
+        for ev in todays_fills:
+            self.costs.on_fill(ev["side"], ev["qty"], ev["fill_price_e4"],
+                               ev.get("symbol", "").strip())
+        if todays_fills:
+            self.policy.orders_today = len(todays_fills)
+            self.policy.last_order_t = todays_fills[-1]["t"] / 1_000_000.0
+            print(f"[om] restored {len(todays_fills)} fill(s) from earlier "
+                 f"today ({audit_path}): net P&L so far "
+                 f"${self.costs.net_pnl_usd:+.2f}, daily order count "
+                 f"{self.policy.orders_today}/{limits.max_orders_per_day}")
+        else:
+            print(f"[om] no fills found for today in {audit_path} — "
+                 f"starting the day's P&L and order count fresh")
+
         self._audit("startup", positions=self.positions,
                     limits={k: v for k, v in vars(limits).items()})
         print(f"[om] reconciled positions from broker: {self.positions}")

@@ -18,6 +18,8 @@ test_order_manager.py — the guardrails are the product; test the refusals.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
+from order_manager import ET
 import os
 import random
 import sys
@@ -239,6 +241,101 @@ check("after a real close: net P&L is nonzero (matches the reported "
       cards6["sma"].pnl_e4 != 0, True)
 check("QQQ position untouched by SPY's close",
       cards6["sma"].positions.get("QQQ"), 1)
+
+# ---- v2.7: today's REAL trading history survives a restart --------------
+# (NET P&L and the daily order cap both used to silently reset to zero
+# on every restart, even mid-day, even though positions correctly
+# reconcile from the broker -- a real reported issue)
+print("[G7] a restart resumes today's cumulative P&L and order count "
+     "instead of resetting to zero")
+from order_manager import _replay_todays_fills
+import json as _json
+
+d7 = tempfile.mkdtemp()
+audit7 = os.path.join(d7, "a.jsonl")
+tight7 = RiskLimits(order_qty=1, max_shares=5, max_notional_e4=10**13,
+                   max_orders_per_day=10, cooldown_s=0.0,
+                   require_market_hours=False)
+
+# "session 1": open SPY, close it for a real realized gain, then the
+# process would normally exit here (Ctrl+C) -- we just stop using this
+# instance, matching what actually happens at shutdown
+om7a = OrderManager(MockBroker(), ["SPY"], tight7, audit_path=audit7,
+                    killfile=os.path.join(d7, "om.kill"))
+om7a.on_signal(sig(SIDE_BUY, 1_000_000, "SPY"))
+om7a.on_signal(sig(SIDE_SELL, 1_100_000, "SPY"))
+session1_pnl = om7a.costs.net_pnl_usd
+check("session 1 realized a real gain", session1_pnl > 0, True)
+check("session 1 recorded 2 orders", om7a.policy.orders_today, 2)
+
+# "session 2": a fresh OrderManager, SAME audit path -- simulating a
+# restart (e.g. to deploy a fix) later the same day
+om7b = OrderManager(MockBroker(), ["SPY"], tight7, audit_path=audit7,
+                    killfile=os.path.join(d7, "om2.kill"))
+check("restart: net P&L resumed, not reset to $0",
+      abs(om7b.costs.net_pnl_usd - session1_pnl) < 0.01, True)
+check("restart: daily order count resumed (2 from session 1)",
+      om7b.policy.orders_today, 2)
+check("restart: cooldown timer restored (not 0 -- a fresh 0 would let "
+     "an immediate order through even inside the real cooldown window)",
+     om7b.policy.last_order_t > 0, True)
+
+# a 3rd order right after "restart" must still respect the ORIGINAL
+# day's order count toward the cap, not start over from 0
+cooldown_test = RiskLimits(order_qty=1, max_shares=5,
+                           max_notional_e4=10**13, max_orders_per_day=2,
+                           cooldown_s=0.0, require_market_hours=False)
+om7c = OrderManager(MockBroker(), ["SPY"], cooldown_test, audit_path=audit7,
+                    killfile=os.path.join(d7, "om3.kill"))
+check("restart correctly inherits an ALREADY-exhausted daily cap "
+     "(session 1 used 2/2 -- a new session must not get a fresh 2)",
+     om7c.policy.orders_today, 2)
+om7c.on_signal(sig(SIDE_BUY, 1_000_000, "SPY"))
+check("further order today correctly blocked by the cap carried over "
+     "from before the restart", om7c.blocked, 1)
+
+# ---- new calendar day: must NOT inherit yesterday's history ---------------
+print("[G8] a new day starts fresh, even with a non-empty audit log "
+     "from a PRIOR day")
+d8 = tempfile.mkdtemp()
+audit8 = os.path.join(d8, "a.jsonl")
+yesterday_us = int((datetime.now(ET) - timedelta(days=1)).timestamp()
+                   * 1_000_000)
+with open(audit8, "w") as f:
+    f.write(_json.dumps({"t": yesterday_us, "event": "order_filled",
+                        "symbol": "SPY", "side": "buy", "qty": 1,
+                        "fill_price_e4": 1_000_000}) + "\n")
+    f.write(_json.dumps({"t": yesterday_us + 1_000_000,
+                        "event": "order_filled", "symbol": "SPY",
+                        "side": "sell", "qty": 1,
+                        "fill_price_e4": 2_000_000}) + "\n")
+replayed = _replay_todays_fills(audit8)
+check("yesterday's fills are NOT replayed into today", len(replayed), 0)
+om8 = OrderManager(MockBroker(), ["SPY"], tight7, audit_path=audit8,
+                   killfile=os.path.join(d8, "om.kill"))
+check("new day: P&L starts at $0 despite a non-empty audit log",
+      om8.costs.net_pnl_usd, 0.0)
+check("new day: order count starts at 0", om8.policy.orders_today, 0)
+
+# ---- a corrupted line doesn't crash startup -------------------------------
+print("[G9] a corrupted audit line is skipped, not fatal")
+d9 = tempfile.mkdtemp()
+audit9 = os.path.join(d9, "a.jsonl")
+now_valid = int(datetime.now(ET).timestamp() * 1_000_000)
+with open(audit9, "w") as f:
+    f.write(_json.dumps({"t": now_valid, "event": "order_filled",
+                        "symbol": "SPY", "side": "buy", "qty": 1,
+                        "fill_price_e4": 1_000_000}) + "\n")
+    f.write("{ this is not valid json at all\n")           # corrupted line
+    f.write(_json.dumps({"t": now_valid + 1, "event": "order_filled",
+                        "symbol": "SPY", "side": "sell", "qty": 1,
+                        "fill_price_e4": 1_200_000}) + "\n")
+om9 = OrderManager(MockBroker(), ["SPY"], tight7, audit_path=audit9,
+                   killfile=os.path.join(d9, "om.kill"))
+check("both valid fills survive around a corrupted line",
+      om9.policy.orders_today, 2)
+check("startup did not crash on the corrupted line", om9.costs.net_pnl_usd > 0,
+      True)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
