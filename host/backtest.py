@@ -157,38 +157,58 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
 
     n = 0
     first_t = last_t = None
-    for t, price_e4, qty in iter_trades_multi(trades_paths):
-        n += 1
-        if first_t is None:
-            first_t = t
-        last_t = t
-        if n % progress_every == 0:
-            print(f"  ...{n:,} trades replayed ({t.date()})", file=sys.stderr)
+    interrupted = False
+    try:
+        for t, price_e4, qty in iter_trades_multi(trades_paths):
+            n += 1
+            if first_t is None:
+                first_t = t
+            last_t = t
+            if n % progress_every == 0:
+                print(f"  ...{n:,} trades replayed ({t.date()})",
+                     file=sys.stderr)
 
-        sig = sma_model.ingest(price_e4)
-        if sig:
-            clocks["sma"].set(t)
-            cards["sma"].on_signal({"side": sig.side, "price_e4": sig.price_e4,
-                                    "symbol": symbol, "strategy": "sma"})
-            if profit_gated is not None:
-                clocks["sma_pg"].set(t)
-                profit_gated.on_signal({"side": sig.side,
+            sig = sma_model.ingest(price_e4)
+            if sig:
+                clocks["sma"].set(t)
+                cards["sma"].on_signal({"side": sig.side,
                                        "price_e4": sig.price_e4,
                                        "symbol": symbol, "strategy": "sma"})
+                if profit_gated is not None:
+                    clocks["sma_pg"].set(t)
+                    profit_gated.on_signal({"side": sig.side,
+                                           "price_e4": sig.price_e4,
+                                           "symbol": symbol,
+                                           "strategy": "sma"})
 
-        sig = ema_model.ingest(price_e4)
-        if sig:
-            clocks["ema"].set(t)
-            cards["ema"].on_signal({"side": sig.side, "price_e4": sig.price_e4,
-                                    "symbol": symbol, "strategy": "ema"})
+            sig = ema_model.ingest(price_e4)
+            if sig:
+                clocks["ema"].set(t)
+                cards["ema"].on_signal({"side": sig.side,
+                                       "price_e4": sig.price_e4,
+                                       "symbol": symbol, "strategy": "ema"})
 
-        if htf_ltf_card is not None:
-            htf_ltf_card.on_tick(t, price_e4)
+            if htf_ltf_card is not None:
+                htf_ltf_card.on_tick(t, price_e4)
 
-        if vwap_card is not None:
-            vwap_card.on_tick(t, price_e4, qty)
+            if vwap_card is not None:
+                vwap_card.on_tick(t, price_e4, qty)
+    except KeyboardInterrupt:
+        # A partial result, honestly labeled, beats no result at all —
+        # this is exactly the reported gap: Ctrl+C used to propagate
+        # straight past the report/save steps below, so a long backtest
+        # interrupted partway through produced NOTHING. Now it returns
+        # normally with everything accumulated so far, with `interrupted`
+        # set in meta so nothing downstream can mistake this for a
+        # complete run.
+        interrupted = True
+        print(f"\n[backtest] INTERRUPTED after {n:,} trades "
+             f"(last: {last_t}) — reporting PARTIAL results below, "
+             f"NOT a complete backtest", file=sys.stderr)
 
-    print(f"[backtest] {n:,} trades replayed for {symbol}", file=sys.stderr)
+    print(f"[backtest] {n:,} trades replayed for {symbol}"
+         + (" [INCOMPLETE -- interrupted]" if interrupted else ""),
+         file=sys.stderr)
     cards["sma"].live = (traded_strategy == "sma")
     cards["ema"].live = (traded_strategy == "ema")
     # the "live" flag here only controls report LABELING (both rows were
@@ -199,7 +219,7 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
     # from a filename — correct regardless of naming convention, and
     # what save_backtest_result() uses to name/label a saved run
     meta = {"n_trades": n, "first_t": first_t, "last_t": last_t,
-           "trades_paths": trades_paths}
+           "trades_paths": trades_paths, "interrupted": interrupted}
     return cards, meta
 
 
@@ -292,6 +312,11 @@ def main():
                               vwap_bounce=args.vwap_bounce,
                               vwap_band_k=args.vwap_band_k)
     print()
+    if meta.get("interrupted"):
+        print("=" * 60)
+        print(f"*** INTERRUPTED after {meta['n_trades']:,} trades — "
+             f"PARTIAL RESULTS, NOT A COMPLETE BACKTEST ***")
+        print("=" * 60)
     print(comparison_report(cards))
 
     if not args.no_save:

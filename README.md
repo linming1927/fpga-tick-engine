@@ -232,6 +232,15 @@ collision-proof even for two runs in the same second. Pass `--no-save`
 to skip saving a quick throwaway run, or `--results-dir` to save
 somewhere other than the default.
 
+**Ctrl+C during a long backtest** (a multi-year, 100M+ trade replay can
+take a while) still produces a report instead of crashing past it —
+you get the partial comparison, printed and saved, for whatever
+progress was made before you interrupted it. It's unmistakably marked
+as partial in three places: an `-INTERRUPTED` folder-name suffix
+(visible in `list_backtest_results.py`'s table without opening
+anything), `summary.json`'s own `interrupted` field, and a banner at
+the top of `report.txt` — never confusable with a complete run.
+
 Browse what you've saved:
 ```bash
 python3 host/list_backtest_results.py                  # every run, newest first

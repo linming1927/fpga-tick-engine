@@ -64,8 +64,9 @@ def main():
                           if not c["live"]), None)
         live_net = f"{live_card['net_usd']:+.2f}" if live_card else "—"
         other_net = f"{other_card['net_usd']:+.2f}" if other_card else "—"
+        flag = " [INTERRUPTED]" if r.get("interrupted") else ""
         print(f"{r['symbol']:<8} {rng:<24} {param_s:<26} "
-             f"{live_net:>11} {other_net:>12}  {r['folder']}")
+             f"{live_net:>11} {other_net:>12}  {r['folder']}{flag}")
     print(f"\nFull report for one run: "
          f"python3 list_backtest_results.py --folder <folder>")
 

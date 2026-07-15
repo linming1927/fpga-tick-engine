@@ -53,16 +53,26 @@ def save_backtest_result(cards: dict, symbol: str, meta: dict,
                          params: dict,
                          results_dir: str = RESULTS_DIR_DEFAULT) -> str:
     """meta: the dict returned alongside `cards` by run_backtest()
-    (n_trades, first_t, last_t, trades_paths).
+    (n_trades, first_t, last_t, trades_paths, interrupted).
     params: every strategy/risk parameter used for this run — save
     everything relevant to reproducing it, not just the interesting
     ones; you won't know in six months which ones you'll wish you kept.
-    Returns the path to the created run folder."""
+    Returns the path to the created run folder.
+
+    If meta["interrupted"] is True (a Ctrl+C during the replay loop —
+    see run_backtest()'s own KeyboardInterrupt handling), this is
+    marked unmistakably in three places: an "-INTERRUPTED" folder-name
+    suffix (visible in list_backtest_results.py's table without even
+    opening the run), summary.json's own "interrupted" field, and a
+    banner at the top of report.txt — a partial result should never be
+    mistaken for a complete backtest later."""
     os.makedirs(results_dir, exist_ok=True)
     start = meta["first_t"].date().isoformat() if meta["first_t"] else "unknown"
     end = meta["last_t"].date().isoformat() if meta["last_t"] else "unknown"
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    base = f"{symbol}_{start}_{end}_{run_ts}"
+    interrupted = bool(meta.get("interrupted"))
+    base = f"{symbol}_{start}_{end}_{run_ts}" + (
+        "-INTERRUPTED" if interrupted else "")
 
     # second-resolution timestamps collide if two runs happen within the
     # same second (a real, reproducible case — not hypothetical: two
@@ -83,6 +93,7 @@ def save_backtest_result(cards: dict, symbol: str, meta: dict,
         "date_range": {"start": start, "end": end},
         "trades_files": meta.get("trades_paths", []),
         "total_trades_replayed": meta["n_trades"],
+        "interrupted": interrupted,
         "strategy_params": params,
         "results": {k: _card_to_dict(c) for k, c in cards.items()},
     }
@@ -90,9 +101,15 @@ def save_backtest_result(cards: dict, symbol: str, meta: dict,
         json.dump(summary, f, indent=2)
 
     with open(os.path.join(run_dir, "report.txt"), "w") as f:
+        if interrupted:
+            f.write("=" * 60 + "\n")
+            f.write("*** INTERRUPTED RUN — PARTIAL RESULTS BELOW, NOT A "
+                   "COMPLETE BACKTEST ***\n")
+            f.write("=" * 60 + "\n\n")
         f.write(f"Backtest run: {symbol}  {start} .. {end}\n")
         f.write(f"Run at (UTC): {summary['run_timestamp_utc']}\n")
-        f.write(f"Trades replayed: {meta['n_trades']:,}\n")
+        f.write(f"Trades replayed: {meta['n_trades']:,}"
+               + (" [INCOMPLETE]" if interrupted else "") + "\n")
         f.write(f"Trades file(s): "
                f"{', '.join(meta.get('trades_paths', []))}\n")
         f.write("Strategy parameters:\n")

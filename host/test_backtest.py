@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 import json as _json
 import subprocess
 from backtest import run_backtest, BacktestClock, iter_trades, iter_trades_multi
+from backtest_results import save_backtest_result
 from compare import comparison_report
 from order_manager import RiskLimits, RiskPolicy
 from tick_protocol import to_e4
@@ -357,6 +358,81 @@ r = subprocess.run(
 check("CLI run succeeded", r.returncode, 0)
 check("CLI output includes the VWAP bounce row",
       "VWAP bounce" in r.stdout, True)
+
+# ---- v3.9: Ctrl+C during a backtest must still produce a report -----------
+print("[G13] an interrupted backtest returns PARTIAL results instead "
+     "of crashing past the report/save steps entirely")
+import backtest as backtest_module
+
+p13 = os.path.join(tmp, "t13.jsonl")
+day13 = datetime(2020, 1, 2, 14, 30, tzinfo=timezone.utc)
+write_jsonl(p13, [(day13 + timedelta(seconds=i), p)
+                  for i, p in enumerate([2000,1900,1800,1700,1600,1500,
+                                        1400,1300,3000,3100,2900,2800])])
+
+real_iter = backtest_module.iter_trades_multi
+
+def interrupting_iter(paths):
+    """Simulates Ctrl+C arriving partway through: raises
+    KeyboardInterrupt after a fixed number of trades, deterministically
+    (real signal-timing tests would be flaky; this isn't)."""
+    count = 0
+    for item in real_iter(paths):
+        count += 1
+        if count > 9:      # after the warmup, before the golden cross
+            raise KeyboardInterrupt()
+        yield item
+
+backtest_module.iter_trades_multi = interrupting_iter
+try:
+    cards13, meta13 = run_backtest(p13, "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                                   ema_ks=3, limits=limits,
+                                   traded_strategy="sma")
+finally:
+    backtest_module.iter_trades_multi = real_iter    # always restore
+
+check("run_backtest returns normally instead of letting "
+     "KeyboardInterrupt propagate and crash past the report/save steps",
+     isinstance(cards13, dict), True)
+check("meta correctly flags this as an interrupted, partial run",
+      meta13["interrupted"], True)
+check("meta still reports how far it got (9 trades, not 12)",
+      meta13["n_trades"], 9)
+check("cards are still usable -- partial state, not empty/broken",
+      cards13["sma"].signals >= 0, True)
+
+r13 = comparison_report(cards13)
+check("comparison_report() still renders on partial/interrupted state "
+     "without crashing", "strategy comparison" in r13, True)
+
+# the save path must also mark this clearly, not silently save it as
+# if it were a complete run
+results_dir13 = os.path.join(tmp, "interrupted_results")
+run_dir13 = save_backtest_result(cards13, "SPY", meta13,
+                                 {"traded_strategy": "sma"},
+                                 results_dir=results_dir13)
+check("the saved folder name is marked INTERRUPTED, visible without "
+     "opening the run", "INTERRUPTED" in os.path.basename(run_dir13), True)
+with open(os.path.join(run_dir13, "summary.json")) as f:
+    saved13 = _json.load(f)
+check("summary.json itself also records interrupted=True",
+      saved13["interrupted"], True)
+with open(os.path.join(run_dir13, "report.txt")) as f:
+    report_text13 = f.read()
+check("report.txt has an unmistakable interrupted banner at the top",
+      "INTERRUPTED" in report_text13.split("\n")[1], True)
+
+# a NORMAL, complete run must NOT be mislabeled
+cards14, meta14 = run_backtest(p13, "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                               ema_ks=3, limits=limits,
+                               traded_strategy="sma")
+check("a normal, uninterrupted run is NOT flagged as interrupted",
+      meta14["interrupted"], False)
+run_dir14 = save_backtest_result(cards14, "SPY", meta14,
+                                 {"traded_strategy": "sma"},
+                                 results_dir=results_dir13)
+check("a normal run's folder has no INTERRUPTED suffix",
+      "INTERRUPTED" in os.path.basename(run_dir14), False)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
