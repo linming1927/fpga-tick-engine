@@ -160,6 +160,41 @@ check("a signal recorded WITHOUT an outcome defaults to empty, not "
      "a crash (backward compatible with any caller that doesn't "
      "pass one)", "outcome" in s2["signals"][0], True)
 
+# ---- v3.2.2: a busy symbol must not crowd a quiet symbol's markers off
+# ITS OWN chart -- the actual reported bug (signals were stored in one
+# shared global deque, so SPY firing often could evict QQQ's older,
+# still-on-screen signals before QQQ's chart ever got drawn) -----------
+print("[G_markers] per-symbol chart signals aren't crowded out by a "
+     "busy OTHER symbol")
+
+def fab(sym, side, price):
+    return {"side": side, "price_e4": price, "symbol": sym,
+            "sma_fast": 0, "sma_slow": 0, "strategy": "sma"}
+
+# QQQ fires ONE signal early...
+dash.on_signal(fab("QQQ", 1, 4_000_000), outcome="FILLED")
+# ...then SPY fires 25 signals (more than the old shared maxlen=20),
+# which under the OLD design would have evicted QQQ's signal entirely
+for i in range(25):
+    dash.on_signal(fab("SPY", 1 if i % 2 == 0 else 2, 1_000_000 + i),
+                   outcome="FILLED")
+
+spy_state = json.loads(get("/api/state?sym=SPY"))
+qqq_state = json.loads(get("/api/state?sym=QQQ"))
+check("SPY's OWN chart_signals still capped sanely (not unbounded)",
+      len(spy_state["chart_signals"]) <= 20, True)
+check("QQQ's signal SURVIVES on its own chart despite 25 unrelated "
+     "SPY signals arriving afterward -- this is the actual fix",
+     len(qqq_state["chart_signals"]), 1)
+check("QQQ's surviving signal is the real one, not a coincidence",
+      qqq_state["chart_signals"][0]["price_e4"], 4_000_000)
+check("the GLOBAL table-facing list is independent of the per-symbol "
+     "fix — it correctly ages QQQ's older entry out once 26 total "
+     "signals exceed its own 20-slot cap (that's expected: the global "
+     "table is 'recent across everything', not 'never forget any "
+     "symbol' — only the PER-SYMBOL chart view needed that guarantee)",
+     any(x["symbol"] == "QQQ" for x in spy_state["signals"]), False)
+
 dash.stop(); br.close(); emu.stop()
 
 print(f"\n==============================================")

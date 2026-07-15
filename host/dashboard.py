@@ -44,7 +44,24 @@ class DashboardServer:
         self._points = points
         self._series = {}                       # symbol -> deque of 7-tuples
         self.chart_symbol = bridge.symbol
-        self._signals = deque(maxlen=20)
+        self._signals = deque(maxlen=20)          # global, chronological
+                                                  # across ALL symbols — feeds
+                                                  # the SIGNALS table
+        self._signals_by_symbol = {}              # symbol -> deque(maxlen=20)
+                                                  # — feeds each CHART's own
+                                                  # markers. Separate from the
+                                                  # global deque above on
+                                                  # purpose: with multiple
+                                                  # symbols configured, a busy
+                                                  # one's signals were crowding
+                                                  # a quieter symbol's older
+                                                  # signals out of one shared
+                                                  # 20-slot buffer, making that
+                                                  # symbol's chart markers
+                                                  # vanish even though the
+                                                  # underlying price point was
+                                                  # still visible on screen —
+                                                  # a real reported bug.
         self._events = deque(maxlen=30)
         self._last_echo_t = 0.0
         self._last_trouble_t = 0.0
@@ -67,14 +84,18 @@ class DashboardServer:
 
     def on_signal(self, fr: dict, outcome: str = ""):
         with self._lock:
-            self._signals.appendleft({"t": time.strftime("%H:%M:%S"),
-                                      "strategy": fr.get("strategy", "sma"),
-                                      "symbol": fr["symbol"].strip(),
-                                      "side": fr["side"],
-                                      "price_e4": fr["price_e4"],
-                                      "sma_fast": fr["sma_fast"],
-                                      "sma_slow": fr["sma_slow"],
-                                      "outcome": outcome})
+            rec = {"t": time.strftime("%H:%M:%S"),
+                  "strategy": fr.get("strategy", "sma"),
+                  "symbol": fr["symbol"].strip(),
+                  "side": fr["side"],
+                  "price_e4": fr["price_e4"],
+                  "sma_fast": fr["sma_fast"],
+                  "sma_slow": fr["sma_slow"],
+                  "outcome": outcome}
+            self._signals.appendleft(rec)
+            sym = rec["symbol"]
+            self._signals_by_symbol.setdefault(
+                sym, deque(maxlen=20)).appendleft(rec)
 
     def on_event(self, text: str, bad: bool = False):
         with self._lock:
@@ -96,6 +117,7 @@ class DashboardServer:
         with self._lock:
             series = list(self._series.get(sym, ()))
             signals = list(self._signals)
+            chart_signals = list(self._signals_by_symbol.get(sym, ()))
             events = list(self._events)
             echo_age = now - self._last_echo_t if self._last_echo_t else 1e9
             trouble_age = (now - self._last_trouble_t
@@ -105,7 +127,8 @@ class DashboardServer:
             "symbols": list(br.symbols),
             "uptime_s": int(now - self.t0),
             "series": series,
-            "signals": signals,
+            "signals": signals,       # global, all symbols — feeds the table
+            "chart_signals": chart_signals,   # THIS symbol only — chart markers
             "events": events,
             "sent": br.sent, "echoes": br.echoes,
             "resyncs": br.parser.resync_count,
@@ -462,8 +485,8 @@ async function poll(){
       stat('RTT µs',s.rtt?s.rtt.med+' ('+s.rtt.min+'–'+s.rtt.max+')':'—')+
       stat('ECHO / SENT',s.echoes+' / '+s.sent,
            s.echoes===s.sent?'':'bad');
-    drawChart('chart',s.series,s.signals);
-    drawChart('chart2',s2.series,s2.signals);
+    drawChart('chart',s.series,s.chart_signals);
+    drawChart('chart2',s2.series,s2.chart_signals);
     if(s.strategies&&s.strategies.length)
       $('cmp').innerHTML='<table><thead><tr><th>strategy</th><th>signals'+
         '</th><th>trips</th><th>wins</th><th>blocked/gated</th>'+
