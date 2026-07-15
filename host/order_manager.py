@@ -73,19 +73,30 @@ def now_us() -> int:
     return time.time_ns() // 1000
 
 
-def _replay_todays_fills(audit_path: str) -> list[dict]:
-    """Read audit_path (if it exists) and return every "order_filled"
-    event from TODAY (ET calendar date, matching RiskPolicy's own daily
-    rollover convention) in chronological order. Used at startup to
-    restore CostTracker and RiskPolicy state across a restart — without
-    this, NET P&L and the daily order cap both silently reset to zero
-    every time the process restarts, even mid-day, even though
-    positions correctly reconcile from the broker. Malformed lines
-    (e.g. from a process killed mid-write) are skipped, not fatal."""
+def _load_fills_split_by_today(audit_path: str) -> tuple[list[dict], list[dict]]:
+    """Read audit_path (if it exists) and return (prior_fills, todays_fills)
+    — every "order_filled" event ever logged, split by whether it's from
+    a calendar day before today (ET, matching RiskPolicy's own daily
+    rollover convention) or from today itself, both in chronological
+    order. Malformed lines (e.g. from a process killed mid-write) are
+    skipped, not fatal.
+
+    THE SPLIT MATTERS: cost basis and "today's reported totals" are NOT
+    the same scope. A position bought yesterday and sold today needs
+    its real yesterday-established cost basis to price today's sale
+    correctly — but what gets REPORTED as "today's" fills/P&L/wins
+    should still only be today's own activity. An earlier version of
+    this function discarded prior-day fills entirely, which correctly
+    scoped the daily order cap but WRONGLY discarded cost basis too: a
+    position bought the day before and sold at today's open showed its
+    ENTIRE sale price as profit, because nothing remembered what it had
+    actually been bought for. See OrderManager.__init__ for how the two
+    groups get replayed differently (prior_fills silently, for cost
+    basis only; todays_fills normally, updating reported totals too)."""
     if not os.path.exists(audit_path):
-        return []
+        return [], []
     today = datetime.now(ET).date()
-    fills = []
+    prior, today_fills = [], []
     with open(audit_path) as f:
         for line in f:
             line = line.strip()
@@ -99,10 +110,10 @@ def _replay_todays_fills(audit_path: str) -> list[dict]:
                 continue
             ev_date = datetime.fromtimestamp(ev["t"] / 1_000_000,
                                              tz=ET).date()
-            if ev_date == today:
-                fills.append(ev)
-    fills.sort(key=lambda e: e["t"])
-    return fills
+            (today_fills if ev_date == today else prior).append(ev)
+    prior.sort(key=lambda e: e["t"])
+    today_fills.sort(key=lambda e: e["t"])
+    return prior, today_fills
 
 
 # ---------------------------------------------------------------------------
@@ -382,19 +393,34 @@ class OrderManager:
         self.positions = {t: self.broker.get_position_qty(t)
                           for t in self.symbols}
 
-        # Positions reconcile from the broker; realized P&L and the
-        # daily order count do NOT have an external source of truth like
-        # that, so without this they'd silently reset to zero on every
+        # Positions reconcile from the broker; realized P&L, cost basis,
+        # and the daily order count do NOT have an external source of
+        # truth like that, so without this they'd silently reset every
         # restart, even mid-day (a real reported issue — NET P&L showed
         # $0 immediately after a restart despite real trading earlier
-        # the same day). Replay today's real fills from the audit log
-        # through the SAME on_fill()/record_order() accounting used
-        # live, so a restart resumes the day's true cumulative state
-        # instead of starting over.
-        todays_fills = _replay_todays_fills(audit_path)
+        # the same day). Two-phase replay, because cost basis and
+        # "today's reported totals" are NOT the same scope: a position
+        # bought YESTERDAY and sold today needs its real prior cost
+        # basis to price today's sale correctly, but what's REPORTED as
+        # today's fills/P&L/wins should still only be today's own
+        # activity. Getting this conflated the first time caused a real
+        # bug: a position bought the day before and sold at today's
+        # open showed its entire sale price as profit, because the
+        # prior day's buy that established its true cost basis had been
+        # discarded along with everything else from before today.
+        prior_fills, todays_fills = _load_fills_split_by_today(audit_path)
+        for ev in prior_fills:
+            # silent: rebuilds cost basis for anything still open,
+            # without polluting today's reported totals
+            self.costs.on_fill(ev["side"], ev["qty"], ev["fill_price_e4"],
+                               ev.get("symbol", "").strip(), count=False)
         for ev in todays_fills:
             self.costs.on_fill(ev["side"], ev["qty"], ev["fill_price_e4"],
                                ev.get("symbol", "").strip())
+        if prior_fills:
+            print(f"[om] carried forward cost basis from {len(prior_fills)} "
+                 f"prior-day fill(s) in {audit_path} (for any position "
+                 f"still open) — not counted toward today's totals")
         if todays_fills:
             self.policy.orders_today = len(todays_fills)
             self.policy.last_order_t = todays_fills[-1]["t"] / 1_000_000.0

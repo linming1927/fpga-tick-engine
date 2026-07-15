@@ -248,7 +248,7 @@ check("QQQ position untouched by SPY's close",
 # reconcile from the broker -- a real reported issue)
 print("[G7] a restart resumes today's cumulative P&L and order count "
      "instead of resetting to zero")
-from order_manager import _replay_todays_fills
+from order_manager import _load_fills_split_by_today
 import json as _json
 
 d7 = tempfile.mkdtemp()
@@ -309,8 +309,11 @@ with open(audit8, "w") as f:
                         "event": "order_filled", "symbol": "SPY",
                         "side": "sell", "qty": 1,
                         "fill_price_e4": 2_000_000}) + "\n")
-replayed = _replay_todays_fills(audit8)
-check("yesterday's fills are NOT replayed into today", len(replayed), 0)
+prior8, today_only8 = _load_fills_split_by_today(audit8)
+check("yesterday's fills are NOT counted as today's", len(today_only8), 0)
+check("but they ARE tracked as prior history for cost-basis "
+     "reconstruction (a fully-closed prior position just nets to "
+     "flat, which is exactly what should happen here)", len(prior8), 2)
 om8 = OrderManager(MockBroker(), ["SPY"], tight7, audit_path=audit8,
                    killfile=os.path.join(d8, "om.kill"))
 check("new day: P&L starts at $0 despite a non-empty audit log",
@@ -356,6 +359,54 @@ check("after a real win: wins is 1, a real number", cards10["sma"].wins, 1)
 r10 = comparison_report(cards10)
 check("report shows a percentage, not a dash, for the live row",
       "100%" in r10, True)
+
+# ---- v2.9: THE REPORTED BUG -- a position bought YESTERDAY and sold
+# TODAY must be priced against its real prior-day entry, not $0 -------
+print("[G11] a position carried overnight is priced correctly on "
+     "today's close (the exact reported scenario: QQQ bought "
+     "yesterday, sold at today's open)")
+from order_manager import _load_fills_split_by_today
+import json as _json2
+
+d11 = tempfile.mkdtemp()
+audit11 = os.path.join(d11, "a.jsonl")
+yesterday_us = int((datetime.now(ET) - timedelta(days=1)).timestamp()
+                   * 1_000_000)
+# yesterday: bought 1 share of QQQ around $700
+with open(audit11, "w") as f:
+    f.write(_json2.dumps({"t": yesterday_us, "event": "order_filled",
+                         "symbol": "QQQ", "side": "buy", "qty": 1,
+                         "fill_price_e4": 7_000_000}) + "\n")
+
+prior, today = _load_fills_split_by_today(audit11)
+check("yesterday's buy is classified as prior, not today", len(prior), 1)
+check("nothing from today yet", len(today), 0)
+
+limits11 = RiskLimits(order_qty=1, max_shares=5, max_notional_e4=10**13,
+                      max_orders_per_day=99, cooldown_s=0.0,
+                      require_market_hours=False)
+broker11 = MockBroker()
+broker11.positions["QQQ"] = 1   # the REAL broker already shows this share
+                                # (audit log reconstructs the PRICE it was
+                                # bought at; the broker is what confirms
+                                # the position itself actually exists)
+om11 = OrderManager(broker11, ["QQQ"], limits11, audit_path=audit11,
+                    killfile=os.path.join(d11, "om.kill"))
+check("cost basis carried forward from yesterday's buy",
+      om11.costs._entries.get("QQQ"), [1, 7_000_000])
+check("but NOTHING counted toward today's totals yet",
+      (om11.costs.buys, om11.costs.sells), (0, 0))
+
+# THIS MORNING: sell that same share at $723.18 (the exact price from
+# the report) -- must realize the REAL ~$23.18 gain, not $723.18
+om11.on_signal(sig(SIDE_SELL, 7_231_800, "QQQ"))
+check("realized gain is the REAL difference vs yesterday's buy "
+     "(not the full sale price treated as pure profit)",
+     om11.costs.realized_pnl_e4, 7_231_800 - 7_000_000)
+check("that's about $23.18, not $723.18",
+      round(om11.costs.realized_pnl_usd, 2), 23.18)
+check("today's sell count is 1 (only today's own activity)",
+      om11.costs.sells, 1)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

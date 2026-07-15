@@ -153,25 +153,41 @@ class CostTracker:
                                         # comparison against the gated row)
 
     def on_fill(self, side: str, qty: int, fill_price_e4: int,
-                symbol: str = "") -> dict | None:
+                symbol: str = "", count: bool = True) -> dict | None:
         """Called by OrderManager after each fill. Per-symbol average-entry
         accounting (v2: up to 8 symbols trade concurrently). Returns the
-        fee breakdown for a sell, None for a buy."""
+        fee breakdown for a sell, None for a buy.
+
+        count=False updates the cost basis (_entries) WITHOUT touching
+        the reported totals (realized_pnl_e4, total_fees, wins, sells,
+        buys) — used to silently replay PRIOR-DAY history at startup so
+        a position opened yesterday and closed today is priced against
+        its real historical entry, while what's actually REPORTED for
+        "today" still only reflects today's own fills. Getting this
+        wrong the first time (filtering ALL history to "today only")
+        caused a real bug: a position bought the day before and sold at
+        the open showed its entire sale price as profit, because the
+        prior day's buy that established its true cost basis had been
+        silently discarded along with everything else from before today.
+        """
         e = self._entries.setdefault(symbol, [0, 0])
         if side == "buy":
             tot = e[1] * e[0] + fill_price_e4 * qty
             e[0] += qty
             e[1] = tot // e[0]
-            self.buys += 1
+            if count:
+                self.buys += 1
             return None
         # sell: realize P&L against this symbol's average entry
         trip_pnl_e4 = (fill_price_e4 - e[1]) * qty
-        self.realized_pnl_e4 += trip_pnl_e4
-        if trip_pnl_e4 > 0:
-            self.wins += 1
         e[0] = max(0, e[0] - qty)
         if e[0] == 0:
             e[1] = 0
+        if not count:
+            return None
+        self.realized_pnl_e4 += trip_pnl_e4
+        if trip_pnl_e4 > 0:
+            self.wins += 1
         f = self.fees.sell_fees(qty, qty * fill_price_e4 / 10_000.0)
         self.total_fees += f["total"]
         self.sells += 1

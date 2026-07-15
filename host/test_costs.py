@@ -134,6 +134,43 @@ ct7.on_fill("buy", 1, 1_000_000, "SPY")
 ct7.on_fill("sell", 1, 1_000_000, "SPY")     # exactly flat
 check("a flat (zero P&L) trip does not count as a win", ct7.wins, 0)
 
+# ---- v2.9: count=False updates cost basis silently, without touching
+# reported totals -- the mechanism behind the "carried position" fix ----
+print("[H] on_fill(count=False): cost basis updates, totals don't")
+ct8 = CostTracker()
+ct8.on_fill("buy", 1, 700_000, "QQQ", count=False)   # yesterday's buy, replayed silently
+check("silent buy updates cost basis", ct8._entries["QQQ"], [1, 700_000])
+check("silent buy does NOT increment buys", ct8.buys, 0)
+check("silent buy does NOT touch realized P&L", ct8.realized_pnl_e4, 0)
+
+# today's sell, counted normally -- must price against the REAL prior
+# entry (700_000 = $70.00), not a default $0 cost basis
+ct8.on_fill("sell", 1, 723_180, "QQQ")                # today: sell @ $72.318... using e4 units
+check("today's sell counts normally", ct8.sells, 1)
+check("realized gain is (sell - REAL prior entry), not the full sale "
+     "price (this is the exact reported bug: a carried-over position "
+     "showed its entire sale as profit instead of the real gain)",
+     ct8.realized_pnl_e4, 723_180 - 700_000)
+check("that gain is small and correct, not the full $72.318 sale price",
+      ct8.realized_pnl_usd, round((723_180 - 700_000) / 10_000.0, 4))
+check("wins counted correctly against the real gain", ct8.wins, 1)
+
+# a silent sell (closing out prior-day history) must also not pollute
+# today's totals, and must correctly clear/reduce the entry
+ct9 = CostTracker()
+ct9.on_fill("buy", 2, 500_000, "SPY", count=False)
+ct9.on_fill("sell", 2, 550_000, "SPY", count=False)   # fully closed, silently
+check("silent sell clears the entry", ct9._entries["SPY"], [0, 0])
+check("silent sell does not touch reported totals",
+      (ct9.sells, ct9.realized_pnl_e4), (0, 0))
+# a FRESH position opened and closed today, after that silent history,
+# must be priced correctly and independently
+ct9.on_fill("buy", 1, 600_000, "SPY")
+ct9.on_fill("sell", 1, 650_000, "SPY")
+check("today's fresh trip after silent prior history is correct",
+      ct9.realized_pnl_e4, 50_000)
+check("today's counted totals reflect ONLY today's trip", ct9.sells, 1)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")
