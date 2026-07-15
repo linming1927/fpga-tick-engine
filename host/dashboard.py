@@ -242,7 +242,9 @@ h1 span{color:var(--dim);font-weight:400}
 @keyframes hb{0%,60%{opacity:.25}70%,90%{opacity:1}100%{opacity:.25}}
 .led.hb i{background:var(--green);animation:hb 1.4s infinite}
 .grid{display:grid;grid-template-columns:2fr 1fr;gap:14px}
-@media(max-width:820px){.grid{grid-template-columns:1fr}}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:820px){.grid{grid-template-columns:1fr}
+  .grid2{grid-template-columns:1fr}}
 .panel{background:var(--panel);border:1px solid var(--line);
   border-radius:6px;padding:12px}
 .panel h2{font-size:10px;letter-spacing:.22em;color:var(--dim);
@@ -309,7 +311,7 @@ td:first-child,th:first-child{text-align:left}
   </div>
 </div>
 <div class="stats" id="stats"></div>
-<div class="grid">
+<div class="grid2">
   <div class="panel"><h2>PRICE / SMA / EMA — LAST 240 TICKS
       <select id="csym"></select></h2>
     <canvas id="chart"></canvas>
@@ -317,16 +319,24 @@ td:first-child,th:first-child{text-align:left}
       <b class="k-f">— sma fast</b><b class="k-s">— sma slow</b>
       <b class="k-f">┄ ema fast</b><b class="k-s">┄ ema slow</b>
       <b class="buy">▲ buy</b><b class="sell">▼ sell</b></div>
-    <div id="cmp" style="margin-top:10px"></div>
   </div>
-  <div class="panel"><h2>EVENTS</h2>
-    <div class="log" id="log"><div>console up — waiting for ticks</div></div>
+  <div class="panel"><h2>PRICE / SMA / EMA — LAST 240 TICKS
+      <select id="csym2"></select></h2>
+    <canvas id="chart2"></canvas>
+    <div class="legend"><b class="k-price">— price</b>
+      <b class="k-f">— sma fast</b><b class="k-s">— sma slow</b>
+      <b class="k-f">┄ ema fast</b><b class="k-s">┄ ema slow</b>
+      <b class="buy">▲ buy</b><b class="sell">▼ sell</b></div>
   </div>
 </div>
+<div class="panel" style="margin-top:14px"><div id="cmp"></div></div>
 <div class="panel" style="margin-top:14px"><h2>SIGNALS</h2>
   <table><thead><tr><th>t</th><th>sym</th><th>strat</th><th>side</th>
   <th>price</th><th>fast</th><th>slow</th><th>outcome</th></tr></thead>
   <tbody id="sigs"></tbody></table>
+</div>
+<div class="panel" style="margin-top:14px"><h2>EVENTS</h2>
+  <div class="log" id="log"><div>console up — waiting for ticks</div></div>
 </div>
 </div>
 <div class="killwrap">
@@ -340,8 +350,8 @@ const $=id=>document.getElementById(id);
 const usd=e4=>'$'+(e4/1e4).toFixed(2);
 const money=v=>(v<0?'-':'')+'$'+Math.abs(v).toFixed(2);
 
-function drawChart(series,signals){
-  const c=$('chart'),dpr=window.devicePixelRatio||1;
+function drawChart(canvasId,series,signals){
+  const c=$(canvasId),dpr=window.devicePixelRatio||1;
   const W=c.clientWidth,H=c.clientHeight;
   c.width=W*dpr;c.height=H*dpr;
   const g=c.getContext('2d');g.scale(dpr,dpr);g.clearRect(0,0,W,H);
@@ -380,8 +390,9 @@ function drawChart(series,signals){
 function stat(label,val,cls){return '<div class="stat '+(cls||'')+'">'+
   '<small>'+label+'</small><b>'+val+'</b></div>';}
 
-let slotsSeeded=false,chartSym=null;
+let slotsSeeded=false,chartSym=null,chartSym2=null;
 document.getElementById('csym').onchange=e=>{chartSym=e.target.value};
+document.getElementById('csym2').onchange=e=>{chartSym2=e.target.value};
 document.getElementById('apply').onclick=async()=>{
   const syms=[...document.querySelectorAll('.slot')]
     .map(i=>i.value.trim().toUpperCase()).filter(v=>v);
@@ -392,7 +403,8 @@ document.getElementById('apply').onclick=async()=>{
       body:JSON.stringify({symbols:syms})})).json();
     $('cfgmsg').textContent=r.ok?'acked: '+r.symbols.join(', ')
       :(r.error||'FAILED — see events');
-    if(r.ok){chartSym=r.symbols[0];slotsSeeded=false;}
+    if(r.ok){chartSym=r.symbols[0];chartSym2=r.symbols[1]||r.symbols[0];
+             slotsSeeded=false;}
   }catch(e){$('cfgmsg').textContent='error: '+e;}
 };
 let killArmed=false,killTimer=null;
@@ -408,13 +420,24 @@ $('kill').onclick=async()=>{
 
 async function poll(){
   try{
-    const s=await (await fetch('/api/state'+
-      (chartSym?'?sym='+chartSym:''))).json();
+    const [s,s2]=await Promise.all([
+      fetch('/api/state'+(chartSym?'?sym='+chartSym:'')).then(r=>r.json()),
+      fetch('/api/state'+(chartSym2?'?sym='+chartSym2:
+                          (chartSym?'?sym='+chartSym:''))).then(r=>r.json())
+    ]);
     if(!slotsSeeded&&s.symbols){
       const boxes=document.querySelectorAll('.slot');
       s.symbols.forEach((t,i)=>{if(boxes[i])boxes[i].value=t;});
       $('csym').innerHTML=s.symbols.map(t=>'<option'+
         (t===s.symbol?' selected':'')+'>'+t+'</option>').join('');
+      $('csym2').innerHTML=s.symbols.map(t=>'<option'+
+        (t===(s.symbols[1]||s.symbol)?' selected':'')+'>'+t+'</option>')
+        .join('');
+      // default the two charts to DIFFERENT symbols when more than one
+      // is configured, so you immediately see two different ticks
+      // side by side rather than the same one duplicated
+      chartSym=s.symbol;
+      chartSym2=s.symbols[1]||s.symbol;
       slotsSeeded=true;}
     $('sym').textContent=s.symbol+' · up '+
       Math.floor(s.uptime_s/60)+'m'+(s.uptime_s%60)+'s';
@@ -439,7 +462,8 @@ async function poll(){
       stat('RTT µs',s.rtt?s.rtt.med+' ('+s.rtt.min+'–'+s.rtt.max+')':'—')+
       stat('ECHO / SENT',s.echoes+' / '+s.sent,
            s.echoes===s.sent?'':'bad');
-    drawChart(s.series,s.signals);
+    drawChart('chart',s.series,s.signals);
+    drawChart('chart2',s2.series,s2.signals);
     if(s.strategies&&s.strategies.length)
       $('cmp').innerHTML='<table><thead><tr><th>strategy</th><th>signals'+
         '</th><th>trips</th><th>wins</th><th>blocked/gated</th>'+

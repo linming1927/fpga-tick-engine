@@ -74,6 +74,13 @@ page = get("/").decode()
 check("HTML page serves", page.startswith("<!DOCTYPE html>"), True)
 check("page has the chart canvas", 'id="chart"' in page, True)
 check("page has the kill switch", "KILL SWITCH" in page, True)
+check("two chart canvases present, for two side-by-side symbols",
+      page.count('<canvas id="chart') >= 2, True)
+check("second chart has its own independent symbol selector",
+      'id="csym2"' in page, True)
+check("EVENTS section appears AFTER (below) the SIGNALS table in the "
+     "page source, not beside the chart", page.index('id="log"') >
+     page.index('id="sigs"'), True)
 check("no external resources", ("http://" in page.replace("http://localhost", "")
                                 or "https://" in page), False)
 
