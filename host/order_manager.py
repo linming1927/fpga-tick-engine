@@ -56,7 +56,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -69,8 +69,74 @@ LIVE_ACK_PHRASE = "I-UNDERSTAND-THIS-TRADES-REAL-MONEY"
 ET = ZoneInfo("America/New_York")
 
 
+class HistoricalClock:
+    """Injected into RiskPolicy so cooldown/daily-cap gating is evaluated
+    against a HISTORICAL timestamp, not real wall-clock time while the
+    replay runs. Call .set(dt) before each evaluate()/record_order().
+    Originally built for backtest.py (as BacktestClock); moved here and
+    generalized because the same trick is needed for restoring TODAY's
+    scored-strategy state across a restart — replaying this morning's
+    signals in milliseconds at startup has the identical problem a
+    multi-year backtest does: without a historical clock, cooldown and
+    the daily cap would gate against "now" instead of when each signal
+    actually happened.
+
+    Starts at a sentinel far-past date (RiskPolicy reads the clock once
+    at construction, before any real signal exists, purely to seed its
+    day-rollover tracking) — the first real signal's date will always
+    differ from the sentinel, so the day-rollover check corrects itself
+    on the very first evaluate() call regardless."""
+
+    _SENTINEL = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def __init__(self):
+        self._t: datetime = self._SENTINEL
+
+    def set(self, t: datetime):
+        self._t = t
+
+    def __call__(self) -> datetime:
+        return self._t
+
+
 def now_us() -> int:
     return time.time_ns() // 1000
+
+
+def _load_scored_signals_split_by_today(audit_path: str
+                                        ) -> tuple[list[dict], list[dict]]:
+    """Same idea as _load_fills_split_by_today, for the SCORED (untraded
+    comparison) strategies instead of the real OrderManager. Those
+    cards have no external source of truth like a broker to reconcile
+    from, so without this they silently reset to zero on every restart
+    — a real reported bug: trips/wins/net $ for EMA (and any other
+    scored row) showed stale/reset values after a restart, even though
+    the live SMA row had already been fixed to persist correctly.
+
+    Reads "scored_signal" events (logged by main()'s on_verified(), one
+    per signal fed to any non-live-traded card) from the SAME audit
+    file the real fills already use — no new log file needed."""
+    if not os.path.exists(audit_path):
+        return [], []
+    today = datetime.now(ET).date()
+    prior, today_sigs = [], []
+    with open(audit_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("event") != "scored_signal" or "t" not in ev:
+                continue
+            ev_date = datetime.fromtimestamp(ev["t"] / 1_000_000,
+                                             tz=ET).date()
+            (today_sigs if ev_date == today else prior).append(ev)
+    prior.sort(key=lambda e: e["t"])
+    today_sigs.sort(key=lambda e: e["t"])
+    return prior, today_sigs
 
 
 def _load_fills_split_by_today(audit_path: str) -> tuple[list[dict], list[dict]]:
@@ -741,6 +807,70 @@ def main():
             "SMA profit-gated", policy=RiskPolicy(limits))
         cards["sma_pg"] = profit_gated
 
+    def route_to_shadow_cards(fr: dict, count: bool = True):
+        """Feed a signal to whichever SCORED (non-live) cards should see
+        it — the single routing rule used both for live signals
+        arriving now (via on_verified, below) and for startup replay of
+        today's earlier history (right below this). Keeping this in
+        one place means replay can never reach a different set of
+        cards than live signals do."""
+        strat = fr["strategy"]
+        if strat != args.strategy:
+            cards[strat].on_signal(fr, count=count)
+        if profit_gated is not None and strat == "sma":
+            profit_gated.on_signal(fr, count=count)
+
+    # ---- restore SCORED strategies' state from earlier today ---------------
+    # Positions reconcile from the broker and the LIVE row restores from
+    # om.costs (both fixed earlier) — but the scored/shadow cards (EMA
+    # when it isn't the live strategy, and profit_gated) have no
+    # external source of truth like a broker, so without this their
+    # trips/wins/net$ silently reset to zero on every restart, even
+    # mid-day — a real reported bug, found right after the live row's
+    # own equivalent bug had already been fixed.
+    prior_scored, todays_scored = _load_scored_signals_split_by_today(
+        args.audit)
+    if prior_scored or todays_scored:
+        # precisely the cards route_to_shadow_cards can reach — NOT a
+        # blanket "every non-live card" filter, which would incorrectly
+        # sweep in the ladder (it consumes raw ticks via br.on_echo, not
+        # verified signals, so this replay mechanism never touches it)
+        other_strat = "ema" if args.strategy == "sma" else "sma"
+        shadow_cards = [cards[other_strat]] if other_strat in cards else []
+        if profit_gated is not None:
+            shadow_cards.append(profit_gated)
+        # historical clock per gated card, so cooldown/daily-cap replay
+        # correctly against each signal's OWN timestamp — the exact same
+        # problem (and the exact same fix) as backtest.py's BacktestClock
+        clocks = {}
+        for c in shadow_cards:
+            if c.policy is not None:
+                clk = HistoricalClock()
+                c.policy._now_fn = clk
+                clocks[id(c)] = clk
+
+        def _set_clocks(t_us):
+            t = datetime.fromtimestamp(t_us / 1_000_000, tz=ET)
+            for clk in clocks.values():
+                clk.set(t)
+
+        for ev in prior_scored:      # silent: cost basis only
+            _set_clocks(ev["t"])
+            route_to_shadow_cards(ev, count=False)
+        for ev in todays_scored:     # counted: today's real totals
+            _set_clocks(ev["t"])
+            route_to_shadow_cards(ev, count=True)
+
+        for c in shadow_cards:       # back to real wall-clock time for
+            if c.policy is not None:  # every live signal from here on
+                c.policy._now_fn = lambda: datetime.now(ET)
+
+        print(f"[compare] restored {len(todays_scored)} scored signal(s) "
+             f"from earlier today ({args.audit}) for: "
+             + ", ".join(c.name for c in shadow_cards)
+             + (f" [{len(prior_scored)} prior-day signal(s) also replayed "
+                f"silently, for cost basis only]" if prior_scored else ""))
+
     dash = None
     if args.dashboard:
         from dashboard import DashboardServer
@@ -778,6 +908,14 @@ def main():
         # strategy actually trading.
         if profit_gated is not None and strat == "sma":
             profit_gated.on_signal(fr)
+        # log once per signal that touched any SCORED card, so a
+        # restart can restore trips/wins/net$ instead of resetting them
+        # to zero — a real reported bug (EMA's numbers, and profit-
+        # gated's, went stale/zero on every restart even though the
+        # live SMA row had already been fixed to persist correctly)
+        if strat != args.strategy or (profit_gated is not None
+                                      and strat == "sma"):
+            om._audit("scored_signal", **fr)
         if dash:
             dash.on_signal(fr, outcome)
 

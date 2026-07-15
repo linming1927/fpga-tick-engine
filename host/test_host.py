@@ -228,7 +228,7 @@ check("both symbols produced signals",
 print(f"       reconfig phase: per-key counts {br.fpga_by_key}")
 
 # scorecards score both strategies from the same verified stream
-from compare import StrategyScorecard, comparison_report
+from compare import StrategyScorecard, ProfitGatedScorecard, comparison_report
 cards = {"sma": StrategyScorecard("SMA 4/8"),
          "ema": StrategyScorecard("EMA")}
 for name, v in br.verifiers.items():
@@ -280,6 +280,104 @@ r = comparison_report({"live": StrategyScorecard("L", live=True, trips=3),
 check("report tags LIVE row", "[LIVE]" in r, True)
 check("report shows gated count", "1 gated" in r, True)
 check("report explains block reasons", "gated-away signals" in r, True)
+
+# ---- v3.3: ProfitGatedScorecard -- refuses to sell at a loss ------------
+print("[G_pg] profit-gated shadow strategy: sells only above cost basis")
+pg = ProfitGatedScorecard("SMA profit-gated")
+check("buy proceeds exactly like the base class",
+      pg.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000,
+                   "symbol": "SPY", "strategy": "sma"}),
+      "FILLED (scored)")
+check("position opened", pg.positions.get("SPY"), 1)
+
+# a sell BELOW cost basis must be suppressed, not executed
+out = pg.on_signal({"side": SIDE_SELL, "price_e4": 900_000,
+                    "symbol": "SPY", "strategy": "sma"})
+check("a losing sell is refused, not silently executed",
+      out.startswith("gated: would realize a loss"), True)
+check("position REMAINS OPEN after a suppressed sell",
+      pg.positions.get("SPY"), 1)
+check("no trip was recorded for the suppressed sell",
+      pg.trips, 0)
+check("the suppression is tracked in block_reasons (shows up "
+     "automatically in the report's gated-away breakdown)",
+     pg.block_reasons.get("would realize a loss"), 1)
+
+# an EXACT breakeven sell (price == entry) must ALSO be refused --
+# "higher than" means strictly above, not "at least"
+out2 = pg.on_signal({"side": SIDE_SELL, "price_e4": 1_000_000,
+                     "symbol": "SPY", "strategy": "sma"})
+check("an exact breakeven sell is also refused (strictly ABOVE cost "
+     "basis, not >=)", out2.startswith("gated: would realize a loss"),
+     True)
+check("still open, still zero trips", (pg.positions.get("SPY"), pg.trips),
+      (1, 0))
+
+# price recovers above cost basis: NOW the sell goes through
+out3 = pg.on_signal({"side": SIDE_SELL, "price_e4": 1_100_000,
+                     "symbol": "SPY", "strategy": "sma"})
+check("a profitable sell executes normally once price recovers",
+      out3, "FILLED (scored)")
+check("position closes", pg.positions.get("SPY"), 0)
+check("exactly one trip recorded, and it's a win (always true by "
+     "construction, since a loss can never be realized here)",
+     (pg.trips, pg.wins), (1, 1))
+check("realized gain matches (exit - entry) x qty",
+      pg.pnl_e4, 100_000)
+
+# weighted-average cost basis across multiple buys works the same as
+# the base class — the profit gate compares against the BLENDED entry.
+# Accumulation only happens through the policy-gated path (matching
+# the max_shares fix elsewhere in this project) — ungated mode
+# deliberately preserves single-lot semantics, so this needs a policy.
+pg2_limits = RiskLimits(order_qty=1, max_shares=5, max_notional_e4=10**13,
+                       max_orders_per_day=99, cooldown_s=0.0,
+                       require_market_hours=False)
+pg2 = ProfitGatedScorecard("SMA profit-gated", policy=RiskPolicy(pg2_limits))
+pg2.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000, "symbol": "SPY",
+              "strategy": "sma"})
+pg2.on_signal({"side": SIDE_BUY, "price_e4": 1_200_000, "symbol": "SPY",
+              "strategy": "sma"})
+avg = (1_000_000 + 1_200_000) // 2
+check("blended cost basis across both buys", pg2.opens.get("SPY"), avg)
+out4 = pg2.on_signal({"side": SIDE_SELL, "price_e4": avg, "symbol": "SPY",
+                      "strategy": "sma"})
+check("sell at exactly the blended average is still refused "
+     "(strictly above, not at)",
+     out4.startswith("gated: would realize a loss"), True)
+out5 = pg2.on_signal({"side": SIDE_SELL, "price_e4": avg + 1,
+                      "symbol": "SPY", "strategy": "sma"})
+check("one cent above the blended average finally clears the gate",
+      out5, "FILLED (scored)")
+
+# a suppressed sell must NOT consume the daily order count or the
+# cooldown timer -- it never became a real order at all. Use zero
+# cooldown here so the cooldown check itself can't confound the
+# result; verify via RiskPolicy's own counters directly instead.
+pg3_limits = RiskLimits(order_qty=1, max_shares=5, max_notional_e4=10**13,
+                       max_orders_per_day=99, cooldown_s=0.0,
+                       require_market_hours=False)
+pg3_policy = RiskPolicy(pg3_limits)
+pg3 = ProfitGatedScorecard("SMA profit-gated", policy=pg3_policy)
+pg3.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000, "symbol": "SPY",
+              "strategy": "sma"})
+check("one order recorded after the buy", pg3_policy.orders_today, 1)
+out6 = pg3.on_signal({"side": SIDE_SELL, "price_e4": 900_000,
+                      "symbol": "SPY", "strategy": "sma"})
+check("suppressed sell (loss) reported as such",
+      out6.startswith("gated: would realize a loss"), True)
+check("the suppressed sell did NOT increment the daily order count "
+     "-- it never became a real order, unlike an actual rejected one",
+     pg3_policy.orders_today, 1)
+out7 = pg3.on_signal({"side": SIDE_SELL, "price_e4": 1_100_000,
+                      "symbol": "SPY", "strategy": "sma"})
+check("a profitable sell right afterward executes normally -- "
+     "confirms the suppressed loss-sell consumed nothing that would "
+     "have blocked it", out7, "FILLED (scored)")
+check("NOW the order count reflects both real orders (buy + sell)",
+      pg3_policy.orders_today, 2)
+
+
 
 # v2.4: block-reason breakdown now shows for ANY gated card, regardless
 # of the [LIVE] label -- fixes a real backtest reporting gap (a

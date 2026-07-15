@@ -67,13 +67,21 @@ class StrategyScorecard:
     def open_e4(self) -> int | None:
         return next(iter(self.opens.values()), None)
 
-    def on_signal(self, fr: dict) -> str:
+    def on_signal(self, fr: dict, count: bool = True) -> str:
         """Returns a short status string, same spirit as
         OrderManager.on_signal — "FILLED (scored)", "gated: <reason>",
         or "ignored: <reason>" for the ungated single-lot mode's silent
         skips — so the GUI can show why a scored (untraded) signal
-        didn't count as a trip, not just that it arrived."""
-        self.signals += 1
+        didn't count as a trip, not just that it arrived.
+
+        count=False replays a signal to rebuild cost basis (opens/
+        positions) WITHOUT touching signals/trips/wins/pnl_e4/blocked —
+        same purpose as CostTracker.on_fill's count flag: restoring a
+        scored strategy's state across a restart needs prior-day
+        history to get an open position's cost basis right, but what's
+        REPORTED as "today's" activity should only be today's own."""
+        if count:
+            self.signals += 1
         side, price = fr["side"], fr["price_e4"]
         sym = fr.get("symbol", "").strip()
         pos_qty = self.positions.get(sym, 0)
@@ -82,10 +90,12 @@ class StrategyScorecard:
             allowed, reason, qty = self.policy.evaluate(side, pos_qty,
                                                          price)
             if not allowed:
-                self.blocked += 1
-                self.block_reasons[reason.split(" (")[0]] += 1
+                if count:
+                    self.blocked += 1
+                    self.block_reasons[reason.split(" (")[0]] += 1
                 return f"gated: {reason}"
-            self.policy.record_order()
+            if count:
+                self.policy.record_order()
         else:
             if side == SIDE_BUY and pos_qty > 0:
                 return "ignored: already open"
@@ -98,14 +108,15 @@ class StrategyScorecard:
             self.opens[sym] = price
         elif side == SIDE_SELL:
             entry = self.opens.pop(sym, price)
-            trip = (price - entry) * qty
-            self.pnl_e4 += trip
-            self.trips += 1
-            if trip > 0:
-                self.wins = (self.wins or 0) + 1
-            self.fees_usd += self.fees.sell_fees(
-                qty, qty * price / 10_000.0)["total"]
             self.positions[sym] = 0
+            if count:
+                trip = (price - entry) * qty
+                self.pnl_e4 += trip
+                self.trips += 1
+                if trip > 0:
+                    self.wins = (self.wins or 0) + 1
+                self.fees_usd += self.fees.sell_fees(
+                    qty, qty * price / 10_000.0)["total"]
         return "FILLED (scored)"
 
     @property
@@ -158,8 +169,9 @@ class ProfitGatedScorecard(StrategyScorecard):
         themselves rather than assuming either outcome.
     """
 
-    def on_signal(self, fr: dict) -> str:
-        self.signals += 1
+    def on_signal(self, fr: dict, count: bool = True) -> str:
+        if count:
+            self.signals += 1
         side, price = fr["side"], fr["price_e4"]
         sym = fr.get("symbol", "").strip()
         pos_qty = self.positions.get(sym, 0)
@@ -168,8 +180,9 @@ class ProfitGatedScorecard(StrategyScorecard):
             allowed, reason, qty = self.policy.evaluate(side, pos_qty,
                                                          price)
             if not allowed:
-                self.blocked += 1
-                self.block_reasons[reason.split(" (")[0]] += 1
+                if count:
+                    self.blocked += 1
+                    self.block_reasons[reason.split(" (")[0]] += 1
                 return f"gated: {reason}"
         else:
             if side == SIDE_BUY and pos_qty > 0:
@@ -185,30 +198,32 @@ class ProfitGatedScorecard(StrategyScorecard):
             self.opens[sym] = ((old_avg * old_qty + price * qty)
                                // new_qty) if old_qty else price
             self.positions[sym] = new_qty
-            if self.policy is not None:
+            if self.policy is not None and count:
                 self.policy.record_order()
             return "FILLED (scored)"
 
         # SIDE_SELL: the one rule this whole class exists to add
         entry = self.opens.get(sym, price)
         if price <= entry:
-            self.blocked += 1
-            self.block_reasons["would realize a loss"] += 1
+            if count:
+                self.blocked += 1
+                self.block_reasons["would realize a loss"] += 1
             # NOTE: record_order() is deliberately NOT called here — a
             # suppressed sell never became an order at all, so it
             # shouldn't consume cooldown or the daily cap the way a
             # real rejected order would; only actual fills should.
             return "gated: would realize a loss (price <= avg cost)"
 
-        if self.policy is not None:
+        if self.policy is not None and count:
             self.policy.record_order()
         qty_to_sell = self.positions.get(sym, 0)
-        trip = (price - entry) * qty_to_sell
-        self.pnl_e4 += trip
-        self.trips += 1
-        self.wins = (self.wins or 0) + 1        # always true here, by rule
-        self.fees_usd += self.fees.sell_fees(
-            qty_to_sell, qty_to_sell * price / 10_000.0)["total"]
+        if count:
+            trip = (price - entry) * qty_to_sell
+            self.pnl_e4 += trip
+            self.trips += 1
+            self.wins = (self.wins or 0) + 1    # always true here, by rule
+            self.fees_usd += self.fees.sell_fees(
+                qty_to_sell, qty_to_sell * price / 10_000.0)["total"]
         self.positions[sym] = 0
         self.opens.pop(sym, None)
         return "FILLED (scored)"

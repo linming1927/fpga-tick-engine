@@ -42,31 +42,14 @@ from datetime import datetime, timezone
 
 from backtest_results import save_backtest_result, RESULTS_DIR_DEFAULT
 from compare import StrategyScorecard, comparison_report
-from order_manager import RiskPolicy, RiskLimits
+from order_manager import RiskPolicy, RiskLimits, HistoricalClock
 from tick_protocol import SMAMirror, EMAMirror, to_e4
+BacktestClock = HistoricalClock   # backward-compatible alias — this class
+                                 # moved to order_manager.py so the same
+                                 # replay mechanism could be reused for
+                                 # restoring scored-strategy state across
+                                 # a live restart, not just backtests
 
-
-class BacktestClock:
-    """Injected into RiskPolicy so cooldown/daily-cap gating is evaluated
-    against HISTORICAL trade time, not real time elapsed while this
-    script runs. Call .set(dt) before each evaluate()/record_order().
-
-    Starts at a sentinel far-past date (RiskPolicy reads the clock once
-    at construction, before any real trade exists, purely to seed its
-    day-rollover tracking) — the first real trade's date will always
-    differ from the sentinel, so the day-rollover check corrects itself
-    on the very first evaluate() call regardless."""
-
-    _SENTINEL = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-    def __init__(self):
-        self._t: datetime = self._SENTINEL
-
-    def set(self, t: datetime):
-        self._t = t
-
-    def __call__(self) -> datetime:
-        return self._t
 
 
 def iter_trades(path: str):

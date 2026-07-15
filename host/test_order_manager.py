@@ -23,6 +23,15 @@ from order_manager import ET
 import os
 import random
 import sys
+
+# Resolve order_manager.py's path relative to THIS FILE, not the
+# caller's current working directory — a subprocess test hardcoding a
+# bare "order_manager.py" only works if invoked from inside host/.
+# Running the suite from the repo root (a completely reasonable thing
+# to do) made G14 fail with "can't open file" -- the exact same class
+# of bug already found and fixed once in test_backtest_results.py.
+ORDER_MANAGER_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "order_manager.py")
 import tempfile
 import time
 
@@ -500,6 +509,73 @@ check("ungated scorecard: buy-while-open is reported as ignored, "
      sc13.on_signal({"side": SIDE_BUY, "price_e4": 1_200_000,
                      "symbol": "SPY", "strategy": "sma"}),
      "ignored: already open")
+
+# ---- v3.4: THE REPORTED BUG -- EMA and SMA-profit-gated must resume
+# their trips/wins/net$ across a restart, not reset to zero, exactly
+# like the LIVE row already does (v2.7) ------------------------------------
+print("[G14] a real restart (two subprocess sessions, same audit file) "
+     "resumes EMA and SMA-profit-gated's numbers instead of resetting them")
+import subprocess, re
+d14 = tempfile.mkdtemp()
+audit14 = os.path.join(d14, "a.jsonl")
+
+def run_session(n_ticks):
+    emu = FPGAEmulator(symbol="SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3)
+    port = emu.start()
+    r = subprocess.run(
+        [sys.executable, ORDER_MANAGER_PY, "--port", port,
+         "--source", "sim", "--broker", "mock", "--cooldown", "0",
+         "--n", str(n_ticks), "--rate", "50", "--fast", "4", "--slow", "8",
+         "--ema-kf", "1", "--ema-ks", "3", "--profit-gate",
+         "--audit", audit14],
+        capture_output=True, text=True, timeout=90)
+    emu.stop()
+    return r.stdout
+
+def parse_row(stdout, prefix):
+    # "  EMA 1/2:1/8                   21      5   20%    ..."
+    for line in stdout.splitlines():
+        if line.strip().startswith(prefix):
+            parts = line.split()
+            # strategy name may contain no spaces after the leading label
+            # in this test's fixed config (fast=4/slow=8, ema-kf=1/ks=3)
+            trips = int(parts[-8]) if prefix == "SMA profit-gated" else None
+            return line
+    return None
+
+out1 = run_session(300)
+sma_1 = [l for l in out1.splitlines() if l.strip().startswith("SMA 4/8")][0]
+ema_1 = [l for l in out1.splitlines() if l.strip().startswith("EMA")][0]
+pg_1 = [l for l in out1.splitlines()
+       if l.strip().startswith("SMA profit-gated")][0]
+
+out2 = run_session(1)   # near-zero new activity: isolates the RESTORE
+check("session 2 announces the restore for both shadow strategies",
+      "restored" in out2 and "EMA" in out2 and "profit-gated" in out2,
+      True)
+sma_2 = [l for l in out2.splitlines() if l.strip().startswith("SMA 4/8")][0]
+ema_2 = [l for l in out2.splitlines() if l.strip().startswith("EMA")][0]
+pg_2 = [l for l in out2.splitlines()
+       if l.strip().startswith("SMA profit-gated")][0]
+
+def trips_win_net(line):
+    # compare.py's row() left-justifies name+tag in a 24-char field
+    # after 2 leading spaces (see StrategyScorecard.row()) — slicing
+    # at that fixed boundary is robust regardless of the name's own
+    # length ("SMA 4/8 [LIVE]" vs "SMA profit-gated" vs "EMA 1/2:1/8"),
+    # unlike token-counting from the end, which shifts with variable
+    # trailing text like "(N blocked)"/"(N gated)".
+    fields = line[26:].split()
+    return fields[1], fields[2], fields[5]   # trips, win, net$
+
+check("SMA (live) trips/win/net survive the restart (already fixed "
+     "in v2.7 -- confirms this test's own methodology is sound)",
+     trips_win_net(sma_1), trips_win_net(sma_2))
+check("EMA's trips/win/net RESUME after restart instead of resetting "
+     "to zero -- the actual reported bug",
+     trips_win_net(ema_1), trips_win_net(ema_2))
+check("SMA profit-gated's trips/win/net ALSO resume correctly",
+      trips_win_net(pg_1), trips_win_net(pg_2))
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
