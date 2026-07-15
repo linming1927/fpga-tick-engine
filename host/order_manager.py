@@ -60,7 +60,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from tick_protocol import SIDE_BUY, SIDE_SELL, dollars
+from tick_protocol import SIDE_BUY, SIDE_SELL, dollars, to_e4
 from costs import CostTracker
 
 PAPER_URL = "https://paper-api.alpaca.markets"
@@ -261,17 +261,26 @@ def market_is_open(t: datetime | None = None) -> bool:
 
 
 class RiskPolicy:
-    def __init__(self, limits: RiskLimits):
+    def __init__(self, limits: RiskLimits, now_fn=None):
+        """now_fn: optional callable returning the "current" aware datetime.
+        Defaults to real wall-clock time (datetime.now(ET)) — LIVE behavior
+        is completely unchanged. A backtest replaying historical trades
+        injects a callable that returns each trade's OWN timestamp instead,
+        so cooldown and daily-cap rollover are evaluated against historical
+        time, not the seconds it takes this process to replay years of
+        data. See backtest.py's BacktestClock."""
         self.lim = limits
+        self._now_fn = now_fn or (lambda: datetime.now(ET))
         self.orders_today = 0
-        self.day = datetime.now(ET).date()
+        self.day = self._now_fn().date()
         self.last_order_t = 0.0
 
     def evaluate(self, side: int, position_qty: int,
                  price_e4: int) -> tuple[bool, str, int]:
         """Return (allowed, reason, qty). Pure; no side effects."""
         lim = self.lim
-        today = datetime.now(ET).date()
+        now = self._now_fn()
+        today = now.date()
         if today != self.day:                        # daily counter rollover
             self.day, self.orders_today = today, 0
 
@@ -279,7 +288,7 @@ class RiskPolicy:
             return False, "market closed", 0
         if self.orders_today >= lim.max_orders_per_day:
             return False, f"daily order cap ({lim.max_orders_per_day}) reached", 0
-        gap = time.monotonic() - self.last_order_t
+        gap = now.timestamp() - self.last_order_t
         if self.last_order_t and gap < lim.cooldown_s:
             return False, f"cooldown ({gap:.1f}s < {lim.cooldown_s}s)", 0
 
@@ -303,7 +312,7 @@ class RiskPolicy:
 
     def record_order(self):
         self.orders_today += 1
-        self.last_order_t = time.monotonic()
+        self.last_order_t = self._now_fn().timestamp()
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +481,29 @@ def main():
     ap.add_argument("--strategy", choices=["sma", "ema"], default="sma",
                     help="which engine's signals TRADE; the other is "
                          "scored hypothetically for comparison")
+    ap.add_argument("--ladder", action="store_true",
+                    help="also score a weekly-anchored buy-the-dip ladder "
+                         "(see ladder_strategy.py) — SCORE ONLY, never "
+                         "trades, regardless of --strategy")
+    ap.add_argument("--ladder-step", type=float, default=0.03,
+                    help="ladder trigger spacing, e.g. 0.03 = 3%%")
+    ap.add_argument("--ladder-levels", type=int, default=3,
+                    help="max buy levels before the ladder is 'full'")
+    ap.add_argument("--ladder-qty", type=int, default=1,
+                    help="shares bought at EACH level")
+    ap.add_argument("--ladder-method", choices=list(__import__(
+                    "ladder_strategy").BASELINE_METHODS),
+                    default="week_vwap",
+                    help="how to compute each symbol's weekly baseline")
+    ap.add_argument("--baud", type=int, default=921_600,
+                    help="must match the bitstream's BAUD parameter — "
+                         "921600 (default) for the current build, 115200 "
+                         "for anything built before this change")
+    ap.add_argument("--ladder-baseline", default=None,
+                    help="manual override, e.g. 'SPY:500.00,QQQ:450.00' — "
+                         "skips the Alpaca weekly-bars fetch (required "
+                         "for --source sim, since there's no real feed "
+                         "to compute a baseline from)")
     ap.add_argument("--source", choices=["sim", "alpaca"], default="sim")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--rate", type=float, default=10.0)
@@ -537,7 +569,8 @@ def main():
 
     from compare import StrategyScorecard, comparison_report
     br = Bridge(args.port, symbols, args.fast, args.slow,
-                ema_kf=args.ema_kf, ema_ks=args.ema_ks, log_path=args.log)
+                ema_kf=args.ema_kf, ema_ks=args.ema_ks, baud=args.baud,
+                log_path=args.log)
 
     labels = {"sma": f"SMA {args.fast}/{args.slow}",
               "ema": f"EMA 1/{1 << args.ema_kf}:1/{1 << args.ema_ks}"}
@@ -554,11 +587,57 @@ def main():
             # The live row is overwritten from om.costs at session end.
             policy=None if live else RiskPolicy(limits))
 
+    ladder = None
+    if args.ladder:
+        from ladder_strategy import (LadderScorecard, compute_weekly_baseline,
+                                     fetch_prior_week_bars)
+        ladder = LadderScorecard(
+            f"Ladder {args.ladder_step*100:.0f}%/{args.ladder_levels}lvl",
+            step_pct=args.ladder_step, max_levels=args.ladder_levels,
+            qty_per_level=args.ladder_qty, live=False)
+        cards["ladder"] = ladder
+
+        manual = {}
+        if args.ladder_baseline:
+            for pair in args.ladder_baseline.split(","):
+                sym, price = pair.split(":")
+                manual[sym.strip().upper()] = float(price)
+        for sym in symbols:
+            sym = sym.strip().upper()
+            if sym in manual:
+                ladder.set_baseline(sym, to_e4(manual[sym]))
+            elif args.source == "alpaca":
+                key = os.environ.get("ALPACA_KEY")
+                secret = os.environ.get("ALPACA_SECRET")
+                bars = fetch_prior_week_bars(sym, key, secret)
+                base = compute_weekly_baseline(bars, args.ladder_method)
+                ladder.set_baseline(sym, base)
+                print(f"[ladder] {sym} baseline ({args.ladder_method}): "
+                      f"${base/10_000:.2f}")
+            else:
+                print(f"[ladder] WARNING: no baseline for {sym} — pass "
+                      f"--ladder-baseline {sym}:<price> for --source sim")
+
     dash = None
     if args.dashboard:
         from dashboard import DashboardServer
         dash = DashboardServer(br, om, args.dashboard, scorecards=cards)
         dash.start()
+
+    if ladder:
+        # chain onto whatever's already listening for echoes (the
+        # dashboard, if running) rather than replace it — the ladder
+        # needs EVERY accepted trade, not just verified crossover
+        # signals, since it compares raw price against static levels.
+        _prev_echo = br.on_echo
+        def _on_echo_with_ladder(fr):
+            if _prev_echo:
+                _prev_echo(fr)
+            sym = fr["symbol"].strip()
+            ev = ladder.on_tick(sym, fr["price_e4"])
+            if ev:
+                ladder.on_signal(ev)
+        br.on_echo = _on_echo_with_ladder
 
     def on_verified(fr):
         strat = fr["strategy"]

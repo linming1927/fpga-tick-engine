@@ -128,7 +128,16 @@ def comparison_report(cards: dict[str, StrategyScorecard]) -> str:
              " fees $      net $  position"]
     lines += [c.row() for c in cards.values()]
     for c in cards.values():
-        if not c.live and c.policy is not None and c.block_reasons:
+        if c.policy is not None and c.block_reasons:
+            # NOTE: shown regardless of c.live. The [LIVE] tag means
+            # "these numbers are real broker fills" (true in a live
+            # session, never true in a backtest — see backtest.py's
+            # run_backtest(), which labels one row [LIVE] purely for
+            # cosmetic consistency with live reports even though BOTH
+            # rows are gated replays there). Hiding the reason breakdown
+            # for whichever row happens to be labeled [LIVE] was a real
+            # gap: in a backtest it hid exactly the diagnostic you'd
+            # want most, for no real benefit even in a true live session.
             top = ", ".join(f"{r} x{n}"
                             for r, n in c.block_reasons.most_common(3))
             lines.append(f"    {c.name} gated-away signals: {top}")

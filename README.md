@@ -65,7 +65,80 @@ summary, so treat it as an escape hatch, not routine.
 
 ---
 
-# FPGA Tick Parser — Integration Layer (MANUAL.md §4)
+## Historical Data & Backtesting
+
+Live sessions produce a handful of round trips at best — every
+comparison report so far has printed "few round trips, treat as
+anecdote." Backtesting against real historical data is how you get a
+statistically meaningful sample (a real 5-year SPY backtest produced 95
+trips per strategy) instead of n=4.
+
+### 1. Fetch historical trades
+
+```bash
+# one symbol
+python3 host/fetch_historical_trades.py --symbol SPY --years 3
+
+# several symbols, fetched CONCURRENTLY (independent page sequences,
+# one shared rate limiter — this is the case where concurrency helps;
+# a single symbol's pages are strictly sequential, no way around that)
+python3 host/fetch_historical_trades.py --symbols SPY,QQQ,AAPL --years 3
+```
+
+Notes:
+- **Resumable.** Ctrl+C any time; rerun the exact same command to
+  continue from the checkpoint instead of starting over.
+- **Files are scoped to the exact range requested** —
+  `SPY_2026-01-01_2026-07-01.trades.jsonl` — so fetching a different
+  range for the same symbol never collides with or silently shadows an
+  earlier fetch. If you have old flat `SPY.trades.jsonl` files from
+  before this, they're stale; delete and refetch.
+- **`--end` defaults to 2 days before today**, not today — free-tier
+  SIP access rejects queries that touch genuinely recent data (HTTP
+  403, "subscription does not permit querying recent SIP data"). If
+  you need the last day or two, use `--feed iex` for that slice
+  specifically (no recency restriction on IEX), or just accept the
+  small gap — irrelevant for a multi-year statistical backtest.
+- Start small first: `--start 2026-06-01 --end 2026-07-01` to validate
+  the whole pipeline before committing to a multi-hour, multi-year
+  pull. Raw tick-level history for a liquid symbol is large.
+- `--rate-per-min` defaults to 180 (of the free tier's 200/min cap);
+  transient rate-limit hits and connection drops retry with backoff
+  automatically.
+
+### 2. Run the backtest
+
+```bash
+python3 host/backtest.py --trades historical_trades/SPY_2026-01-01_2026-07-01.trades.jsonl \
+    --symbol SPY --strategy sma --fast 8 --slow 32 --cooldown 60 --max-orders-per-day 10
+```
+
+- Replays the file through the **exact same** `SMAMirror`/`EMAMirror`/
+  `StrategyScorecard`/`RiskPolicy` classes the live system and hardware
+  verification use — not a reimplementation, so a backtest result is
+  guaranteed consistent with what the FPGA actually computes.
+- `--strategy` only controls which row is labeled `[LIVE]` in the
+  report (cosmetic) — **both rows are gated replays** in a backtest,
+  neither has real fills. `RiskPolicy`'s cooldown and daily-order-cap
+  gating evaluate against each trade's own *historical* timestamp, not
+  wall-clock time while the script runs — replaying years of data in
+  seconds still gets correct day-by-day and cooldown gating.
+- **Combine incrementally-fetched ranges** without re-downloading, by
+  passing multiple files in chronological order:
+  ```bash
+  --trades SPY_2026-01-01_2026-06-01.trades.jsonl,SPY_2026-06-01_2026-07-01.trades.jsonl
+  ```
+  (raises if the files are out of order or overlapping, rather than
+  silently corrupting the replay's notion of historical time.)
+- Read the block-reason breakdown (`gated-away signals: daily order cap
+  x..., cooldown x...`) before drawing conclusions from the dollar
+  figures — a strict cap dominating the blocks means you're looking at
+  "the indicator under these risk limits," not the raw indicator's
+  unconstrained behavior.
+
+---
+
+
 
 ## New in this drop
 | File | Purpose |

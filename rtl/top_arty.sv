@@ -35,7 +35,16 @@
 
 module top_arty #(
     parameter int          CLK_HZ         = 100_000_000,
-    parameter int          BAUD           = 115_200,
+    parameter int          BAUD           = 921_600,   // was 115_200;
+                                                       // 100MHz/921600 rounds
+                                                       // to 108 clks/bit,
+                                                       // actual ~925.9kHz
+                                                       // (+0.469%) — well
+                                                       // within normal UART
+                                                       // tolerance, same
+                                                       // category of effect
+                                                       // as the sim BAUD
+                                                       // speedup trick
     parameter int          TX_FIFO_DEPTH  = 16,      // echo FIFO; power of 2
     parameter int          SIG_FIFO_DEPTH = 4,       // signal FIFO; power of 2
     parameter logic [47:0] DEFAULT_SYM0   = "SPY   ", // slot 0 reset value

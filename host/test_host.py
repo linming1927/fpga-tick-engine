@@ -280,6 +280,19 @@ r = comparison_report({"live": StrategyScorecard("L", live=True, trips=3),
 check("report tags LIVE row", "[LIVE]" in r, True)
 check("report shows gated count", "1 gated" in r, True)
 check("report explains block reasons", "gated-away signals" in r, True)
+
+# v2.4: block-reason breakdown now shows for ANY gated card, regardless
+# of the [LIVE] label -- fixes a real backtest reporting gap (a
+# backtest's "[LIVE]"-labeled row is still a gated replay, not real
+# fills, so hiding its own breakdown hid the most useful diagnostic)
+live_but_gated = StrategyScorecard("X", live=True, policy=RiskPolicy(tight))
+live_but_gated.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000,
+                          "symbol": "SPY", "strategy": "sma"})
+live_but_gated.on_signal({"side": SIDE_SELL, "price_e4": 1_100_000,
+                          "symbol": "SPY", "strategy": "sma"})  # cooldown blocks
+r2 = comparison_report({"x": live_but_gated})
+check("breakdown now shows even for a [LIVE]-labeled gated card",
+      "gated-away signals" in r2, True)
 br.close()
 emu.stop()
 

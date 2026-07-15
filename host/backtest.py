@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+backtest.py — replay historical trades through the SAME engines that run
+live and in verification. Not a reimplementation: SMAMirror, EMAMirror,
+StrategyScorecard, and RiskPolicy are imported unchanged from the exact
+modules the FPGA's signals are verified against. A backtest is only
+meaningful if "SMA crossover" means the identical arithmetic in both
+places — this guarantees that by construction rather than by care.
+
+    python3 backtest.py --symbol SPY --strategy sma \\
+        --trades ./historical_trades/SPY.trades.jsonl \\
+        --fast 8 --slow 32 --cooldown 60 --max-orders-per-day 10
+
+Feed it JSONL from fetch_historical_trades.py (one Alpaca trade record
+per line, fields "t" ISO timestamp and "p" price — matches Alpaca's
+documented trade schema). Streams the file rather than loading it whole
+(these files can be gigabytes), replaying each trade through:
+
+  1. BOTH SMAMirror and EMAMirror (matching the live bridge exactly)
+  2. one StrategyScorecard per strategy, gated through a RiskPolicy whose
+     clock is the trade's OWN historical timestamp — NOT wall-clock time
+     as this script runs. Without that, replaying years of history in
+     seconds would mean cooldown never expires and the daily cap never
+     rolls over against the real calendar; see BacktestClock below and
+     RiskPolicy's now_fn parameter in order_manager.py.
+
+Output is the same comparison_report() table you already read from live
+sessions — same columns, same "few round trips" caveat, same honesty
+about hypothetical signal-price fills with no slippage. A multi-year
+backtest answers "does this crossover show any edge over real history",
+not "will it be profitable live" — spread, slippage, and partial fills
+are absent here exactly as they're absent from the live scorecard's
+untraded-strategy row.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+
+from compare import StrategyScorecard, comparison_report
+from order_manager import RiskPolicy, RiskLimits
+from tick_protocol import SMAMirror, EMAMirror, to_e4
+
+
+class BacktestClock:
+    """Injected into RiskPolicy so cooldown/daily-cap gating is evaluated
+    against HISTORICAL trade time, not real time elapsed while this
+    script runs. Call .set(dt) before each evaluate()/record_order().
+
+    Starts at a sentinel far-past date (RiskPolicy reads the clock once
+    at construction, before any real trade exists, purely to seed its
+    day-rollover tracking) — the first real trade's date will always
+    differ from the sentinel, so the day-rollover check corrects itself
+    on the very first evaluate() call regardless."""
+
+    _SENTINEL = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def __init__(self):
+        self._t: datetime = self._SENTINEL
+
+    def set(self, t: datetime):
+        self._t = t
+
+    def __call__(self) -> datetime:
+        return self._t
+
+
+def iter_trades(path: str):
+    """Stream one (datetime, price_e4) pair per line — never loads the
+    whole file, since these can be gigabytes for a multi-year pull."""
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            t = datetime.fromisoformat(rec["t"].replace("Z", "+00:00"))
+            yield t, to_e4(float(rec["p"]))
+
+
+def iter_trades_multi(paths: list[str]):
+    """Stream several trade files IN THE ORDER GIVEN, as if they were
+    one continuous file. Meant for combining separately-fetched,
+    non-overlapping date ranges (fetch_historical_trades.py now scopes
+    filenames to their exact range, so incrementally widening your
+    history means MULTIPLE files rather than one growing file — this
+    is how you replay them together without re-downloading anything).
+
+    Does a cheap streaming sanity check, not a full sort: if a later
+    file's first trade is timestamped BEFORE the previous file's last
+    trade, that's very likely the files were passed out of
+    chronological order (or the ranges overlap), which would corrupt
+    the backtest's notion of "historical time" — this raises rather
+    than silently replaying history out of order."""
+    prev_last_t = None
+    for path in paths:
+        first_in_file = True
+        for t, price_e4 in iter_trades(path):
+            if first_in_file and prev_last_t is not None and t < prev_last_t:
+                raise ValueError(
+                    f"{path} starts at {t}, which is BEFORE the previous "
+                    f"file's last trade at {prev_last_t} — files must be "
+                    f"passed in chronological order with non-overlapping "
+                    f"ranges, or the backtest's historical clock breaks")
+            first_in_file = False
+            prev_last_t = t
+            yield t, price_e4
+
+
+def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
+                 ema_kf: int, ema_ks: int, limits: RiskLimits,
+                 traded_strategy: str, progress_every: int = 500_000
+                 ) -> dict[str, StrategyScorecard]:
+    if isinstance(trades_paths, str):
+        trades_paths = [trades_paths]
+    sma_model = SMAMirror(fast_n=fast_n, slow_n=slow_n)
+    ema_model = EMAMirror(k_fast=ema_kf, k_slow=ema_ks, warmup_n=slow_n)
+
+    clocks = {"sma": BacktestClock(), "ema": BacktestClock()}
+    cards = {
+        name: StrategyScorecard(
+            f"{name.upper()} backtest", live=False,
+            policy=RiskPolicy(limits, now_fn=clocks[name]))
+        for name in ("sma", "ema")
+    }
+
+    n = 0
+    for t, price_e4 in iter_trades_multi(trades_paths):
+        n += 1
+        if n % progress_every == 0:
+            print(f"  ...{n:,} trades replayed ({t.date()})", file=sys.stderr)
+
+        sig = sma_model.ingest(price_e4)
+        if sig:
+            clocks["sma"].set(t)
+            cards["sma"].on_signal({"side": sig.side, "price_e4": sig.price_e4,
+                                    "symbol": symbol, "strategy": "sma"})
+
+        sig = ema_model.ingest(price_e4)
+        if sig:
+            clocks["ema"].set(t)
+            cards["ema"].on_signal({"side": sig.side, "price_e4": sig.price_e4,
+                                    "symbol": symbol, "strategy": "ema"})
+
+    print(f"[backtest] {n:,} trades replayed for {symbol}", file=sys.stderr)
+    cards["sma"].live = (traded_strategy == "sma")
+    cards["ema"].live = (traded_strategy == "ema")
+    # the "live" flag here only controls report LABELING (both rows were
+    # actually gated identically) — a backtest has no real broker fills
+    # to prefer over the gated replay, unlike a live session's true row
+    return cards
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trades", required=True,
+                    help="one JSONL file from fetch_historical_trades.py, "
+                         "or several comma-separated files to replay as "
+                         "one continuous history (e.g. if you fetched "
+                         "Jan-Mar and Apr-Jun separately: "
+                         "SPY_2026-01-01_2026-04-01.trades.jsonl,"
+                         "SPY_2026-04-01_2026-07-01.trades.jsonl) — "
+                         "must be given in chronological, non-"
+                         "overlapping order")
+    ap.add_argument("--symbol", required=True)
+    ap.add_argument("--strategy", choices=["sma", "ema"], default="sma",
+                    help="which row is labeled [LIVE] in the report — "
+                         "cosmetic only, both are gated identically")
+    ap.add_argument("--fast", type=int, default=8)
+    ap.add_argument("--slow", type=int, default=32)
+    ap.add_argument("--ema-kf", type=int, default=3)
+    ap.add_argument("--ema-ks", type=int, default=5)
+    ap.add_argument("--order-qty", type=int, default=1)
+    ap.add_argument("--max-shares", type=int, default=1)
+    ap.add_argument("--max-notional", type=float, default=1_000_000.0)
+    ap.add_argument("--max-orders-per-day", type=int, default=10)
+    ap.add_argument("--cooldown", type=float, default=60.0)
+    args = ap.parse_args()
+
+    limits = RiskLimits(
+        order_qty=args.order_qty, max_shares=args.max_shares,
+        max_notional_e4=to_e4(args.max_notional),
+        max_orders_per_day=args.max_orders_per_day,
+        cooldown_s=args.cooldown, require_market_hours=False)
+        # require_market_hours=False: historical trade timestamps ARE
+        # market-hours by construction (that's when trades print), so
+        # this gate would just be redundant work against real data
+
+    trades_paths = [p.strip() for p in args.trades.split(",") if p.strip()]
+    cards = run_backtest(trades_paths, args.symbol, args.fast, args.slow,
+                        args.ema_kf, args.ema_ks, limits, args.strategy)
+    print()
+    print(comparison_report(cards))
+
+
+if __name__ == "__main__":
+    main()
