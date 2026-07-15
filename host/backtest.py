@@ -186,9 +186,14 @@ def main():
     ap.add_argument("--ema-kf", type=int, default=3)
     ap.add_argument("--ema-ks", type=int, default=5)
     ap.add_argument("--order-qty", type=int, default=1)
-    ap.add_argument("--max-shares", type=int, default=1)
-    ap.add_argument("--max-notional", type=float, default=1_000_000.0)
-    ap.add_argument("--max-orders-per-day", type=int, default=10)
+    ap.add_argument("--max-shares", type=int, default=10)   # matches
+                    # order_manager.py's live default -- was 1, an
+                    # oversight that made a bare backtest.py run NOT
+                    # faithfully reproduce default live behavior
+    ap.add_argument("--max-notional", type=float, default=2_000.0)   # was
+                    # 1_000_000.0 (effectively a no-op cap); now matches
+                    # order_manager.py's live default of $2,000/order
+    ap.add_argument("--max-orders-per-day", type=int, default=1000)
     ap.add_argument("--cooldown", type=float, default=60.0)
     ap.add_argument("--profit-gate", action="store_true",
                     help="also backtest the SAME SMA crossover signals "

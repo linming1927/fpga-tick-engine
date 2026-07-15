@@ -243,6 +243,37 @@ check("CLI run succeeded", r.returncode, 0)
 check("CLI output includes the profit-gated row",
       "SMA profit-gated" in r.stdout, True)
 
+# ---- v3.6: default risk limits must match order_manager.py exactly,
+# so a bare backtest.py run (no risk-limit flags) faithfully reproduces
+# what a default LIVE session would have done -- found via a real
+# report: backtest.py's own defaults for max_shares ($1, not 10) and
+# max_notional ($1M, effectively a no-op, not $2,000) silently diverged
+# from the live tool's defaults. -----------------------------------
+print("[G8] backtest.py's CLI defaults match order_manager.py's exactly")
+import re
+
+bt_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "backtest.py")).read()
+om_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "order_manager.py")).read()
+
+def cli_default(module_src, flag):
+    m = re.search(re.escape(f'"{flag}"') + r'.*?default=([\d_.]+)',
+                 module_src)
+    return float(m.group(1).replace("_", "")) if m else None
+
+for flag in ("--max-shares", "--max-notional", "--max-orders-per-day"):
+    check(f"{flag} default matches between backtest.py and order_manager.py",
+          cli_default(bt_src, flag), cli_default(om_src, flag))
+check("max_orders_per_day default is specifically 1000 (per request), "
+     "not the old value of 10",
+     cli_default(bt_src, "--max-orders-per-day"), 1000.0)
+check("max_shares default is specifically 10, not the old value of 1",
+      cli_default(bt_src, "--max-shares"), 10.0)
+check("max_notional default is specifically $2,000, not the old "
+     "effectively-unlimited $1,000,000",
+     cli_default(bt_src, "--max-notional"), 2000.0)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

@@ -351,7 +351,7 @@ class RiskLimits:
     order_qty: int = 1                    # shares per entry
     max_shares: int = 10                  # position ceiling
     max_notional_e4: int = 2_000 * 10_000 # $2000 per order
-    max_orders_per_day: int = 10
+    max_orders_per_day: int = 1000
     cooldown_s: float = 60.0              # anti-whipsaw gap between orders
     require_market_hours: bool = True     # RTH gate (no holiday calendar)
     max_daily_loss: float | None = None   # $ realized; halt when breached
@@ -696,7 +696,7 @@ def main():
     ap.add_argument("--qty", type=int, default=1)
     ap.add_argument("--max-shares", type=int, default=10)
     ap.add_argument("--max-notional", type=float, default=2000.0)
-    ap.add_argument("--max-orders-per-day", type=int, default=10)
+    ap.add_argument("--max-orders-per-day", type=int, default=1000)
     ap.add_argument("--cooldown", type=float, default=60.0)
     ap.add_argument("--ignore-market-hours", action="store_true",
                     help="for mock/off-hours testing")

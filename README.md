@@ -142,8 +142,14 @@ Notes:
 
 ```bash
 python3 host/backtest.py --trades historical_trades/SPY_2026-01-01_2026-07-01.trades.jsonl \
-    --symbol SPY --strategy sma --fast 8 --slow 32 --cooldown 60 --max-orders-per-day 10
+    --symbol SPY --strategy sma --fast 8 --slow 32 --cooldown 60
 ```
+
+`--max-shares` (10), `--max-notional` ($2,000), and `--max-orders-per-day`
+(1000) default to the exact same values as `order_manager.py`'s live
+CLI — a bare backtest with no risk-limit flags faithfully reproduces
+what a default live session would have done, not a separately-tuned
+set of backtest-only assumptions.
 
 - Replays the file through the **exact same** `SMAMirror`/`EMAMirror`/
   `StrategyScorecard`/`RiskPolicy` classes the live system and hardware
