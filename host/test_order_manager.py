@@ -59,14 +59,22 @@ LIM = dict(order_qty=2, max_shares=4, max_notional_e4=5_000_000,
 print("\n[G1] RiskPolicy refusals")
 pol = RiskPolicy(RiskLimits(**LIM))
 check("buy when flat allowed", pol.evaluate(SIDE_BUY, 0, 1_000_000)[0], True)
-check("no pyramiding", pol.evaluate(SIDE_BUY, 2, 1_000_000)[:2],
-      (False, "already long (no pyramiding)"))
+check("buy while already holding, still under max_shares, is now "
+     "ALLOWED (pyramiding is intentional: buys accumulate up to "
+     "max_shares, they're no longer refused just for holding a "
+     "position at all)", pol.evaluate(SIDE_BUY, 2, 1_000_000)[:2],
+     (True, "ok"))
+check("buy correctly blocked once it would exceed max_shares",
+      pol.evaluate(SIDE_BUY, 4, 1_000_000)[:2],
+      (False, f"would exceed max_shares ({LIM['max_shares']})"))
 check("sell when flat blocked", pol.evaluate(SIDE_SELL, 0, 1_000_000)[0], False)
-check("sell closes full position", pol.evaluate(SIDE_SELL, 2, 1_000_000)[2], 2)
+check("sell closes the FULL accumulated position, not just one lot",
+      pol.evaluate(SIDE_SELL, 4, 1_000_000)[2], 4)
 check("notional cap blocks",
       pol.evaluate(SIDE_BUY, 0, 3_000_000)[0], False)   # 2 x $300 > $500
 pol9 = RiskPolicy(RiskLimits(**{**LIM, "order_qty": 9}))
-check("position ceiling blocks", pol9.evaluate(SIDE_BUY, 0, 1)[0], False)
+check("max_shares still blocks a single oversized order from flat",
+      pol9.evaluate(SIDE_BUY, 0, 1)[0], False)
 
 pol.record_order()
 check("cooldown blocks immediately",
@@ -407,6 +415,91 @@ check("that's about $23.18, not $723.18",
       round(om11.costs.realized_pnl_usd, 2), 23.18)
 check("today's sell count is 1 (only today's own activity)",
       om11.costs.sells, 1)
+
+# ---- v3.1: buys accumulate up to max_shares (the actual reported
+# scenario: RKLB refused a 2nd share even with max_shares=10) ---------------
+print("[G12] real accumulation: 3 separate buys build a position, "
+     "ONE sell closes it all at the correct weighted-average cost basis")
+d12 = tempfile.mkdtemp()
+om12 = OrderManager(MockBroker(), ["RKLB"],
+                    RiskLimits(order_qty=1, max_shares=10,
+                              max_notional_e4=10**13, max_orders_per_day=99,
+                              cooldown_s=0.0, require_market_hours=False),
+                    audit_path=os.path.join(d12, "a.jsonl"),
+                    killfile=os.path.join(d12, "om.kill"))
+
+om12.on_signal(sig(SIDE_BUY, 100_000, "RKLB"))   # buy #1 @ $10.00
+check("1st buy allowed, position opens", om12.positions["RKLB"], 1)
+om12.on_signal(sig(SIDE_BUY, 120_000, "RKLB"))   # buy #2 @ $12.00
+check("2nd buy ALSO allowed (this is the exact reported bug: it used "
+     "to refuse this unconditionally)", om12.positions["RKLB"], 2)
+om12.on_signal(sig(SIDE_BUY, 140_000, "RKLB"))   # buy #3 @ $14.00
+check("3rd buy allowed, still under max_shares=10",
+      om12.positions["RKLB"], 3)
+check("nothing blocked so far", om12.blocked, 0)
+
+expected_avg = (100_000 + 120_000 + 140_000) // 3   # weighted average entry
+check("cost basis correctly weighted across all 3 accumulated buys",
+      om12.costs._entries["RKLB"], [3, expected_avg])
+
+# one sell must close the ENTIRE accumulated position, not just 1 share
+om12.on_signal(sig(SIDE_SELL, 150_000, "RKLB"))
+check("sell closes the full accumulated position", om12.positions["RKLB"], 0)
+check("realized P&L correctly uses the weighted-average cost basis "
+     "across ALL 3 buys, not just the most recent one",
+     om12.costs.realized_pnl_e4, (150_000 - expected_avg) * 3)
+check("exactly one trip recorded (one sell = one closing trip, "
+     "regardless of how many buys built the position)",
+     om12.costs.sells, 1)
+
+# the max_shares ceiling must still genuinely block once actually reached
+om13 = OrderManager(MockBroker(), ["RKLB"],
+                    RiskLimits(order_qty=1, max_shares=3,
+                              max_notional_e4=10**13, max_orders_per_day=99,
+                              cooldown_s=0.0, require_market_hours=False),
+                    audit_path=os.path.join(d12, "b.jsonl"),
+                    killfile=os.path.join(d12, "om2.kill"))
+for _ in range(3):
+    om13.on_signal(sig(SIDE_BUY, 100_000, "RKLB"))
+check("filled up to max_shares (3)", om13.positions["RKLB"], 3)
+om13.on_signal(sig(SIDE_BUY, 100_000, "RKLB"))     # 4th buy: must be refused
+check("a 4th buy is correctly refused once max_shares is truly reached",
+      om13.positions["RKLB"], 3)
+check("blocked with the right reason", om13.blocked, 1)
+
+# ---- v3.1: on_signal() reports what actually happened, for the GUI's
+# new signals-table outcome column -----------------------------------------
+print("[G13] on_signal returns a real outcome string, not just a "
+     "side effect — this is what feeds the GUI's new outcome column")
+d13 = tempfile.mkdtemp()
+om13b = OrderManager(MockBroker(), ["SPY"],
+                     RiskLimits(order_qty=1, max_shares=1,
+                               max_notional_e4=10**13, max_orders_per_day=99,
+                               cooldown_s=0.0, require_market_hours=False),
+                     audit_path=os.path.join(d13, "a.jsonl"),
+                     killfile=os.path.join(d13, "om.kill"))
+check("a filled buy returns FILLED",
+      om13b.on_signal(sig(SIDE_BUY, 1_000_000, "SPY")), "FILLED")
+check("a blocked buy (max_shares reached) reports why",
+      om13b.on_signal(sig(SIDE_BUY, 1_000_000, "SPY")).startswith("blocked:"),
+      True)
+check("a filled sell also returns FILLED",
+      om13b.on_signal(sig(SIDE_SELL, 1_100_000, "SPY")), "FILLED")
+check("a blocked sell (now flat) reports why",
+      om13b.on_signal(sig(SIDE_SELL, 1_100_000, "SPY")).startswith("blocked:"),
+      True)
+
+from compare import StrategyScorecard
+sc13 = StrategyScorecard("T", live=False)
+check("ungated scorecard: a normal fill reports FILLED (scored)",
+      sc13.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000,
+                      "symbol": "SPY", "strategy": "sma"}),
+      "FILLED (scored)")
+check("ungated scorecard: buy-while-open is reported as ignored, "
+     "not silently swallowed",
+     sc13.on_signal({"side": SIDE_BUY, "price_e4": 1_200_000,
+                     "symbol": "SPY", "strategy": "sma"}),
+     "ignored: already open")
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

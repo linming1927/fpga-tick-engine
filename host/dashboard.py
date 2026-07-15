@@ -65,7 +65,7 @@ class DashboardServer:
                       e.ema_fast, e.ema_slow, e.warmed_up))
             self._last_echo_t = time.time()
 
-    def on_signal(self, fr: dict):
+    def on_signal(self, fr: dict, outcome: str = ""):
         with self._lock:
             self._signals.appendleft({"t": time.strftime("%H:%M:%S"),
                                       "strategy": fr.get("strategy", "sma"),
@@ -73,7 +73,8 @@ class DashboardServer:
                                       "side": fr["side"],
                                       "price_e4": fr["price_e4"],
                                       "sma_fast": fr["sma_fast"],
-                                      "sma_slow": fr["sma_slow"]})
+                                      "sma_slow": fr["sma_slow"],
+                                      "outcome": outcome})
 
     def on_event(self, text: str, bad: bool = False):
         with self._lock:
@@ -320,7 +321,7 @@ td:first-child,th:first-child{text-align:left}
   <div>
     <div class="panel"><h2>SIGNALS</h2>
       <table><thead><tr><th>t</th><th>sym</th><th>strat</th><th>side</th>
-      <th>price</th><th>fast</th><th>slow</th></tr></thead>
+      <th>price</th><th>fast</th><th>slow</th><th>outcome</th></tr></thead>
       <tbody id="sigs"></tbody></table>
     </div>
     <div class="panel" style="margin-top:14px"><h2>EVENTS</h2>
@@ -453,7 +454,13 @@ async function poll(){
       '<td>'+x.strategy.toUpperCase()+'</td>'+
       '<td class="'+(x.side===1?'buy">BUY':'sell">SELL')+'</td>'+
       '<td>'+usd(x.price_e4)+'</td><td>'+usd(x.sma_fast)+'</td>'+
-      '<td>'+usd(x.sma_slow)+'</td></tr>').join('');
+      '<td>'+usd(x.sma_slow)+'</td>'+
+      '<td class="'+(x.outcome.startsWith('FILLED')?'buy':
+                     x.outcome.startsWith('rejected')?'sell':'')+
+      '" style="'+(x.outcome.startsWith('blocked')||
+                   x.outcome.startsWith('gated')?'color:var(--amber)':
+                   x.outcome.startsWith('ignored')?'color:var(--dim)':'')+
+      '">'+(x.outcome||'—')+'</td></tr>').join('');
     if(s.events.length)$('log').innerHTML=s.events.map(e=>
       '<div class="'+(e.bad?'bad':'')+'">'+e.t+'  '+e.text+'</div>').join('');
   }catch(e){$('led2').classList.remove('on');}

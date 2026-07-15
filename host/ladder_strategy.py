@@ -179,7 +179,7 @@ class LadderScorecard(StrategyScorecard):
                         "symbol": symbol, "strategy": "ladder"}
         return None
 
-    def on_signal(self, fr: dict):
+    def on_signal(self, fr: dict) -> str:
         self.signals += 1
         side, price = fr["side"], fr["price_e4"]
         sym = fr.get("symbol", "").strip()
@@ -187,7 +187,7 @@ class LadderScorecard(StrategyScorecard):
         if side == SIDE_BUY:
             lvl = self.levels_bought.get(sym, 0)
             if lvl >= self.max_levels:
-                return                         # ladder already full
+                return "ignored: ladder full"
             old_qty = self.positions.get(sym, 0)
             old_avg = self.opens.get(sym, price)
             new_qty = old_qty + self.qty_per_level
@@ -197,11 +197,12 @@ class LadderScorecard(StrategyScorecard):
                                // new_qty) if old_qty else price
             self.positions[sym] = new_qty
             self.levels_bought[sym] = lvl + 1
+            return f"FILLED (scored): level {lvl + 1}/{self.max_levels}"
 
         elif side == SIDE_SELL:
             qty = self.positions.get(sym, 0)
             if qty <= 0:
-                return                         # nothing to sell
+                return "ignored: flat"
             entry = self.opens.pop(sym, price)
             trip = (price - entry) * qty
             self.pnl_e4 += trip
@@ -212,3 +213,4 @@ class LadderScorecard(StrategyScorecard):
                 qty, qty * price / 10_000.0)["total"]
             self.positions[sym] = 0
             self.levels_bought[sym] = 0
+            return "FILLED (scored): ladder closed"

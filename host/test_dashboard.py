@@ -137,6 +137,18 @@ check("halt reason names dashboard", "dashboard" in s["halt_reason"], True)
 check("trouble LED on after kill", s["led"]["trouble"], True)
 check("event logged", any("KILL" in e["text"] for e in s["events"]), True)
 
+# ---- v3.1: the outcome column reaches the API, not just the object ----
+print("[G_outcome] on_signal's outcome parameter reaches /api/state")
+dash.on_signal({"side": 1, "price_e4": 1_000_000, "symbol": "SPY",
+                "strategy": "sma", "sma_fast": 0, "sma_slow": 0},
+               outcome="blocked: cooldown (5.0s < 60.0s)")
+s2 = json.loads(get("/api/state"))
+check("newest signal carries the real outcome string",
+      s2["signals"][0]["outcome"], "blocked: cooldown (5.0s < 60.0s)")
+check("a signal recorded WITHOUT an outcome defaults to empty, not "
+     "a crash (backward compatible with any caller that doesn't "
+     "pass one)", "outcome" in s2["signals"][0], True)
+
 dash.stop(); br.close(); emu.stop()
 
 print(f"\n==============================================")

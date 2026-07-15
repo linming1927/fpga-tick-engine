@@ -336,8 +336,6 @@ class RiskPolicy:
             return False, f"cooldown ({gap:.1f}s < {lim.cooldown_s}s)", 0
 
         if side == SIDE_BUY:
-            if position_qty > 0:
-                return False, "already long (no pyramiding)", 0
             qty = lim.order_qty
             if position_qty + qty > lim.max_shares:
                 return False, f"would exceed max_shares ({lim.max_shares})", 0
@@ -462,8 +460,12 @@ class OrderManager:
         return self.positions.get(self.symbol, 0)
 
     # ---- the signal path ---------------------------------------------------------
-    def on_signal(self, fr: dict):
-        """Callback for VERIFIED FPGA signals (bridge SignalVerifier)."""
+    def on_signal(self, fr: dict) -> str:
+        """Callback for VERIFIED FPGA signals (bridge SignalVerifier).
+        Returns a short status string describing what happened to this
+        signal — "FILLED", "blocked: <reason>", or "rejected: <error>" —
+        so callers (the dashboard's signals table, in particular) can
+        show WHY a signal didn't trade instead of just that it fired."""
         side = fr["side"]
         price_e4 = fr["price_e4"]
         sym = fr.get("symbol", self.symbol).strip() or self.symbol
@@ -473,7 +475,7 @@ class OrderManager:
             self.blocked += 1
             self._audit("blocked", reason=f"halted: {self.halt_reason}",
                         symbol=sym, side=side, price_e4=price_e4)
-            return
+            return f"blocked: halted: {self.halt_reason}"
 
         allowed, reason, qty = self.policy.evaluate(side,
                                                     self.positions[sym],
@@ -485,7 +487,7 @@ class OrderManager:
                         position_qty=self.positions[sym])
             print(f"[om] blocked {sym} "
                   f"{('BUY' if side == SIDE_BUY else 'SELL')}: {reason}")
-            return
+            return f"blocked: {reason}"
 
         verb = "buy" if side == SIDE_BUY else "sell"
         self._audit("order_submit", symbol=sym, side=verb, qty=qty,
@@ -501,7 +503,7 @@ class OrderManager:
             if self.consecutive_rejects >= self.MAX_CONSECUTIVE_REJECTS:
                 self.halt(f"{self.consecutive_rejects} consecutive broker "
                           "rejections")
-            return
+            return f"rejected: {e}"
 
         self.consecutive_rejects = 0
         self.orders += 1
@@ -522,6 +524,7 @@ class OrderManager:
         if lim and self.costs.net_pnl_usd <= -lim:
             self.halt(f"daily loss limit breached: net "
                       f"${self.costs.net_pnl_usd:+,.2f} <= -${lim:,.2f}")
+        return "FILLED"
 
     # ---- teardown -----------------------------------------------------------------
     def summary(self, household_income: float | None = None,
@@ -746,12 +749,12 @@ def main():
         strat = fr["strategy"]
         if strat == args.strategy:
             cards[strat].signals += 1     # real routing/gating/fills below
-            om.on_signal(fr)
+            outcome = om.on_signal(fr)
             sync_live_card(cards, args.strategy, om)  # keep dashboard fresh
         else:
-            cards[strat].on_signal(fr)    # hypothetical, gated identically
+            outcome = cards[strat].on_signal(fr)  # hypothetical, gated
         if dash:
-            dash.on_signal(fr)
+            dash.on_signal(fr, outcome)
 
     def on_divergence(info):
         if dash:

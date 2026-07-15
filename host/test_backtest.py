@@ -126,9 +126,9 @@ t0 = datetime(2020, 1, 2, 14, 30, tzinfo=timezone.utc)
 #   +14s  SELL  (6s after the BUY: cooldown(60s) blocks it -- position
 #                stays open in the scorecard, though the MODEL's own
 #                internal state still flips regardless of the policy)
-#   +102s BUY   (94s after the BUY: cooldown has expired, but the
-#                position is STILL open from the blocked sell above,
-#                so this is refused for pyramiding instead)
+#   +102s BUY   (94s after the BUY: cooldown has expired, but max_shares=1
+#                is already fully used from the still-open position, so
+#                this is refused for exceeding max_shares instead)
 #   +151s SELL  (143s after the original BUY: cooldown expired AND the
 #                position is genuinely open -> this one succeeds,
 #                closing the trip)
@@ -151,10 +151,10 @@ sma4 = cards4["sma"]
 check("all 4 model crossovers counted as signals", sma4.signals, 4)
 check("cooldown blocked the too-soon SELL (6s later, 60s cooldown)",
       any("cooldown" in r for r in sma4.block_reasons), True)
-check("pyramiding blocked the BUY while still open (94s later, "
+check("max_shares blocked the BUY while still open (94s later, "
      "cooldown had expired by then -- proves the clock is historical, "
      "not wall-clock: this whole test runs in milliseconds of real time)",
-      any("already long" in r for r in sma4.block_reasons), True)
+      any("max_shares" in r for r in sma4.block_reasons), True)
 check("the far-later SELL (143s after the open) succeeded, closing 1 trip",
       sma4.trips, 1)
 check("exactly 2 of the 4 signals were blocked", sma4.blocked, 2)

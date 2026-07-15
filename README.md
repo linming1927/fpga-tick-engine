@@ -38,6 +38,23 @@ python3 host/order_manager.py --port /dev/pts/N --source sim --broker mock \
     --cooldown 0 --n 300 --rate 20 --dashboard 8000
 ```
 
+**Position sizing:** buys accumulate up to `--max-shares` (default 10)
+per symbol — a signal to buy while already holding is allowed as long
+as `current position + order_qty <= max_shares`, not refused outright.
+A single SELL always closes the *entire* accumulated position at once,
+correctly priced against the weighted-average cost basis across
+however many buys built it up. Cooldown and the daily order cap still
+gate every individual order regardless of position size, so this isn't
+unthrottled — it's deliberately closer to a scaling-in strategy than a
+strict one-lot-at-a-time system.
+
+**The GUI's signals table shows what actually happened to each
+signal** — a new outcome column reads `FILLED`, `blocked: <reason>`
+(cooldown, daily cap, position ceiling, market closed), `rejected:
+<broker error>`, or `ignored: <reason>` for the untraded/scored
+strategy's own housekeeping (already open, ladder full, nothing to
+sell) — not just that a crossover fired.
+
 **Acceptance test after any bitstream rebuild:**
 ```bash
 python3 host/bridge.py --port /dev/ttyUSB1 --source selftest --fast 8 --slow 32

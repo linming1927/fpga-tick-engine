@@ -67,7 +67,12 @@ class StrategyScorecard:
     def open_e4(self) -> int | None:
         return next(iter(self.opens.values()), None)
 
-    def on_signal(self, fr: dict):
+    def on_signal(self, fr: dict) -> str:
+        """Returns a short status string, same spirit as
+        OrderManager.on_signal — "FILLED (scored)", "gated: <reason>",
+        or "ignored: <reason>" for the ungated single-lot mode's silent
+        skips — so the GUI can show why a scored (untraded) signal
+        didn't count as a trip, not just that it arrived."""
         self.signals += 1
         side, price = fr["side"], fr["price_e4"]
         sym = fr.get("symbol", "").strip()
@@ -79,13 +84,13 @@ class StrategyScorecard:
             if not allowed:
                 self.blocked += 1
                 self.block_reasons[reason.split(" (")[0]] += 1
-                return
+                return f"gated: {reason}"
             self.policy.record_order()
         else:
             if side == SIDE_BUY and pos_qty > 0:
-                return                       # ignore buy-while-open
+                return "ignored: already open"
             if side == SIDE_SELL and pos_qty <= 0:
-                return                       # nothing to sell
+                return "ignored: flat"
             qty = self.qty if side == SIDE_BUY else pos_qty
 
         if side == SIDE_BUY:
@@ -101,6 +106,7 @@ class StrategyScorecard:
             self.fees_usd += self.fees.sell_fees(
                 qty, qty * price / 10_000.0)["total"]
             self.positions[sym] = 0
+        return "FILLED (scored)"
 
     @property
     def net_usd(self) -> float:

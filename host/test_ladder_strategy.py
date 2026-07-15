@@ -167,6 +167,28 @@ r = comparison_report({"ladder": lc2})
 check("renders in the shared report", "Ladder" in r, True)
 check("trip count shown", "2" in r.split("\n")[-2] or True, True)  # smoke
 
+# ---- v3.1: on_signal returns a status string for the GUI's outcome
+# column, same convention as the base StrategyScorecard ---------------
+print("[G7] ladder on_signal reports outcomes for the GUI")
+lg = LadderScorecard("L", step_pct=0.03, max_levels=2, live=False)
+lg.set_baseline("SPY", to_e4(100.00))
+ev = lg.on_tick("SPY", to_e4(97.00))
+check("first level buy reports FILLED with level info",
+      lg.on_signal(ev).startswith("FILLED (scored): level 1/2"), True)
+ev2 = lg.on_tick("SPY", to_e4(94.00))
+lg.on_signal(ev2)                              # level 2 -- now full
+check("a 3rd buy attempt reports the ladder is full, not silently "
+     "nothing", lg.on_signal({"side": 1, "price_e4": to_e4(50.00),
+                              "symbol": "SPY", "strategy": "ladder"}),
+      "ignored: ladder full")
+sell_ev = lg.on_tick("SPY", to_e4(103.00))
+check("closing sell reports FILLED", lg.on_signal(sell_ev).startswith(
+      "FILLED (scored): ladder closed"), True)
+check("a sell with nothing open reports ignored, not silently nothing",
+      lg.on_signal({"side": 2, "price_e4": to_e4(100.00),
+                   "symbol": "SPY", "strategy": "ladder"}),
+      "ignored: flat")
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")
