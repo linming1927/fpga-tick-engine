@@ -533,8 +533,9 @@ def sync_live_card(cards: dict, strategy: str, om: "OrderManager"):
     the whole time regardless (a real reported bug)."""
     live = cards[strategy]
     live.trips = om.costs.sells
-    live.wins = None              # CostTracker has no per-trip win/loss;
-                                  # report honestly rather than guess
+    live.wins = om.costs.wins     # CostTracker now tracks per-trip win/loss
+                                  # (added specifically so this stops
+                                  # showing as a dash in the dashboard)
     live.pnl_e4 = om.costs.realized_pnl_e4
     live.fees_usd = om.costs.total_fees
     live.blocked = om.blocked

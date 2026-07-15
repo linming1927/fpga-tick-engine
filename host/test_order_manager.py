@@ -193,7 +193,7 @@ emu.stop()
 print("[G6] sync_live_card reflects reality immediately after EACH "
      "fill, not only when the session ends")
 from order_manager import sync_live_card
-from compare import StrategyScorecard
+from compare import StrategyScorecard, comparison_report
 
 d6 = tempfile.mkdtemp()
 om6 = OrderManager(MockBroker(), ["SPY", "QQQ"],
@@ -336,6 +336,26 @@ check("both valid fills survive around a corrupted line",
       om9.policy.orders_today, 2)
 check("startup did not crash on the corrupted line", om9.costs.net_pnl_usd > 0,
       True)
+
+# ---- v2.8: sync_live_card now reports a REAL win count, not None -----
+print("[G10] the dashboard's SMA win column is a real number, not a dash")
+d10 = tempfile.mkdtemp()
+om10 = OrderManager(MockBroker(), ["SPY"],
+                    RiskLimits(order_qty=1, max_shares=5,
+                              max_notional_e4=10**13, max_orders_per_day=99,
+                              cooldown_s=0.0, require_market_hours=False),
+                    audit_path=os.path.join(d10, "a.jsonl"),
+                    killfile=os.path.join(d10, "om.kill"))
+cards10 = {"sma": StrategyScorecard("SMA", live=True)}
+sync_live_card(cards10, "sma", om10)
+check("before any trips: wins is 0, not None", cards10["sma"].wins, 0)
+om10.on_signal(sig(SIDE_BUY, 1_000_000, "SPY"))
+om10.on_signal(sig(SIDE_SELL, 1_100_000, "SPY"))    # a real win
+sync_live_card(cards10, "sma", om10)
+check("after a real win: wins is 1, a real number", cards10["sma"].wins, 1)
+r10 = comparison_report(cards10)
+check("report shows a percentage, not a dash, for the live row",
+      "100%" in r10, True)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

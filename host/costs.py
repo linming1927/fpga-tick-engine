@@ -146,6 +146,11 @@ class CostTracker:
     _entries: dict = field(default_factory=dict)  # sym -> [qty, avg_e4]
     buys: int = 0
     sells: int = 0
+    wins: int = 0                       # trips closed at a net-positive P&L
+                                        # (gross, before fees — matches how
+                                        # StrategyScorecard's win rate is
+                                        # defined, for an apples-to-apples
+                                        # comparison against the gated row)
 
     def on_fill(self, side: str, qty: int, fill_price_e4: int,
                 symbol: str = "") -> dict | None:
@@ -160,7 +165,10 @@ class CostTracker:
             self.buys += 1
             return None
         # sell: realize P&L against this symbol's average entry
-        self.realized_pnl_e4 += (fill_price_e4 - e[1]) * qty
+        trip_pnl_e4 = (fill_price_e4 - e[1]) * qty
+        self.realized_pnl_e4 += trip_pnl_e4
+        if trip_pnl_e4 > 0:
+            self.wins += 1
         e[0] = max(0, e[0] - qty)
         if e[0] == 0:
             e[1] = 0
@@ -168,6 +176,10 @@ class CostTracker:
         self.total_fees += f["total"]
         self.sells += 1
         return f
+
+    @property
+    def win_rate_pct(self) -> float | None:
+        return 100 * self.wins / self.sells if self.sells else None
 
     @property
     def realized_pnl_usd(self) -> float:
@@ -181,7 +193,9 @@ class CostTracker:
                status: str = "mfj", state_rate_pct: float = 4.40,
                income_is_gross: bool = False) -> str:
         lines = ["---- costs & tax estimate " + "-" * 34,
-                 f"  fills                 {self.buys} buys / {self.sells} sells",
+                 f"  fills                 {self.buys} buys / {self.sells} sells"
+                 + (f"  ({self.wins}/{self.sells} won, "
+                    f"{self.win_rate_pct:.0f}%)" if self.sells else ""),
                  f"  realized P&L (gross)  ${self.realized_pnl_usd:+,.2f}",
                  f"  regulatory fees       ${self.total_fees:,.2f}"
                  f"   (SEC ${self.fees.sec_per_million}/M + TAF "

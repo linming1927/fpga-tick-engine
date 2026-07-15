@@ -112,6 +112,28 @@ check("report includes federal line", "federal" in r, True)
 check("report includes disclaimer", "not tax advice" in r, True)
 
 # ---------------------------------------------------------------------------
+# ---- v2.8: per-trip win/loss tracking (this used to always show as a
+# dash in the dashboard, since CostTracker never remembered it) ------------
+print("[G] per-trip win tracking")
+ct5 = CostTracker()
+ct5.on_fill("buy", 1, 1_000_000, "SPY")
+ct5.on_fill("sell", 1, 1_100_000, "SPY")     # win: +$10
+check("first win counted", ct5.wins, 1)
+check("win rate 100% after one win", ct5.win_rate_pct, 100.0)
+ct5.on_fill("buy", 1, 1_000_000, "SPY")
+ct5.on_fill("sell", 1, 900_000, "SPY")       # loss: -$10
+check("wins NOT incremented on a losing trip", ct5.wins, 1)
+check("win rate now 50% (1 win, 1 loss)", ct5.win_rate_pct, 50.0)
+check("sells count matches trip count", ct5.sells, 2)
+ct6 = CostTracker()
+check("win_rate_pct is None before any trip closes (nothing to divide by)",
+      ct6.win_rate_pct, None)
+# exact tie (sell at cost basis) must NOT count as a win
+ct7 = CostTracker()
+ct7.on_fill("buy", 1, 1_000_000, "SPY")
+ct7.on_fill("sell", 1, 1_000_000, "SPY")     # exactly flat
+check("a flat (zero P&L) trip does not count as a win", ct7.wins, 0)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")
