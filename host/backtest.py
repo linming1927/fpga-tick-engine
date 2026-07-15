@@ -53,8 +53,14 @@ BacktestClock = HistoricalClock   # backward-compatible alias — this class
 
 
 def iter_trades(path: str):
-    """Stream one (datetime, price_e4) pair per line — never loads the
-    whole file, since these can be gigabytes for a multi-year pull."""
+    """Stream one (datetime, price_e4, qty) triple per line — never
+    loads the whole file, since these can be gigabytes for a multi-
+    year pull. qty is Alpaca's own trade-size field ("s", the same
+    field name bridge.py's live path already reads) — real historical
+    downloads always have it since fetch_historical_trades.py writes
+    Alpaca's trade record verbatim; defaults to 1 for synthetic test
+    data that doesn't bother setting it, so every existing caller that
+    only cares about price keeps working unmodified."""
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -62,7 +68,8 @@ def iter_trades(path: str):
                 continue
             rec = json.loads(line)
             t = datetime.fromisoformat(rec["t"].replace("Z", "+00:00"))
-            yield t, to_e4(float(rec["p"]))
+            qty = int(rec.get("s", 1))
+            yield t, to_e4(float(rec["p"])), qty
 
 
 def iter_trades_multi(paths: list[str]):
@@ -82,7 +89,7 @@ def iter_trades_multi(paths: list[str]):
     prev_last_t = None
     for path in paths:
         first_in_file = True
-        for t, price_e4 in iter_trades(path):
+        for t, price_e4, qty in iter_trades(path):
             if first_in_file and prev_last_t is not None and t < prev_last_t:
                 raise ValueError(
                     f"{path} starts at {t}, which is BEFORE the previous "
@@ -91,14 +98,15 @@ def iter_trades_multi(paths: list[str]):
                     f"ranges, or the backtest's historical clock breaks")
             first_in_file = False
             prev_last_t = t
-            yield t, price_e4
+            yield t, price_e4, qty
 
 
 def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
                  ema_kf: int, ema_ks: int, limits: RiskLimits,
                  traded_strategy: str, progress_every: int = 500_000,
                  profit_gate: bool = False, htf_ltf: bool = False,
-                 htf_interval_s: int = 3600, ltf_interval_s: int = 300
+                 htf_interval_s: int = 3600, ltf_interval_s: int = 300,
+                 vwap_bounce: bool = False, vwap_band_k: float = 1.0
                  ) -> dict[str, StrategyScorecard]:
     if isinstance(trades_paths, str):
         trades_paths = [trades_paths]
@@ -138,9 +146,18 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
             htf_interval_s=htf_interval_s, ltf_interval_s=ltf_interval_s)
         cards["htf_ltf"] = htf_ltf_card
 
+    vwap_card = None
+    if vwap_bounce:
+        from vwap_bounce_strategy import VWAPBounceScorecard
+        vwap_card = VWAPBounceScorecard(
+            "VWAP bounce", symbol=symbol, live=False,
+            policy=RiskPolicy(limits, now_fn=HistoricalClock()),
+            band_k=vwap_band_k)
+        cards["vwap_bounce"] = vwap_card
+
     n = 0
     first_t = last_t = None
-    for t, price_e4 in iter_trades_multi(trades_paths):
+    for t, price_e4, qty in iter_trades_multi(trades_paths):
         n += 1
         if first_t is None:
             first_t = t
@@ -167,6 +184,9 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
 
         if htf_ltf_card is not None:
             htf_ltf_card.on_tick(t, price_e4)
+
+        if vwap_card is not None:
+            vwap_card.on_tick(t, price_e4, qty)
 
     print(f"[backtest] {n:,} trades replayed for {symbol}", file=sys.stderr)
     cards["sma"].live = (traded_strategy == "sma")
@@ -233,6 +253,18 @@ def main():
     ap.add_argument("--ltf-interval", type=int, default=300,
                     help="lower-timeframe bar size in seconds "
                          "(default 300 = 5 minutes)")
+    ap.add_argument("--vwap-bounce", action="store_true",
+                    help="also backtest a session-VWAP mean-reversion "
+                         "strategy: buy when price dips below a "
+                         "volume-weighted-stdev band under VWAP and "
+                         "bounces back above it, sell when price reverts "
+                         "to VWAP (positions are forced flat at each "
+                         "day's session boundary — see "
+                         "vwap_bounce_strategy.py) — always score-only, "
+                         "regardless of --strategy")
+    ap.add_argument("--vwap-band-k", type=float, default=1.0,
+                    help="band width in session standard deviations "
+                         "(default 1.0)")
     ap.add_argument("--results-dir", default=RESULTS_DIR_DEFAULT,
                     help="where saved runs go — browse them with "
                          "list_backtest_results.py")
@@ -256,7 +288,9 @@ def main():
                               args.strategy, profit_gate=args.profit_gate,
                               htf_ltf=args.htf_ltf,
                               htf_interval_s=args.htf_interval,
-                              ltf_interval_s=args.ltf_interval)
+                              ltf_interval_s=args.ltf_interval,
+                              vwap_bounce=args.vwap_bounce,
+                              vwap_band_k=args.vwap_band_k)
     print()
     print(comparison_report(cards))
 
@@ -273,6 +307,8 @@ def main():
             "htf_ltf": args.htf_ltf,
             "htf_interval_s": args.htf_interval,
             "ltf_interval_s": args.ltf_interval,
+            "vwap_bounce": args.vwap_bounce,
+            "vwap_band_k": args.vwap_band_k,
         }
         run_dir = save_backtest_result(cards, args.symbol, meta, params,
                                        results_dir=args.results_dir)

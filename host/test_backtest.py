@@ -12,6 +12,7 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 
+import json as _json
 import subprocess
 from backtest import run_backtest, BacktestClock, iter_trades, iter_trades_multi
 from compare import comparison_report
@@ -312,6 +313,50 @@ r = subprocess.run(
 check("CLI run succeeded", r.returncode, 0)
 check("CLI output includes the HTF/LTF row", "HTF/LTF trend" in r.stdout,
       True)
+
+# ---- v3.8: --vwap-bounce wired into backtest.py ---------------------------
+print("[G11] backtest.py can also score the VWAP bounce strategy")
+p11 = os.path.join(tmp, "t11.jsonl")
+t11 = datetime(2024, 1, 2, 14, 30, 0, tzinfo=timezone.utc)
+rows11 = []
+price = 100.0
+for i in range(200):
+    price += (0.05 if i % 7 else -0.4)   # mostly drifting up, periodic dips
+    rows11.append((t11 + timedelta(seconds=i * 5), price))
+with open(p11, "w") as f:
+    for t_, p_ in rows11:
+        f.write(_json.dumps({"t": t_.isoformat().replace("+00:00", "Z"),
+                            "p": round(p_, 2), "s": 100}) + "\n")
+
+cards11, meta11 = run_backtest(p11, "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                               ema_ks=3, limits=limits,
+                               traded_strategy="sma", vwap_bounce=True)
+check("vwap_bounce card is present when requested",
+      "vwap_bounce" in cards11, True)
+check("it is always score-only (live=False)",
+      cards11["vwap_bounce"].live, False)
+
+cards12, meta12 = run_backtest(p11, "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                               ema_ks=3, limits=limits,
+                               traded_strategy="sma")
+check("vwap_bounce card is absent when NOT requested (default off)",
+      "vwap_bounce" in cards12, False)
+
+r11 = comparison_report(cards11)
+check("comparison report includes the VWAP bounce row",
+      "VWAP bounce" in r11, True)
+
+print("[G12] the real backtest.py --vwap-bounce CLI works end to end")
+r = subprocess.run(
+    [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "backtest.py"),
+     "--trades", p11, "--symbol", "SPY", "--strategy", "sma",
+     "--fast", "4", "--slow", "8", "--ema-kf", "1", "--ema-ks", "3",
+     "--vwap-bounce", "--vwap-band-k", "1.0", "--no-save"],
+    capture_output=True, text=True, timeout=30)
+check("CLI run succeeded", r.returncode, 0)
+check("CLI output includes the VWAP bounce row",
+      "VWAP bounce" in r.stdout, True)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

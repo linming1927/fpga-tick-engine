@@ -187,6 +187,19 @@ set of backtest-only assumptions.
   that needs OHLC bars rather than raw ticks, since "the daily chart"
   and "the 15-minute chart" aren't concepts the tick-level engines have
   any notion of.
+- **`--vwap-bounce`** (`--vwap-band-k` sets band width, default 1.0
+  session standard deviations) — a session-VWAP mean-reversion
+  strategy: buy when price dips below a volume-weighted-stdev band
+  under VWAP and bounces back above it, sell when price reverts back
+  up to VWAP itself. Positions are forced flat at each day's session
+  boundary (VWAP only means anything within the session it's computed
+  over) — this also happens to bound the worst case at one trading
+  day, the same disposition-effect risk flagged for `--profit-gate`.
+  Unlike HTF/LTF, this one genuinely reacts to every tick the way
+  SMA/EMA do, and is a real fetch_historical_trades.py field this
+  project hadn't used until now — trade volume (Alpaca's `"s"` field),
+  already sitting in every downloaded historical file, unused until
+  this strategy needed it.
 - **Combine incrementally-fetched ranges** without re-downloading, by
   passing multiple files in chronological order:
   ```bash
