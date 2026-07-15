@@ -40,6 +40,7 @@ import json
 import sys
 from datetime import datetime, timezone
 
+from backtest_results import save_backtest_result, RESULTS_DIR_DEFAULT
 from compare import StrategyScorecard, comparison_report
 from order_manager import RiskPolicy, RiskLimits
 from tick_protocol import SMAMirror, EMAMirror, to_e4
@@ -128,8 +129,12 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
     }
 
     n = 0
+    first_t = last_t = None
     for t, price_e4 in iter_trades_multi(trades_paths):
         n += 1
+        if first_t is None:
+            first_t = t
+        last_t = t
         if n % progress_every == 0:
             print(f"  ...{n:,} trades replayed ({t.date()})", file=sys.stderr)
 
@@ -151,7 +156,13 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
     # the "live" flag here only controls report LABELING (both rows were
     # actually gated identically) — a backtest has no real broker fills
     # to prefer over the gated replay, unlike a live session's true row
-    return cards
+
+    # date range is derived from the ACTUAL DATA replayed, not trusted
+    # from a filename — correct regardless of naming convention, and
+    # what save_backtest_result() uses to name/label a saved run
+    meta = {"n_trades": n, "first_t": first_t, "last_t": last_t,
+           "trades_paths": trades_paths}
+    return cards, meta
 
 
 def main():
@@ -178,6 +189,12 @@ def main():
     ap.add_argument("--max-notional", type=float, default=1_000_000.0)
     ap.add_argument("--max-orders-per-day", type=int, default=10)
     ap.add_argument("--cooldown", type=float, default=60.0)
+    ap.add_argument("--results-dir", default=RESULTS_DIR_DEFAULT,
+                    help="where saved runs go — browse them with "
+                         "list_backtest_results.py")
+    ap.add_argument("--no-save", action="store_true",
+                    help="skip saving this run (default: always saved, "
+                         "so you can go back and review it later)")
     args = ap.parse_args()
 
     limits = RiskLimits(
@@ -190,10 +207,27 @@ def main():
         # this gate would just be redundant work against real data
 
     trades_paths = [p.strip() for p in args.trades.split(",") if p.strip()]
-    cards = run_backtest(trades_paths, args.symbol, args.fast, args.slow,
-                        args.ema_kf, args.ema_ks, limits, args.strategy)
+    cards, meta = run_backtest(trades_paths, args.symbol, args.fast,
+                              args.slow, args.ema_kf, args.ema_ks, limits,
+                              args.strategy)
     print()
     print(comparison_report(cards))
+
+    if not args.no_save:
+        params = {
+            "traded_strategy": args.strategy,
+            "fast": args.fast, "slow": args.slow,
+            "ema_kf": args.ema_kf, "ema_ks": args.ema_ks,
+            "order_qty": args.order_qty, "max_shares": args.max_shares,
+            "max_notional": args.max_notional,
+            "max_orders_per_day": args.max_orders_per_day,
+            "cooldown": args.cooldown,
+        }
+        run_dir = save_backtest_result(cards, args.symbol, meta, params,
+                                       results_dir=args.results_dir)
+        print(f"\n[backtest] saved to {run_dir}/ "
+             f"(summary.json + report.txt) — browse past runs with "
+             f"list_backtest_results.py")
 
 
 if __name__ == "__main__":

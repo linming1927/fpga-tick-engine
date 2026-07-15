@@ -61,8 +61,12 @@ write_jsonl(p2, rows)
 limits = RiskLimits(order_qty=1, max_shares=1, max_notional_e4=to_e4(10**7),
                    max_orders_per_day=99, cooldown_s=0.0,
                    require_market_hours=False)
-cards = run_backtest(p2, "SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3,
-                    limits=limits, traded_strategy="sma")
+cards, meta2 = run_backtest(p2, "SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3,
+                          limits=limits, traded_strategy="sma")
+check("meta reports the real trade count", meta2["n_trades"], 10)
+check("meta's date range comes from the actual data, not a filename",
+      (meta2["first_t"].date(), meta2["last_t"].date()),
+      (day1.date(), day1.date()))
 check("SMA fired exactly one golden-cross signal", cards["sma"].signals, 1)
 check("SMA position opened at the spike price",
       cards["sma"].opens.get("SPY"), to_e4(3000))
@@ -100,8 +104,8 @@ write_jsonl(p3, rows)
 tight = RiskLimits(order_qty=1, max_shares=1, max_notional_e4=to_e4(10**7),
                    max_orders_per_day=1, cooldown_s=0.0,
                    require_market_hours=False)
-cards3 = run_backtest(p3, "SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3,
-                     limits=tight, traded_strategy="sma")
+cards3, meta3 = run_backtest(p3, "SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3,
+                            limits=tight, traded_strategy="sma")
 sma = cards3["sma"]
 check("day-1's 2nd order (the SELL) blocked by the 1/day cap",
       sma.blocked >= 1, True)
@@ -141,8 +145,8 @@ cooldown_limits = RiskLimits(order_qty=1, max_shares=1,
                              max_notional_e4=to_e4(10**7),
                              max_orders_per_day=99, cooldown_s=60.0,
                              require_market_hours=False)
-cards4 = run_backtest(p4, "SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3,
-                     limits=cooldown_limits, traded_strategy="sma")
+cards4, meta4 = run_backtest(p4, "SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3,
+                            limits=cooldown_limits, traded_strategy="sma")
 sma4 = cards4["sma"]
 check("all 4 model crossovers counted as signals", sma4.signals, 4)
 check("cooldown blocked the too-soon SELL (6s later, 60s cooldown)",
@@ -173,8 +177,12 @@ check("chronological order preserved across the file boundary",
       all(rows_multi[i][0] <= rows_multi[i+1][0]
           for i in range(len(rows_multi)-1)), True)
 
-cards5 = run_backtest([pA, pB], "SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3,
-                     limits=limits, traded_strategy="sma")
+cards5, meta5 = run_backtest([pA, pB], "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                            ema_ks=3, limits=limits, traded_strategy="sma")
+check("meta's date range spans BOTH files (first file's start, "
+     "second file's end)",
+     (meta5["first_t"].date(), meta5["last_t"].date()),
+     (dayA.date(), dayB.date()))
 check("crossover detected correctly ACROSS the file boundary "
      "(warmup in file A, spike in file B)", cards5["sma"].signals, 1)
 
