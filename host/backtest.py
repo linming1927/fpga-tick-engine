@@ -41,7 +41,8 @@ import sys
 from datetime import datetime, timezone
 
 from backtest_results import save_backtest_result, RESULTS_DIR_DEFAULT
-from compare import StrategyScorecard, comparison_report
+from compare import (StrategyScorecard, comparison_report,
+                     monthly_breakdown_report)
 from order_manager import RiskPolicy, RiskLimits, HistoricalClock
 from tick_protocol import SMAMirror, EMAMirror, to_e4
 BacktestClock = HistoricalClock   # backward-compatible alias — this class
@@ -173,20 +174,22 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
                 clocks["sma"].set(t)
                 cards["sma"].on_signal({"side": sig.side,
                                        "price_e4": sig.price_e4,
-                                       "symbol": symbol, "strategy": "sma"})
+                                       "symbol": symbol, "strategy": "sma"},
+                                      t=t)
                 if profit_gated is not None:
                     clocks["sma_pg"].set(t)
                     profit_gated.on_signal({"side": sig.side,
                                            "price_e4": sig.price_e4,
                                            "symbol": symbol,
-                                           "strategy": "sma"})
+                                           "strategy": "sma"}, t=t)
 
             sig = ema_model.ingest(price_e4)
             if sig:
                 clocks["ema"].set(t)
                 cards["ema"].on_signal({"side": sig.side,
                                        "price_e4": sig.price_e4,
-                                       "symbol": symbol, "strategy": "ema"})
+                                       "symbol": symbol, "strategy": "ema"},
+                                      t=t)
 
             if htf_ltf_card is not None:
                 htf_ltf_card.on_tick(t, price_e4)
@@ -291,6 +294,14 @@ def main():
     ap.add_argument("--no-save", action="store_true",
                     help="skip saving this run (default: always saved, "
                          "so you can go back and review it later)")
+    ap.add_argument("--monthly", action="store_true",
+                    help="also print (and save) a month-by-month P&L "
+                         "breakdown, bucketed by each trip's CLOSE date "
+                         "from this ONE continuous run — NOT the same "
+                         "as independently re-running the backtest per "
+                         "month, which would silently disagree due to "
+                         "state (open positions, warmup, cooldown) that "
+                         "wouldn't carry across artificial boundaries")
     args = ap.parse_args()
 
     limits = RiskLimits(
@@ -318,6 +329,9 @@ def main():
              f"PARTIAL RESULTS, NOT A COMPLETE BACKTEST ***")
         print("=" * 60)
     print(comparison_report(cards))
+    if args.monthly:
+        print()
+        print(monthly_breakdown_report(cards))
 
     if not args.no_save:
         params = {
@@ -336,7 +350,8 @@ def main():
             "vwap_band_k": args.vwap_band_k,
         }
         run_dir = save_backtest_result(cards, args.symbol, meta, params,
-                                       results_dir=args.results_dir)
+                                       results_dir=args.results_dir,
+                                       include_monthly=args.monthly)
         print(f"\n[backtest] saved to {run_dir}/ "
              f"(summary.json + report.txt) — browse past runs with "
              f"list_backtest_results.py")

@@ -225,7 +225,7 @@ class HTFLTFScorecard(StrategyScorecard):
             if self.bias == "bullish" and fresh_cross_up:
                 outcome = self.on_signal({
                     "side": SIDE_BUY, "price_e4": ltf_bar.close_e4,
-                    "symbol": self.symbol, "strategy": "htf_ltf"})
+                    "symbol": self.symbol, "strategy": "htf_ltf"}, t=t)
         else:
             # trail: exit the moment an LTF bar CLOSES back below the
             # LTF fast EMA — independent of whether the HTF bias has
@@ -235,5 +235,5 @@ class HTFLTFScorecard(StrategyScorecard):
             if ltf_bar.close_e4 < fast_v:
                 outcome = self.on_signal({
                     "side": SIDE_SELL, "price_e4": ltf_bar.close_e4,
-                    "symbol": self.symbol, "strategy": "htf_ltf"})
+                    "symbol": self.symbol, "strategy": "htf_ltf"}, t=t)
         return outcome

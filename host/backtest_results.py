@@ -26,7 +26,8 @@ import json
 import os
 from datetime import datetime, timezone
 
-from compare import StrategyScorecard, comparison_report
+from compare import (StrategyScorecard, comparison_report,
+                     monthly_breakdown_report)
 
 RESULTS_DIR_DEFAULT = "./backtest_results"
 
@@ -49,9 +50,36 @@ def _card_to_dict(c: StrategyScorecard) -> dict:
     }
 
 
+def _monthly_dict(cards: dict) -> dict:
+    """JSON-serializable version of the same grouping
+    monthly_breakdown_report() prints — one {month: {...}} dict per
+    strategy key, keyed the same way cards is."""
+    out = {}
+    for key, c in cards.items():
+        if not c.trip_log:
+            continue
+        by_month: dict[str, list] = {}
+        for trip in c.trip_log:
+            ym = (trip["close_t"].strftime("%Y-%m")
+                 if trip["close_t"] is not None else "unknown")
+            by_month.setdefault(ym, []).append(trip)
+        out[key] = {
+            ym: {
+                "trips": len(trips),
+                "wins": sum(1 for tr in trips if tr["win"]),
+                "gross_usd": round(sum(tr["pnl_e4"] for tr in trips)
+                                  / 10_000.0, 4),
+                "fees_usd": round(sum(tr["fees_usd"] for tr in trips), 4),
+            }
+            for ym, trips in sorted(by_month.items())
+        }
+    return out
+
+
 def save_backtest_result(cards: dict, symbol: str, meta: dict,
                          params: dict,
-                         results_dir: str = RESULTS_DIR_DEFAULT) -> str:
+                         results_dir: str = RESULTS_DIR_DEFAULT,
+                         include_monthly: bool = False) -> str:
     """meta: the dict returned alongside `cards` by run_backtest()
     (n_trades, first_t, last_t, trades_paths, interrupted).
     params: every strategy/risk parameter used for this run — save
@@ -97,6 +125,8 @@ def save_backtest_result(cards: dict, symbol: str, meta: dict,
         "strategy_params": params,
         "results": {k: _card_to_dict(c) for k, c in cards.items()},
     }
+    if include_monthly:
+        summary["monthly"] = _monthly_dict(cards)
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -116,6 +146,8 @@ def save_backtest_result(cards: dict, symbol: str, meta: dict,
         for k, v in params.items():
             f.write(f"  {k}: {v}\n")
         f.write("\n" + comparison_report(cards) + "\n")
+        if include_monthly:
+            f.write("\n" + monthly_breakdown_report(cards) + "\n")
 
     return run_dir
 

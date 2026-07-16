@@ -434,6 +434,81 @@ run_dir14 = save_backtest_result(cards14, "SPY", meta14,
 check("a normal run's folder has no INTERRUPTED suffix",
       "INTERRUPTED" in os.path.basename(run_dir14), False)
 
+# ---- v3.10: monthly P&L breakdown, bucketed by CLOSE date -----------------
+print("[G14] a position opened in one month and closed in the next is "
+     "attributed ENTIRELY to its close month -- the exact scenario "
+     "that independently-run monthly backtests would get wrong")
+from compare import monthly_breakdown_report
+
+p14 = os.path.join(tmp, "t14.jsonl")
+# warmup + a golden cross + settled high plateau, all still in January
+# (the BUY), then held across the month boundary, then a settled low
+# plateau in February (the SELL) -- confirmed empirically to produce
+# exactly one clean BUY and one clean SELL, same pattern proven
+# reliable throughout this project's other tests
+jan_end = datetime(2020, 1, 30, 20, 0, tzinfo=timezone.utc)
+rows14 = [(jan_end + timedelta(seconds=i), p)
+         for i, p in enumerate([2000,1900,1800,1700,1600,1500,1400,1300,
+                                3000,3000,3000])]           # BUY, in January
+feb_start = datetime(2020, 2, 1, 14, 30, tzinfo=timezone.utc)
+rows14 += [(feb_start + timedelta(seconds=i), p)
+          for i, p in enumerate([100,100,100,100])]        # SELL, in February
+write_jsonl(p14, rows14)
+
+cards14b, meta14b = run_backtest(p14, "SPY", fast_n=4, slow_n=8, ema_kf=1,
+                                 ema_ks=3, limits=limits,
+                                 traded_strategy="sma")
+sma14 = cards14b["sma"]
+check("exactly one completed trip", sma14.trips, 1)
+check("trip_log recorded exactly one entry", len(sma14.trip_log), 1)
+check("the trip's close timestamp is in FEBRUARY, not January "
+     "(bought in Jan, held across the boundary, sold in Feb -- "
+     "the whole trip's P&L belongs to the month it CLOSED in)",
+     sma14.trip_log[0]["close_t"].month, 2)
+check("the entry price recorded is still the REAL January buy price "
+     "(3000) -- the cost basis correctly survived the month boundary, "
+     "same as it must survive any other point in a continuous run",
+     sma14.trip_log[0]["entry_e4"], to_e4(3000))
+
+report14 = monthly_breakdown_report(cards14b)
+check("monthly report shows the trip under 2020-02, not 2020-01",
+      "2020-02" in report14, True)
+check("January does NOT appear as a month with any trips "
+     "(the position was only OPENED there, never closed there)",
+      "2020-01     1" in report14, False)
+check("report explains why this differs from independent monthly runs",
+      "NOT the same as summing" in report14, True)
+
+print("[G15] --monthly wired into backtest.py's real CLI and saved output")
+r = subprocess.run(
+    [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "backtest.py"),
+     "--trades", p14, "--symbol", "SPY", "--strategy", "sma",
+     "--fast", "4", "--slow", "8", "--ema-kf", "1", "--ema-ks", "3",
+     # match this test's fixture `limits` explicitly -- the CLI's real
+     # defaults (cooldown 60s, max-notional $2,000) would correctly
+     # block this scenario (buy/sell ~15s apart, buy priced at $3,000),
+     # exactly as they should for real trading; that's not what this
+     # test is checking, so don't fight the real defaults, override them
+     "--cooldown", "0", "--max-notional", "10000000",
+     "--monthly", "--results-dir", os.path.join(tmp, "monthly_cli_results")],
+    capture_output=True, text=True, timeout=30)
+check("CLI run succeeded", r.returncode, 0)
+check("CLI output includes the monthly breakdown section",
+      "monthly P&L breakdown" in r.stdout, True)
+saved_dirs = os.listdir(os.path.join(tmp, "monthly_cli_results"))
+run_dir15 = os.path.join(tmp, "monthly_cli_results", saved_dirs[0])
+with open(os.path.join(run_dir15, "report.txt")) as f:
+    saved_report = f.read()
+check("saved report.txt also includes the monthly section",
+      "monthly P&L breakdown" in saved_report, True)
+with open(os.path.join(run_dir15, "summary.json")) as f:
+    saved_summary = _json.load(f)
+check("summary.json has a machine-readable monthly section",
+      "monthly" in saved_summary, True)
+check("summary.json's monthly data correctly shows Feb, not Jan",
+      "2020-02" in saved_summary["monthly"].get("sma", {}), True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

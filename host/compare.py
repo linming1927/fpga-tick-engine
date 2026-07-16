@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from costs import FeeSchedule
 from tick_protocol import SIDE_BUY, SIDE_SELL, dollars
@@ -62,12 +63,18 @@ class StrategyScorecard:
     fees_usd: float = 0.0
     positions: dict = field(default_factory=dict)  # symbol -> qty (hyp.)
     opens: dict = field(default_factory=dict)       # symbol -> entry price
+    trip_log: list = field(default_factory=list)    # one entry per CLOSED
+                                                    # trip, for the monthly
+                                                    # breakdown report — see
+                                                    # compare.py's
+                                                    # monthly_breakdown_report()
 
     @property
     def open_e4(self) -> int | None:
         return next(iter(self.opens.values()), None)
 
-    def on_signal(self, fr: dict, count: bool = True) -> str:
+    def on_signal(self, fr: dict, count: bool = True,
+                 t: datetime | None = None) -> str:
         """Returns a short status string, same spirit as
         OrderManager.on_signal — "FILLED (scored)", "gated: <reason>",
         or "ignored: <reason>" for the ungated single-lot mode's silent
@@ -79,7 +86,12 @@ class StrategyScorecard:
         same purpose as CostTracker.on_fill's count flag: restoring a
         scored strategy's state across a restart needs prior-day
         history to get an open position's cost basis right, but what's
-        REPORTED as "today's" activity should only be today's own."""
+        REPORTED as "today's" activity should only be today's own.
+
+        t: the trade's own timestamp (backtest historical time, or
+        None live) — recorded on trip_log when a sell actually closes,
+        so monthly_breakdown_report() can bucket by CLOSE date. Only
+        logged when count=True, matching every other reported total."""
         if count:
             self.signals += 1
         side, price = fr["side"], fr["price_e4"]
@@ -113,10 +125,15 @@ class StrategyScorecard:
                 trip = (price - entry) * qty
                 self.pnl_e4 += trip
                 self.trips += 1
-                if trip > 0:
+                trip_win = trip > 0
+                if trip_win:
                     self.wins = (self.wins or 0) + 1
-                self.fees_usd += self.fees.sell_fees(
-                    qty, qty * price / 10_000.0)["total"]
+                fee = self.fees.sell_fees(qty, qty * price / 10_000.0)["total"]
+                self.fees_usd += fee
+                self.trip_log.append({
+                    "close_t": t, "symbol": sym, "entry_e4": entry,
+                    "exit_e4": price, "qty": qty, "pnl_e4": trip,
+                    "fees_usd": fee, "win": trip_win})
         return "FILLED (scored)"
 
     @property
@@ -169,7 +186,8 @@ class ProfitGatedScorecard(StrategyScorecard):
         themselves rather than assuming either outcome.
     """
 
-    def on_signal(self, fr: dict, count: bool = True) -> str:
+    def on_signal(self, fr: dict, count: bool = True,
+                 t: datetime | None = None) -> str:
         if count:
             self.signals += 1
         side, price = fr["side"], fr["price_e4"]
@@ -222,8 +240,13 @@ class ProfitGatedScorecard(StrategyScorecard):
             self.pnl_e4 += trip
             self.trips += 1
             self.wins = (self.wins or 0) + 1    # always true here, by rule
-            self.fees_usd += self.fees.sell_fees(
-                qty_to_sell, qty_to_sell * price / 10_000.0)["total"]
+            fee = self.fees.sell_fees(qty_to_sell,
+                                      qty_to_sell * price / 10_000.0)["total"]
+            self.fees_usd += fee
+            self.trip_log.append({
+                "close_t": t, "symbol": sym, "entry_e4": entry,
+                "exit_e4": price, "qty": qty_to_sell, "pnl_e4": trip,
+                "fees_usd": fee, "win": True})
         self.positions[sym] = 0
         self.opens.pop(sym, None)
         return "FILLED (scored)"
@@ -253,4 +276,56 @@ def comparison_report(cards: dict[str, StrategyScorecard]) -> str:
     if trips and max(trips) < 20:
         lines.append("  note: few round trips — treat as anecdote, "
                      "not evidence")
+    return "\n".join(lines)
+
+
+def monthly_breakdown_report(cards: dict[str, StrategyScorecard]) -> str:
+    """Group each card's ALREADY-COMPLETED trips (trip_log) by the
+    calendar month each one CLOSED in — matching how realized P&L is
+    recognized everywhere else in this project (the OM's own day-scoped
+    persistence fix used the same rule: a trade's gain belongs to the
+    day it closed, priced against its real entry, not the day it
+    opened).
+
+    This is NOT the same as running independent monthly backtests and
+    summing them — and deliberately so. A single continuous run (this
+    function just re-buckets its ALREADY-CORRECT trip history for
+    display) correctly carries state across month boundaries: an open
+    position spanning month-end, a slow HTF warmup that only needs to
+    happen once, a cooldown timer that shouldn't forget an order from
+    11:59pm on the 31st. Splitting into independent monthly runs would
+    silently lose all of that — see the README for the specifics."""
+    lines = ["---- monthly P&L breakdown (from ONE continuous run — see "
+             "monthly_breakdown_report()'s docstring for why this is NOT "
+             "the same as summing independently-run monthly backtests) "
+             "----"]
+    any_trips = False
+    for c in cards.values():
+        if not c.trip_log:
+            continue
+        any_trips = True
+        lines.append(f"\n  {c.name}:")
+        lines.append(f"  {'month':<9} {'trips':>6} {'win':>5}  "
+                     f"{'gross $':>10} {'fees $':>8} {'net $':>10}")
+        by_month: dict[str, list] = {}
+        for trip in c.trip_log:
+            ym = (trip["close_t"].strftime("%Y-%m")
+                 if trip["close_t"] is not None else "unknown")
+            by_month.setdefault(ym, []).append(trip)
+        for ym in sorted(by_month):
+            month_trips = by_month[ym]
+            n = len(month_trips)
+            wins = sum(1 for tr in month_trips if tr["win"])
+            gross = sum(tr["pnl_e4"] for tr in month_trips) / 10_000
+            fees = sum(tr["fees_usd"] for tr in month_trips)
+            wr = f"{100*wins/n:.0f}%" if n else "  —"
+            lines.append(f"  {ym:<9} {n:>6} {wr:>5}  {gross:>+10.2f} "
+                        f"{fees:>8.2f} {gross-fees:>+10.2f}")
+        total_gross = sum(tr["pnl_e4"] for tr in c.trip_log) / 10_000
+        total_fees = sum(tr["fees_usd"] for tr in c.trip_log)
+        lines.append(f"  {'TOTAL':<9} {len(c.trip_log):>6} {'':>5}  "
+                     f"{total_gross:>+10.2f} {total_fees:>8.2f} "
+                     f"{total_gross-total_fees:>+10.2f}")
+    if not any_trips:
+        lines.append("\n  (no completed trips yet for any strategy)")
     return "\n".join(lines)

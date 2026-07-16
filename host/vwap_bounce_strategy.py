@@ -108,7 +108,7 @@ class VWAPBounceScorecard(StrategyScorecard):
                 self.on_signal({"side": SIDE_SELL,
                                "price_e4": int(self.vwap),
                                "symbol": self.symbol,
-                               "strategy": "vwap_bounce"})
+                               "strategy": "vwap_bounce"}, t=t)
             self._reset_session(day)
 
         qty = max(qty, 1)          # a zero/missing size must not zero out
@@ -138,10 +138,10 @@ class VWAPBounceScorecard(StrategyScorecard):
             if bounced_back_up:
                 outcome = self.on_signal({
                     "side": SIDE_BUY, "price_e4": price_e4,
-                    "symbol": self.symbol, "strategy": "vwap_bounce"})
+                    "symbol": self.symbol, "strategy": "vwap_bounce"}, t=t)
         else:
             if price_e4 >= self.vwap:      # reverted to fair value: exit
                 outcome = self.on_signal({
                     "side": SIDE_SELL, "price_e4": price_e4,
-                    "symbol": self.symbol, "strategy": "vwap_bounce"})
+                    "symbol": self.symbol, "strategy": "vwap_bounce"}, t=t)
         return outcome

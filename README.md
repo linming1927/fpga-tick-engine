@@ -200,6 +200,17 @@ set of backtest-only assumptions.
   project hadn't used until now — trade volume (Alpaca's `"s"` field),
   already sitting in every downloaded historical file, unused until
   this strategy needed it.
+- **`--monthly`** prints (and saves) a month-by-month P&L breakdown for
+  every row, bucketed by each trip's CLOSE date — from the SAME
+  continuous run, not independent monthly backtests. That distinction
+  matters: a position opened in one month and closed in the next is
+  correctly attributed entirely to its close month, with its real
+  entry price intact; splitting into independent monthly runs instead
+  would either lose that position entirely or restart HTF/LTF's ~200-
+  hour warmup every single month. Every month's numbers reconcile
+  exactly to the overall total, by construction — same trips, just
+  bucketed differently for display, never a second, independently-
+  computed number that could disagree.
 - **Combine incrementally-fetched ranges** without re-downloading, by
   passing multiple files in chronological order:
   ```bash
