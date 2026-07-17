@@ -686,6 +686,18 @@ def main():
                          "is above the average cost of shares held — "
                          "SCORE ONLY, never trades, regardless of "
                          "--strategy")
+    ap.add_argument("--pg-max-hold-days", type=float, default=5.0,
+                    help="--profit-gate only: force-close a position held "
+                         "longer than this many days at the next signal, "
+                         "even at a loss — bounds the never-realize-a-"
+                         "loss rule's unbounded downside (see backtest.py's "
+                         "flag of the same name, which found the case for "
+                         "this: multi-year VTI/QQQ backtests showed "
+                         "'would realize a loss' as the single largest "
+                         "gated-away reason, and a perpetually-open "
+                         "position carrying unbounded unrealized loss the "
+                         "report couldn't show). <= 0 disables (restores "
+                         "the original unbounded behavior). Default 5.0")
     ap.add_argument("--baud", type=int, default=921_600,
                     help="must match the bitstream's BAUD parameter — "
                          "921600 (default) for the current build, 115200 "
@@ -737,6 +749,9 @@ def main():
     ap.add_argument("--dashboard", type=int, default=None, metavar="PORT",
                     help="serve the web console on this port (e.g. 8000)")
     args = ap.parse_args()
+
+    from compare import normalize_max_hold_days
+    pg_max_hold = normalize_max_hold_days(args.pg_max_hold_days)
 
     limits = RiskLimits(order_qty=args.qty,
                         max_shares=args.max_shares,
@@ -826,7 +841,8 @@ def main():
         # difference from the plain SMA row, not a difference in
         # cooldown/daily-cap/position-sizing too
         profit_gated = ProfitGatedScorecard(
-            "SMA profit-gated", policy=RiskPolicy(limits))
+            "SMA profit-gated", policy=RiskPolicy(limits),
+            max_hold_days=pg_max_hold)
         cards["sma_pg"] = profit_gated
 
     def route_to_shadow_cards(fr: dict, count: bool = True):

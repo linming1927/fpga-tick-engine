@@ -651,6 +651,65 @@ kill_b = [e for e in audit_lines_b if e.get("event") == "KILL"][0]
 check("no spurious extra fields appear when none were given",
       set(kill_b.keys()), {"t", "event", "reason"})
 
+# ---- v3.12.1: --pg-max-hold-days reaches the LIVE profit-gated row too,
+# not just backtest.py's standalone/blend rows -- the reported gap: the
+# live --profit-gate row was still running the ORIGINAL unbounded
+# never-realize-a-loss rule after v3.12 shipped the fix everywhere else
+print("[G16] --pg-max-hold-days wired into the live --profit-gate row")
+
+r = subprocess.run([sys.executable, ORDER_MANAGER_PY, "--help"],
+                   capture_output=True, text=True, timeout=30)
+check("--help exits cleanly", r.returncode, 0)
+check("--pg-max-hold-days is a real CLI flag now",
+      "--pg-max-hold-days" in r.stdout, True)
+check("default matches backtest.py's default (5.0) -- live and "
+     "backtest agree unless explicitly overridden",
+     "Default 5.0" in r.stdout, True)
+
+# The construction order_manager.py's main() actually uses for the live
+# row: policy=RiskPolicy(limits) with NO now_fn override, i.e. real
+# wall-clock time -- unlike every backtest/blend test above, which
+# inject a HistoricalClock. This is the one path that hadn't been
+# exercised: does the forced exit still work against RiskPolicy's real
+# datetime.now(ET) fallback, not just a HistoricalClock?
+from compare import ProfitGatedScorecard, normalize_max_hold_days
+from tick_protocol import SIDE_BUY, SIDE_SELL, to_e4
+
+live_limits = RiskLimits(require_market_hours=False, cooldown_s=0.0)
+live_pg = ProfitGatedScorecard(
+    "SMA profit-gated", policy=RiskPolicy(live_limits),
+    max_hold_days=normalize_max_hold_days(5.0))
+live_pg.on_signal({"side": SIDE_BUY, "price_e4": to_e4(100.00),
+                   "symbol": "SPY", "strategy": "sma"})
+check("entry_t recorded against real wall-clock time (no t passed, "
+     "same as a real live signal)",
+     "SPY" in live_pg.entry_t, True)
+# backdate the recorded entry past the bound -- simulates real time
+# having passed, without an actual multi-day sleep in the test suite
+live_pg.entry_t["SPY"] = datetime.now(ET) - timedelta(days=6)
+out = live_pg.on_signal({"side": SIDE_SELL, "price_e4": to_e4(98.00),
+                         "symbol": "SPY", "strategy": "sma"})
+check("forced exit fires against RiskPolicy's real-wall-clock fallback, "
+     "the exact configuration order_manager.py's main() constructs",
+     "forced exit" in out, True)
+check("it's counted as a loss, not a definitional win",
+      live_pg.wins, 0)
+
+# --pg-max-hold-days 0 must still restore the original unbounded live
+# behavior, matching backtest.py's own --pg-max-hold-days 0 escape hatch
+live_pg_unbounded = ProfitGatedScorecard(
+    "SMA profit-gated", policy=RiskPolicy(live_limits),
+    max_hold_days=normalize_max_hold_days(0))
+live_pg_unbounded.on_signal({"side": SIDE_BUY, "price_e4": to_e4(100.00),
+                            "symbol": "SPY", "strategy": "sma"})
+live_pg_unbounded.entry_t["SPY"] = datetime.now(ET) - timedelta(days=400)
+out = live_pg_unbounded.on_signal(
+    {"side": SIDE_SELL, "price_e4": to_e4(98.00),
+     "symbol": "SPY", "strategy": "sma"})
+check("--pg-max-hold-days 0 still disables the bound live, same as "
+     "backtest.py's convention",
+     out.startswith("gated"), True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

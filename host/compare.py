@@ -155,6 +155,15 @@ class StrategyScorecard:
                 f"{self.net_usd:>+10.2f}  {open_s}{blk}")
 
 
+def normalize_max_hold_days(raw: float | None) -> float | None:
+    """The shared <= 0 disables convention for a --pg-max-hold-days CLI
+    value, used identically by backtest.py and order_manager.py so a
+    live session and a backtest interpret the same flag the same way.
+    Pulled out to one place specifically so it's unit-testable without
+    spinning up either CLI's full argparse + main()."""
+    return raw if raw and raw > 0 else None
+
+
 @dataclass
 class ProfitGatedScorecard(StrategyScorecard):
     """The SAME SMA (or EMA) crossover signals as any other scored row,

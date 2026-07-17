@@ -222,3 +222,24 @@ scored-state restore replays audit signals, but the VWAP sleeve
 consumes raw ticks (like the ladder), which aren't in the audit log —
 solve that before this row runs live. 39 new checks, 611 total across
 the host suite, 0 failures.
+
+**v3.13** — the live `--profit-gate` row now gets v3.12's max-hold
+fix too. A reported gap: v3.12 added `max_hold_days` to
+`ProfitGatedScorecard` and wired it into backtest.py's standalone row
+and the blend, but `order_manager.py`'s live/paper session still
+constructed the profit-gated card with no bound at all — a live
+session run today would still hold a loser open indefinitely with a
+trivially-100%-by-construction win rate, the exact thing the VTI/QQQ
+backtests exposed. New `--pg-max-hold-days` CLI flag on
+`order_manager.py` (same default 5.0, same `<=0` disables convention
+as backtest.py), threaded into the live profit-gated construction.
+The `<=0`-disables normalization itself moved to one shared
+`compare.normalize_max_hold_days()`, called by both CLIs, so a live
+session and a backtest can't silently disagree about what the flag
+means — and so the logic is unit-testable without spinning up either
+argparse + main(). New coverage exercises the one path the v3.12 test
+suite hadn't touched: the forced exit firing against `RiskPolicy`'s
+real wall-clock fallback (`datetime.now(ET)`, no `HistoricalClock`
+injected) — the actual configuration `order_manager.py`'s live row
+uses, as opposed to every existing test's backtest-style historical
+clock. 8 new checks, 623 total across the host suite, 0 failures.

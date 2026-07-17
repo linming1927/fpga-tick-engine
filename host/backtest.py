@@ -390,9 +390,8 @@ def main():
         # this gate would just be redundant work against real data
 
     trades_paths = [p.strip() for p in args.trades.split(",") if p.strip()]
-    pg_max_hold = (args.pg_max_hold_days
-                   if args.pg_max_hold_days and args.pg_max_hold_days > 0
-                   else None)
+    from compare import normalize_max_hold_days
+    pg_max_hold = normalize_max_hold_days(args.pg_max_hold_days)
     cards, meta = run_backtest(trades_paths, args.symbol, args.fast,
                               args.slow, args.ema_kf, args.ema_ks, limits,
                               args.strategy, profit_gate=args.profit_gate,

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 from blended_strategy import (AccountExposureCap, BlendedScorecard,
                               SleevePolicy)
-from compare import ProfitGatedScorecard
+from compare import ProfitGatedScorecard, normalize_max_hold_days
 from order_manager import HistoricalClock, RiskLimits, RiskPolicy
 from tick_protocol import SIDE_BUY, SIDE_SELL, to_e4
 
@@ -206,6 +206,17 @@ check("sleeve-prefixed gate reasons",
       or "gated-away" not in rep, True)
 mon = monthly_breakdown_report({"blend": blend})
 check("monthly report renders", "2024-01" in mon, True)
+
+# ---- G10: shared <=0-disables normalization (backtest.py AND -----------
+# order_manager.py both call this instead of duplicating the logic, so
+# a live session and a backtest agree on what --pg-max-hold-days 0 means)
+print("[G10] normalize_max_hold_days — shared CLI-value convention")
+check("positive value passes through", normalize_max_hold_days(5.0), 5.0)
+check("zero disables (-> None)", normalize_max_hold_days(0), None)
+check("negative disables (-> None)", normalize_max_hold_days(-1.0), None)
+check("None stays None", normalize_max_hold_days(None), None)
+check("fractional value passes through",
+      normalize_max_hold_days(0.5), 0.5)
 
 print("=" * 46)
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
