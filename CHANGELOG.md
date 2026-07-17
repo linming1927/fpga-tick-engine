@@ -168,3 +168,27 @@ echoes). 8-slot register file + 8x both engines + priority encoders in
 fabric; slot writes reset slot engine state. Per-symbol models, verifiers,
 positions, costs, scorecards; multi-symbol sim + Alpaca sources; GUI slot
 editor. 3030 checks / 0 failures. BITSTREAM REBUILD REQUIRED.
+
+**v3.11** — signal verification grace window changed from a fixed echo
+count to real elapsed seconds (--verify-grace-s, default 2.0). The old
+count-based design had no fixed real-time meaning; during a burst
+(multiple symbols firing, daily cap maxed out, signals piling up), it
+was consumed almost instantly -- found after "orphan FPGA signal"
+recurred three times in three days, always during high signal volume.
+Divergences now also persist full diagnostic detail (symbol, strategy,
+wait time, actual signal contents) to the audit log's KILL event,
+instead of just a one-line reason -- previously that detail existed in
+memory for one moment and was then gone. 19 new checks, 568 total
+across the host suite, 0 failures.
+
+**v3.11.1** — fixed a real regression in test_order_manager.py and
+test_backtest_results.py: both had a bare relative subprocess path
+("order_manager.py" / "backtest.py") that only resolves when invoked
+from inside host/ -- already fixed once before (v3.4.1 and v3.0.1
+respectively), but reintroduced when a sandbox reset caused these
+files to be rebuilt from copies that predated those fixes. Found via
+a real report. Also fixed a diagnostic gap: run_session() was
+silently discarding subprocess stderr/returncode on failure, turning
+a clear root cause into a bare IndexError with no explanation.
+Verified from both the repo root and host/ this time. 0 new failures,
+same 568 total.

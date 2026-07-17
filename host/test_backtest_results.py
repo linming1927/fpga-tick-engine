@@ -19,13 +19,11 @@ from backtest import run_backtest
 from order_manager import RiskLimits
 
 # Resolve backtest.py's path relative to THIS FILE, not the caller's
-# current working directory — a subprocess test that hardcodes a bare
-# "backtest.py" only works if invoked from inside host/; running the
-# test suite from the repo root (a completely reasonable, common thing
-# to do) made it fail with "can't open file 'backtest.py'" (exit code
-# 2), a real reported bug in the test itself, not in backtest.py.
-BACKTEST_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "backtest.py")
+# current working directory — already fixed once (v3.0.1) but lost when
+# a sandbox reset caused this file to be rebuilt from a copy that
+# predated the fix. Re-applying it.
+BACKTEST_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "backtest.py")
 
 PASS = FAIL = 0
 

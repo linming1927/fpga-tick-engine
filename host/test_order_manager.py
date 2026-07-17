@@ -18,11 +18,20 @@ test_order_manager.py — the guardrails are the product; test the refusals.
 from __future__ import annotations
 
 import json
+import os
+import sys
+
+# Resolve order_manager.py's path relative to THIS FILE, not the
+# caller's current working directory — a subprocess test hardcoding a
+# bare "order_manager.py" only works if invoked from inside host/.
+# This exact fix was already made once (v3.4.1) but was lost when a
+# sandbox reset caused it to be rebuilt from a copy that predated the
+# fix — re-applying it here, and this time it's staying.
+ORDER_MANAGER_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "order_manager.py")
 from datetime import datetime, timedelta
 from order_manager import ET
-import os
 import random
-import sys
 import tempfile
 import time
 
@@ -514,13 +523,22 @@ def run_session(n_ticks):
     emu = FPGAEmulator(symbol="SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3)
     port = emu.start()
     r = subprocess.run(
-        [sys.executable, "order_manager.py", "--port", port,
+        [sys.executable, ORDER_MANAGER_PY, "--port", port,
          "--source", "sim", "--broker", "mock", "--cooldown", "0",
          "--n", str(n_ticks), "--rate", "50", "--fast", "4", "--slow", "8",
          "--ema-kf", "1", "--ema-ks", "3", "--profit-gate",
          "--audit", audit14],
         capture_output=True, text=True, timeout=90)
     emu.stop()
+    if r.returncode != 0:
+        # Surface the actual failure instead of silently discarding it —
+        # a discarded stderr here once turned a clear root cause (a
+        # bare relative path only resolving from one specific directory)
+        # into a bare "IndexError: list index out of range" three
+        # frames away from anything explaining why.
+        print(f"  order_manager.py subprocess FAILED "
+             f"(returncode={r.returncode}):", file=sys.stderr)
+        print(r.stderr, file=sys.stderr)
     return r.stdout
 
 def parse_row(stdout, prefix):
