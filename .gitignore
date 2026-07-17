@@ -32,3 +32,6 @@ om.kill
 # downloaded historical market data — regenerable via
 # fetch_historical_trades.py + Alpaca's API, not source code
 historical_trades/
+
+# saved backtest run outputs — regenerable via backtest.py, not source code
+backtest_results/
