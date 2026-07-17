@@ -218,6 +218,76 @@ set of backtest-only assumptions.
   project hadn't used until now — trade volume (Alpaca's `"s"` field),
   already sitting in every downloaded historical file, unused until
   this strategy needed it.
+- **`--pg-max-hold-days`** (default 5.0) bounds `--profit-gate`'s
+  never-realize-a-loss rule: a position held longer than this many
+  days force-closes at the next signal's price, even at a loss,
+  through the same `RiskPolicy` gate as any other sell (see
+  `compare.py`'s `ProfitGatedScorecard.max_hold_days`). Multi-year
+  VTI/QQQ backtests made the case for this directly — "would realize
+  a loss" was the single largest gated-away reason (1.4M+ signals on
+  VTI, 4.2M+ on QQQ), and the row's perpetual `1 open` position at
+  report end was carrying unbounded unrealized loss the net-$ column
+  structurally couldn't show. With the bound in place, win rate is a
+  real number again — a forced exit below cost counts as a loss —
+  and `forced_exits` in the saved `summary.json` tells you how often
+  it fired. Hold time is measured from the *first* lot bought since
+  flat, so averaging down can't extend a loser's clock. Pass `--pg-
+  max-hold-days 0` to restore the original unbounded behavior, for
+  an A/B against the bounded version.
+- **`--blended`** adds a two-sleeve portfolio row, `Blend
+  (VWAP+SMA-PG)`, combining `--vwap-bounce` and `--profit-gate` as
+  independently-capitalized sleeves rather than one filtering the
+  other (see `blended_strategy.py`). The case for a *blend* over a
+  *filter*: monthly net P&L between the two strategies correlates
+  around **-0.15** on both VTI and QQQ multi-year backtests — close
+  to uncorrelated, with a mild diversifying tilt — and the SMA-PG
+  sleeve sits out roughly a third of months where VWAP bounce is
+  still trading. A filter changes trade selection and would need its
+  own backtest from scratch; a blend only changes capital allocation,
+  so each sleeve's own already-validated numbers still mean what they
+  meant.
+  - Each sleeve is the **unchanged** `VWAPBounceScorecard` /
+    `ProfitGatedScorecard`, with its own `RiskPolicy` clone built from
+    its own carved-down `RiskLimits` — own cooldown, own daily cap,
+    own `max_shares`/`max_notional`. One sleeve's cooldown never
+    blocks the other's signal.
+  - One `AccountExposureCap` sits above both sleeves: total open
+    cost-basis notional across BOTH can never exceed one account
+    ceiling, no matter what either sleeve's own per-order limits would
+    allow alone. Stateless — recomputed from the sleeves' live
+    positions on every check, so there's no separate ledger that can
+    drift out of sync.
+  - `--blend-vwap-shares`/`--blend-vwap-notional` (default 6 /
+    $1,300) and `--blend-pg-shares`/`--blend-pg-notional` (default 4 /
+    $700) size each sleeve; `--blend-account-notional` (default
+    $2,000) sets the combined cap — by default this re-divides the
+    same budget a single-strategy `--max-notional` would use, rather
+    than adding capital.
+  - The report row shows the merged totals, a sub-row per sleeve, and
+    one summary line with the two numbers a per-strategy table can't
+    show: **unrealized** P&L marked on whatever's still open (the
+    exact figure the standalone profit-gated row's `net $` column
+    always excluded), and the **combined realized max drawdown**
+    across both sleeves in close order — a diversification argument
+    built on monthly correlation can still hide same-week overlap
+    that only a trade-by-trade drawdown catches.
+  - `--blended` implies the SMA and VWAP machinery it feeds from; add
+    `--profit-gate --vwap-bounce` alongside it to also print the
+    standalone rows for a side-by-side comparison against the blend.
+  - **Score-only, backtest/comparison only** — not yet wired into
+    `order_manager.py` for live sessions. The scored-state restore
+    that survives a live restart replays `"scored_signal"` audit
+    events, but the VWAP sleeve consumes raw ticks (like the ladder
+    strategy), which aren't in that audit log — a mid-day restart
+    would silently reset its session VWAP. That gap needs closing
+    before this row trades real (paper) fills.
+
+  ```bash
+  python3 host/backtest.py \
+      --trades historical_trades/VTI_2023-07-17_2026-07-14.trades.jsonl \
+      --symbol VTI --strategy sma --profit-gate --vwap-bounce --blended \
+      --monthly
+  ```
 - **`--monthly`** prints (and saves) a month-by-month P&L breakdown for
   every row, bucketed by each trip's CLOSE date — from the SAME
   continuous run, not independent monthly backtests. That distinction
