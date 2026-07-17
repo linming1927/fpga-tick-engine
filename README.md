@@ -48,6 +48,24 @@ gate every individual order regardless of position size, so this isn't
 unthrottled — it's deliberately closer to a scaling-in strategy than a
 strict one-lot-at-a-time system.
 
+**Signal verification (`--verify-grace-s`, default 2.0):** every FPGA
+signal must be independently confirmed by the host's own model
+computation before it becomes a real order — that's what the "verified"
+in "verified FPGA signal" means. If they don't line up within
+`--verify-grace-s` REAL SECONDS, the kill switch trips with
+`"model/hardware divergence: orphan ... signal"`. This is deliberately
+measured in real elapsed time, not an echo count — an earlier version
+used a fixed count of echoes, which has no fixed real-time meaning:
+during a burst (multiple symbols firing at once, the daily order cap
+already maxed out, signals piling up with nothing to absorb them), a
+small echo count is consumed almost instantly, giving very little real
+tolerance exactly when timing pressure is highest. If this divergence
+recurs and you can rule out a genuine hardware fault (check the audit
+log's `KILL` event — it now carries the symbol, strategy, how long it
+waited, and the actual signal contents that didn't match, not just the
+one-line reason), raising `--verify-grace-s` is the first thing to try
+before assuming something is actually broken.
+
 **The GUI's signals table shows what actually happened to each
 signal** — a new outcome column reads `FILLED`, `blocked: <reason>`
 (cooldown, daily cap, position ceiling, market closed), `rejected:

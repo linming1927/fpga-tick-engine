@@ -77,40 +77,84 @@ def now_us() -> int:
 # ---------------------------------------------------------------------------
 @dataclass
 class SignalVerifier:
-    grace: int = 3                       # echoes a pending signal may wait
-    pending_fpga: list = field(default_factory=list)
-    pending_model: list = field(default_factory=list)
+    """Matches the FPGA's own hardware-computed crossover signals against
+    an independent host-side model computation, to prove they agree —
+    the whole point of the "verified" trading path (a signal only turns
+    into a real order after BOTH sides agree, not just because the FPGA
+    says so).
+
+    min_grace_s is REAL SECONDS a pending signal may wait unmatched
+    before being declared an orphan divergence — NOT an echo count. An
+    earlier version used a fixed count (3 more echoes) instead; that has
+    no fixed real-world meaning. During a burst — multiple symbols
+    firing at once, the daily order cap already maxed out, signals
+    piling up with nothing to absorb them — "3 echoes" can be consumed
+    in a few milliseconds, giving almost no real tolerance exactly when
+    timing pressure (host processing load, FPGA-to-host transmission
+    under load) is highest. A fixed TIME window self-adjusts instead:
+    more echoes naturally fit inside it during a busy period (more
+    effective tolerance exactly when needed), fewer during a quiet one.
+    Found after "orphan FPGA signal" recurred three times in three days,
+    every time correlated with high signal volume, never during quiet
+    periods — the old echo-count design was the reason why."""
+    min_grace_s: float = 2.0
+    symbol: str = ""
+    strategy: str = ""
+    pending_fpga: list = field(default_factory=list)   # (t_mono, echo_n, fr)
+    pending_model: list = field(default_factory=list)  # (t_mono, echo_n, sig)
     verified: int = 0
     divergences: int = 0
     on_verified: object = None           # callback(fr) — a VERIFIED FPGA signal
     on_divergence: object = None         # callback(info) — any mismatch/orphan
 
-    def on_fpga_signal(self, fr: dict, echo_seq: int):
-        self.pending_fpga.append((echo_seq, fr))
+    def on_fpga_signal(self, fr: dict, t: float, echo_n: int):
+        self.pending_fpga.append((t, echo_n, fr))
         self._match()
 
-    def on_model_signal(self, sig: SMASignal, echo_seq: int):
-        self.pending_model.append((echo_seq, sig))
+    def on_model_signal(self, sig: SMASignal, t: float, echo_n: int):
+        self.pending_model.append((t, echo_n, sig))
         self._match()
 
-    def on_echo(self, echo_seq: int):
-        """Called per echo: expire anything waiting longer than grace."""
+    def on_echo(self, t: float, echo_n: int):
+        """Called per echo: expire anything that's waited longer than
+        min_grace_s of REAL elapsed time (not echo count) — see class
+        docstring for why time, not count."""
         for name, pend in (("FPGA", self.pending_fpga),
                            ("model", self.pending_model)):
-            while pend and echo_seq - pend[0][0] > self.grace:
-                _, item = pend.pop(0)
+            while pend and t - pend[0][0] > self.min_grace_s:
+                t_queued, echo_n_queued, item = pend.pop(0)
                 self.divergences += 1
                 other = "model" if name == "FPGA" else "FPGA"
-                print(f"!! DIVERGENCE: {name} signal never matched by "
-                      f"{other}: {item}")
+                waited_s = t - t_queued
+                fields = self._fields(item)
+                print(f"!! DIVERGENCE: {self.symbol}/{self.strategy} "
+                     f"{name} signal never matched by {other} after "
+                     f"{waited_s:.2f}s ({echo_n - echo_n_queued} echoes "
+                     f"elapsed): {fields}")
                 if self.on_divergence:
-                    self.on_divergence({"reason": f"orphan {name} signal",
-                                        "detail": str(item)})
+                    self.on_divergence({
+                        "reason": f"orphan {name} signal",
+                        "symbol": self.symbol, "strategy": self.strategy,
+                        "waited_s": round(waited_s, 3),
+                        "echoes_elapsed": echo_n - echo_n_queued,
+                        **fields})
+
+    @staticmethod
+    def _fields(item) -> dict:
+        """Normalize either an fr dict (FPGA signal) or an SMASignal
+        (model signal) into the same shape for logging, so both orphan
+        cases carry the same diagnostic detail."""
+        if isinstance(item, dict):
+            return {"side": item.get("side"), "price_e4": item.get("price_e4"),
+                   "sma_fast": item.get("sma_fast"),
+                   "sma_slow": item.get("sma_slow")}
+        return {"side": item.side, "price_e4": item.price_e4,
+               "sma_fast": item.sma_fast, "sma_slow": item.sma_slow}
 
     def _match(self):
         while self.pending_fpga and self.pending_model:
-            _, fr = self.pending_fpga.pop(0)
-            _, sig = self.pending_model.pop(0)
+            _, _, fr = self.pending_fpga.pop(0)
+            _, _, sig = self.pending_model.pop(0)
             ok = (fr["side"] == sig.side
                   and fr["price_e4"] == sig.price_e4
                   and fr["sma_fast"] == sig.sma_fast
@@ -123,10 +167,19 @@ class SignalVerifier:
                     self.on_verified(fr)
             else:
                 self.divergences += 1
-                print(f"!! DIVERGENCE: FPGA {fr} vs model {sig}")
+                print(f"!! DIVERGENCE: {self.symbol}/{self.strategy} "
+                     f"FPGA {fr} vs model {sig}")
                 if self.on_divergence:
-                    self.on_divergence({"reason": "SMA mismatch",
-                                        "fpga": fr, "model": str(sig)})
+                    self.on_divergence({
+                        "reason": "SMA mismatch",
+                        "symbol": self.symbol, "strategy": self.strategy,
+                        "fpga_side": fr["side"],
+                        "fpga_price_e4": fr["price_e4"],
+                        "fpga_sma_fast": fr["sma_fast"],
+                        "fpga_sma_slow": fr["sma_slow"],
+                        "model_side": sig.side, "model_price_e4": sig.price_e4,
+                        "model_sma_fast": sig.sma_fast,
+                        "model_sma_slow": sig.sma_slow})
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +188,15 @@ class SignalVerifier:
 class Bridge:
     def __init__(self, port: str, symbols, fast_n: int, slow_n: int,
                  ema_kf: int = 3, ema_ks: int = 5,
-                 baud: int = 115_200, log_path: str | None = None):
+                 baud: int = 115_200, log_path: str | None = None,
+                 verify_grace_s: float = 2.0):
         if isinstance(symbols, str):
             symbols = [symbols]
         self.symbols = [t.strip().upper() for t in symbols][:8]
         self.symbol = self.symbols[0]            # primary (OM default)
         self.params = (fast_n, slow_n, ema_kf, ema_ks)
+        self.verify_grace_s = verify_grace_s     # real seconds, not an echo
+                                                 # count — see SignalVerifier
         self.ser = serial.Serial(port, baud, timeout=0.05)
         # one mirror model + one verifier PER (strategy, symbol) — models
         # must match the bitstream's engine parameters, symbols must match
@@ -182,7 +238,8 @@ class Bridge:
             "sma": {t: SMAMirror(fast_n=f, slow_n=sl) for t in self.symbols},
             "ema": {t: EMAMirror(k_fast=kf, k_slow=ks, warmup_n=sl)
                     for t in self.symbols}}
-        self.verifiers = {(st, t): SignalVerifier()
+        self.verifiers = {(st, t): SignalVerifier(symbol=t, strategy=st,
+                                                  min_grace_s=self.verify_grace_s)
                           for st in ("sma", "ema") for t in self.symbols}
         for v in self.verifiers.values():
             v.on_verified = lambda fr: (self.on_verified and
@@ -303,9 +360,9 @@ class Bridge:
                               f"${dollars(sig.price_e4):.4f}  "
                               f"fast={sig.sma_fast} slow={sig.sma_slow}")
                         self.verifiers[(name, sym)].on_model_signal(
-                            sig, self.echoes_by_symbol[sym])
+                            sig, time.monotonic(), self.echoes_by_symbol[sym])
             for (_, vsym), v in self.verifiers.items():
-                v.on_echo(self.echoes_by_symbol.get(vsym, 0))
+                v.on_echo(time.monotonic(), self.echoes_by_symbol.get(vsym, 0))
             if self.on_echo:
                 self.on_echo(fr)
 
@@ -325,7 +382,7 @@ class Bridge:
                     {"t": now_us(), "signal": True, **fr}) + "\n")
             if key in self.verifiers:
                 self.verifiers[key].on_fpga_signal(
-                    fr, self.echoes_by_symbol.get(sym, 0))
+                    fr, time.monotonic(), self.echoes_by_symbol.get(sym, 0))
             else:
                 print(f"!! signal for unconfigured symbol {sym} — "
                       "host/FPGA slot mismatch?")
@@ -534,11 +591,15 @@ def main():
     ap.add_argument("--ema-ks", type=int, default=5)
     ap.add_argument("--baud", type=int, default=921_600,
                     help="must match the bitstream's BAUD parameter")
+    ap.add_argument("--verify-grace-s", type=float, default=2.0,
+                    help="real SECONDS an unmatched FPGA/model signal may "
+                         "wait before being flagged an orphan divergence "
+                         "(NOT an echo count — see SignalVerifier)")
     args = ap.parse_args()
 
     br = Bridge(args.port, args.symbols.split(","), args.fast, args.slow,
                 ema_kf=args.ema_kf, ema_ks=args.ema_ks, baud=args.baud,
-                log_path=args.log)
+                log_path=args.log, verify_grace_s=args.verify_grace_s)
     try:
         if args.source == "sim":
             run_sim(br, args.n, args.rate, args.start_price)

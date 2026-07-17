@@ -507,19 +507,32 @@ class OrderManager:
         self._audit_f.flush()
 
     # ---- kill switch -----------------------------------------------------------
-    def halt(self, reason: str):
+    def halt(self, reason: str, **extra):
+        """extra: additional diagnostic fields persisted alongside the
+        KILL event in the audit log — e.g. a divergence's symbol,
+        strategy, how long it waited, and the actual signal contents
+        (side/price/sma_fast/sma_slow) that didn't match. Previously
+        on_divergence() only ever passed the short reason string through
+        to halt(), so all of that richer detail existed in memory for
+        one moment and was then gone — reconstructing what actually
+        happened required re-deriving it from scratch after the fact.
+        The killfile's own plaintext content is unchanged (still just
+        the reason), so anything reading that file directly still works
+        identically; the extra detail lives in the audit log only."""
         if self.halted:
             return
         self.halted = True
         self.halt_reason = reason
-        self._audit("KILL", reason=reason)
+        self._audit("KILL", reason=reason, **extra)
         with open(self.killfile, "w") as f:
             f.write(f"{datetime.now(ET).isoformat()}  {reason}\n")
         print(f"[om] *** KILL SWITCH: {reason} — no further orders; "
               f"delete '{self.killfile}' to re-arm a future session ***")
 
     def on_divergence(self, info: dict):
-        self.halt(f"model/hardware divergence: {info.get('reason')}")
+        detail = {k: v for k, v in info.items() if k != "reason"}
+        self.halt(f"model/hardware divergence: {info.get('reason')}",
+                 **detail)
 
     @property
     def position_qty(self) -> int:            # back-compat: primary symbol
@@ -677,6 +690,15 @@ def main():
                     help="must match the bitstream's BAUD parameter — "
                          "921600 (default) for the current build, 115200 "
                          "for anything built before this change")
+    ap.add_argument("--verify-grace-s", type=float, default=2.0,
+                    help="real SECONDS an unmatched FPGA/model signal may "
+                         "wait before the kill switch trips on 'model/"
+                         "hardware divergence: orphan ... signal' — NOT "
+                         "an echo count. Raise this if that divergence "
+                         "recurs during genuinely high signal-volume "
+                         "periods (multiple symbols firing, daily cap "
+                         "maxed out) rather than a real hardware fault; "
+                         "see SignalVerifier in bridge.py")
     ap.add_argument("--ladder-baseline", default=None,
                     help="manual override, e.g. 'SPY:500.00,QQQ:450.00' — "
                          "skips the Alpaca weekly-bars fetch (required "
@@ -748,7 +770,7 @@ def main():
     from compare import StrategyScorecard, comparison_report
     br = Bridge(args.port, symbols, args.fast, args.slow,
                 ema_kf=args.ema_kf, ema_ks=args.ema_ks, baud=args.baud,
-                log_path=args.log)
+                log_path=args.log, verify_grace_s=args.verify_grace_s)
 
     labels = {"sma": f"SMA {args.fast}/{args.slow}",
               "ema": f"EMA 1/{1 << args.ema_kf}:1/{1 << args.ema_ks}"}

@@ -414,48 +414,80 @@ check("all verified, no divergence",
 br5.close(); emu5.stop()
 
 # ---- v2.2: per-symbol grace window (fixes a real divergence bug) ----------
-print("[G7] grace window is scoped per-symbol, not a shared global counter")
+print("[G7] grace window is REAL ELAPSED TIME, not an echo count — "
+     "a burst of many echoes with almost no real time passing must NOT "
+     "expire a pending signal, and real time passing DOES expire one "
+     "regardless of how few echoes happened to occur")
 from bridge import SignalVerifier
 from tick_protocol import SMASignal, SIDE_BUY
 
-# Reproduce the failure mode directly against SignalVerifier: a model
-# signal is pending for QQQ; a BURST of unrelated SPY echo activity (more
-# than `grace` echoes) should NOT expire it, because SPY's echoes must
-# not advance QQQ's own grace-window clock.
-v = SignalVerifier(grace=3)
+# A model signal goes pending at t=0. A BURST of 50 echoes, but with the
+# clock barely moving (simulating many ticks arriving within
+# milliseconds — exactly the reported real-world scenario: multiple
+# symbols firing, the daily order cap already maxed out, signals piling
+# up) must NOT expire it, because almost no REAL TIME has passed.
+v = SignalVerifier(symbol="QQQ", strategy="sma", min_grace_s=2.0)
 qqq_sig = SMASignal(side=SIDE_BUY, price_e4=4_000_000, sma_fast=1, sma_slow=2)
-v.on_model_signal(qqq_sig, echo_seq=0)      # pending, stamped at QQQ-count 0
+v.on_model_signal(qqq_sig, t=0.0, echo_n=0)
+for i in range(1, 51):
+    v.on_echo(t=0.05, echo_n=i)     # 50 echoes, clock barely moved (50ms)
+check("a burst of 50 echoes in ~50ms does NOT expire the pending signal "
+     "-- this is the actual reported bug: the old echo-COUNT grace "
+     "window had no fixed real-time meaning and could be exhausted "
+     "almost instantly during a burst", v.divergences, 0)
+check("still pending, correctly", len(v.pending_model), 1)
 
-# Old (buggy) behavior: passing a GLOBAL counter that races ahead due to
-# unrelated SPY traffic would blow through grace=3 and orphan this. New
-# behavior: the bridge now stamps/advances each verifier with that
-# SYMBOL's OWN echo count, so a burst on a different symbol must not
-# reach the verifier at all — simulate that correctly here by holding
-# QQQ's own count at 0 (no QQQ ticks arrived) regardless of how much SPY
-# traffic happened in between:
-for qqq_echo_count in (0, 0, 0, 0, 0, 0):   # SPY-only burst: QQQ count idle
-    v.on_echo(qqq_echo_count)
-check("no orphan from unrelated-symbol traffic", v.divergences, 0)
-check("QQQ signal still pending, not expired",
-      len(v.pending_model), 1)
+# Now real time genuinely passes (2.5s > min_grace_s=2.0), even with NO
+# further echoes at all -- it must still expire, because real elapsed
+# time is what actually matters, not echo traffic
+v.on_echo(t=2.5, echo_n=51)
+check("once REAL TIME exceeds min_grace_s, it expires -- correctly, "
+     "this time for a genuine reason (elapsed time), not an artifact "
+     "of counting", v.divergences, 1)
 
-# Now QQQ's OWN next tick arrives (its count finally advances) and the
-# matching FPGA signal shows up within ITS OWN grace window:
-fpga_fr = {"side": SIDE_BUY, "price_e4": 4_000_000, "sma_fast": 1,
-          "sma_slow": 2, "symbol": "QQQ  "}
-v.on_fpga_signal(fpga_fr, echo_seq=1)       # QQQ's own count now 1
-check("late-but-within-grace FPGA signal verifies correctly",
-      v.verified, 1)
-check("still zero divergences", v.divergences, 0)
+# ---- the divergence info dict must carry full diagnostic detail ---------
+print("[G7b] a divergence carries rich diagnostic detail, not just a "
+     "one-line reason -- the actual second half of what was asked for")
+captured = []
+v2 = SignalVerifier(symbol="RKLB", strategy="ema", min_grace_s=1.0,
+                    on_divergence=lambda info: captured.append(info))
+v2.on_model_signal(qqq_sig, t=10.0, echo_n=5)
+v2.on_echo(t=12.0, echo_n=9)        # 2s later, 4 echoes elapsed
+check("exactly one divergence captured", len(captured), 1)
+info = captured[0]
+check("reason identifies which side was orphaned",
+      info["reason"], "orphan model signal")
+check("symbol is carried through", info["symbol"], "RKLB")
+check("strategy is carried through", info["strategy"], "ema")
+check("waited_s reflects the real elapsed time (~2.0s), not an echo count",
+      abs(info["waited_s"] - 2.0) < 0.01, True)
+check("echoes_elapsed is ALSO recorded, as useful extra context "
+     "(not the basis for the decision, just diagnostic detail)",
+      info["echoes_elapsed"], 4)
+check("the actual signal contents are captured, not just that "
+     "something diverged", (info["side"], info["price_e4"], info["sma_fast"],
+                            info["sma_slow"]),
+      (SIDE_BUY, 4_000_000, 1, 2))
 
-# Sanity: the window DOES still expire a genuinely-unmatched signal once
-# that SAME symbol's own count exceeds grace (the mechanism still works,
-# just scoped correctly now):
-v2 = SignalVerifier(grace=3)
-v2.on_model_signal(qqq_sig, echo_seq=0)
-for qqq_echo_count in (1, 2, 3, 4):         # QQQ's OWN ticks advancing
-    v2.on_echo(qqq_echo_count)
-check("genuinely stale same-symbol signal still expires", v2.divergences, 1)
+# an SMA-mismatch divergence (not just an orphan) must ALSO carry rich,
+# comparable detail from BOTH sides
+captured2 = []
+v3 = SignalVerifier(symbol="SPY", strategy="sma",
+                    on_divergence=lambda info: captured2.append(info))
+fpga_fr = {"side": SIDE_BUY, "price_e4": 1_000_000, "sma_fast": 10,
+          "sma_slow": 20, "symbol": "SPY  "}
+mismatched_sig = SMASignal(side=SIDE_BUY, price_e4=1_000_000,
+                          sma_fast=99, sma_slow=20)   # fast disagrees
+v3.on_fpga_signal(fpga_fr, t=0.0, echo_n=0)
+v3.on_model_signal(mismatched_sig, t=0.0, echo_n=0)
+check("mismatch detected immediately (both sides present, values differ)",
+      len(captured2), 1)
+info2 = captured2[0]
+check("mismatch reason is distinct from an orphan", info2["reason"],
+      "SMA mismatch")
+check("both FPGA's and the model's conflicting values are captured "
+     "side by side, not just 'they disagreed'",
+     (info2["fpga_sma_fast"], info2["model_sma_fast"]), (10, 99))
 
 # ---- integration: bridge tracks echoes_by_symbol, not just the global ----
 print("[G8] Bridge exposes a real per-symbol counter, reset on reconfigure")

@@ -23,15 +23,6 @@ from order_manager import ET
 import os
 import random
 import sys
-
-# Resolve order_manager.py's path relative to THIS FILE, not the
-# caller's current working directory — a subprocess test hardcoding a
-# bare "order_manager.py" only works if invoked from inside host/.
-# Running the suite from the repo root (a completely reasonable thing
-# to do) made G14 fail with "can't open file" -- the exact same class
-# of bug already found and fixed once in test_backtest_results.py.
-ORDER_MANAGER_PY = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "order_manager.py")
 import tempfile
 import time
 
@@ -523,7 +514,7 @@ def run_session(n_ticks):
     emu = FPGAEmulator(symbol="SPY", fast_n=4, slow_n=8, ema_kf=1, ema_ks=3)
     port = emu.start()
     r = subprocess.run(
-        [sys.executable, ORDER_MANAGER_PY, "--port", port,
+        [sys.executable, "order_manager.py", "--port", port,
          "--source", "sim", "--broker", "mock", "--cooldown", "0",
          "--n", str(n_ticks), "--rate", "50", "--fast", "4", "--slow", "8",
          "--ema-kf", "1", "--ema-ks", "3", "--profit-gate",
@@ -576,6 +567,71 @@ check("EMA's trips/win/net RESUME after restart instead of resetting "
      trips_win_net(ema_1), trips_win_net(ema_2))
 check("SMA profit-gated's trips/win/net ALSO resume correctly",
       trips_win_net(pg_1), trips_win_net(pg_2))
+
+# ---- v3.11: halt() persists rich divergence detail, not just the "reason"
+# one-liner -- previously that detail existed in memory for one moment and
+# was then gone, making a real incident hard to reconstruct after the fact
+print("[G15] halt() persists extra diagnostic fields to the audit log, "
+     "not just the short reason string")
+d15 = tempfile.mkdtemp()
+om15 = OrderManager(MockBroker(), ["SPY"],
+                    RiskLimits(order_qty=1, max_shares=5,
+                              max_notional_e4=10**13, max_orders_per_day=99,
+                              cooldown_s=0.0, require_market_hours=False),
+                    audit_path=os.path.join(d15, "a.jsonl"),
+                    killfile=os.path.join(d15, "om.kill"))
+
+# on_divergence() is the actual real-world call path (from the bridge's
+# SignalVerifier) -- exercise that directly, not just halt() in isolation
+om15.on_divergence({
+    "reason": "orphan FPGA signal", "symbol": "RKLB", "strategy": "sma",
+    "waited_s": 2.13, "echoes_elapsed": 47,
+    "side": 1, "price_e4": 1_665_000, "sma_fast": 10, "sma_slow": 20,
+})
+check("halted", om15.halted, True)
+check("the concise reason still reads as before (backward compatible "
+     "with anything that reads the killfile's plain text)",
+     om15.halt_reason, "model/hardware divergence: orphan FPGA signal")
+with open(om15.killfile) as f:
+    killfile_text = f.read()
+check("killfile's own content is unchanged -- still just the reason, "
+     "one line", "orphan FPGA signal" in killfile_text, True)
+
+# now check the AUDIT LOG actually has the rich detail persisted
+with open(os.path.join(d15, "a.jsonl")) as f:
+    audit_lines = [json.loads(l) for l in f if l.strip()]
+kill_events = [e for e in audit_lines if e.get("event") == "KILL"]
+check("exactly one KILL event in the audit log", len(kill_events), 1)
+kill_ev = kill_events[0]
+check("symbol persisted", kill_ev.get("symbol"), "RKLB")
+check("strategy persisted", kill_ev.get("strategy"), "sma")
+check("waited_s persisted -- this is the whole point: a real incident "
+     "can now be reconstructed from the audit log alone, instead of "
+     "having to guess after the fact", kill_ev.get("waited_s"), 2.13)
+check("echoes_elapsed persisted", kill_ev.get("echoes_elapsed"), 47)
+check("the actual signal contents (side/price/sma_fast/sma_slow) "
+     "persisted, not just that something diverged",
+     (kill_ev.get("side"), kill_ev.get("price_e4"), kill_ev.get("sma_fast"),
+      kill_ev.get("sma_slow")), (1, 1_665_000, 10, 20))
+
+# backward compatibility: a plain halt(reason) with NO extra fields
+# (e.g. the existing "N consecutive broker rejections" call site) must
+# still work exactly as before
+d15b = tempfile.mkdtemp()
+om15b = OrderManager(MockBroker(), ["SPY"],
+                     RiskLimits(order_qty=1, max_shares=5,
+                               max_notional_e4=10**13, max_orders_per_day=99,
+                               cooldown_s=0.0, require_market_hours=False),
+                     audit_path=os.path.join(d15b, "a.jsonl"),
+                     killfile=os.path.join(d15b, "om.kill"))
+om15b.halt("3 consecutive broker rejections")
+check("plain halt() with no extra fields still works unchanged",
+      om15b.halt_reason, "3 consecutive broker rejections")
+with open(os.path.join(d15b, "a.jsonl")) as f:
+    audit_lines_b = [json.loads(l) for l in f if l.strip()]
+kill_b = [e for e in audit_lines_b if e.get("event") == "KILL"][0]
+check("no spurious extra fields appear when none were given",
+      set(kill_b.keys()), {"t", "event", "reason"})
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
