@@ -192,3 +192,33 @@ silently discarding subprocess stderr/returncode on failure, turning
 a clear root cause into a bare IndexError with no explanation.
 Verified from both the repo root and host/ this time. 0 new failures,
 same 568 total.
+**v3.12** — blended two-sleeve portfolio (VWAP bounce + SMA
+profit-gated), plus the fix the 3-year reports demanded: a max-hold
+bound on the profit-gated rule. The VTI/QQQ multi-year runs showed
+"would realize a loss" as the single largest gated-away reason (1.4M+
+on VTI, 4.2M+ on QQQ) — the 100% win rate was pure exit-rule artifact,
+and the perpetual "1 open" position carried unbounded unrealized loss
+the report structurally couldn't show. ProfitGatedScorecard now takes
+max_hold_days (backtest default 5.0; <=0 restores the old unbounded
+behavior for comparison): an expired position force-closes at the next
+signal's price, even at a loss, through the SAME RiskPolicy gate as
+any other sell — win rate is a real number again, forced exits are
+counted and flagged in trip_log. Hold time is measured from the first
+lot since flat, so averaging down cannot extend a loser. New
+blended_strategy.py: each sleeve is the unchanged existing scorecard
+with its own RiskPolicy clone from its own carved-down RiskLimits
+(VWAP 6sh/$1300, SMA-PG 4sh/$700 by default — re-dividing the same
+$2,000 budget, not adding capital), under one AccountExposureCap on
+total open cost-basis notional across both — recomputed from the
+sleeves' own positions on every check, no mutable ledger to drift.
+Chosen as a portfolio blend, not a signal filter, on the evidence:
+monthly nets correlate ~-0.15 on both symbols and profit-gated sits
+out ~1/3 of months where VWAP still trades. The blend row reports
+per-sleeve sub-rows, merged sleeve-prefixed gate reasons, combined
+realized max drawdown, and an UNREALIZED mark on open lots — the two
+numbers the separate per-strategy tables couldn't show. Score-only in
+backtest.py (--blended); live wiring deliberately deferred: the
+scored-state restore replays audit signals, but the VWAP sleeve
+consumes raw ticks (like the ladder), which aren't in the audit log —
+solve that before this row runs live. 39 new checks, 611 total across
+the host suite, 0 failures.

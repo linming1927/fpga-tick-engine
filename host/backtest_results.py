@@ -33,7 +33,7 @@ RESULTS_DIR_DEFAULT = "./backtest_results"
 
 
 def _card_to_dict(c: StrategyScorecard) -> dict:
-    return {
+    d = {
         "name": c.name,
         "live": c.live,
         "signals": c.signals,
@@ -48,6 +48,21 @@ def _card_to_dict(c: StrategyScorecard) -> dict:
         "block_reasons": dict(c.block_reasons),
         "open_positions": {k: v for k, v in c.positions.items() if v},
     }
+    # profit-gated cards with a max-hold bound: how often it fired is
+    # the number that tells you whether the bound is doing real work
+    if getattr(c, "max_hold_days", None) is not None:
+        d["max_hold_days"] = c.max_hold_days
+        d["forced_exits"] = getattr(c, "forced_exits", 0)
+    # blend cards: the two numbers the per-strategy tables can't show
+    # (unrealized mark on open lots; combined realized max drawdown),
+    # plus each sleeve saved in full so a later comparison doesn't
+    # have to re-derive them from the merged row
+    if hasattr(c, "unrealized_usd"):
+        d["unrealized_usd"] = round(c.unrealized_usd(), 4)
+        d["max_drawdown_usd"] = round(c.max_drawdown_usd(), 4)
+        d["sleeves"] = {"vwap": _card_to_dict(c.vwap),
+                       "sma_pg": _card_to_dict(c.pg)}
+    return d
 
 
 def _monthly_dict(cards: dict) -> dict:

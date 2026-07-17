@@ -107,7 +107,13 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
                  traded_strategy: str, progress_every: int = 500_000,
                  profit_gate: bool = False, htf_ltf: bool = False,
                  htf_interval_s: int = 3600, ltf_interval_s: int = 300,
-                 vwap_bounce: bool = False, vwap_band_k: float = 1.0
+                 vwap_bounce: bool = False, vwap_band_k: float = 1.0,
+                 pg_max_hold_days: float | None = None,
+                 blended: bool = False, blend_vwap_shares: int = 6,
+                 blend_vwap_notional: float = 1_300.0,
+                 blend_pg_shares: int = 4,
+                 blend_pg_notional: float = 700.0,
+                 blend_account_notional: float = 2_000.0
                  ) -> dict[str, StrategyScorecard]:
     if isinstance(trades_paths, str):
         trades_paths = [trades_paths]
@@ -131,7 +137,8 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
         from compare import ProfitGatedScorecard
         profit_gated = ProfitGatedScorecard(
             "SMA profit-gated", live=False,
-            policy=RiskPolicy(limits, now_fn=clocks["sma_pg"]))
+            policy=RiskPolicy(limits, now_fn=clocks["sma_pg"]),
+            max_hold_days=pg_max_hold_days)
         cards["sma_pg"] = profit_gated
 
     htf_ltf_card = None
@@ -155,6 +162,26 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
             policy=RiskPolicy(limits, now_fn=HistoricalClock()),
             band_k=vwap_band_k)
         cards["vwap_bounce"] = vwap_card
+
+    blend_card = None
+    if blended:
+        from blended_strategy import BlendedScorecard
+        # two sleeves, each its own RiskPolicy clone + HistoricalClock
+        # (same per-row isolation as every other shadow card), plus one
+        # account-level exposure cap across both — see
+        # blended_strategy.py for why a portfolio blend and not a
+        # signal filter
+        blend_card = BlendedScorecard.build(
+            symbol=symbol, base_limits=limits,
+            vwap_shares=blend_vwap_shares,
+            vwap_notional_e4=to_e4(blend_vwap_notional),
+            pg_shares=blend_pg_shares,
+            pg_notional_e4=to_e4(blend_pg_notional),
+            account_cap_e4=to_e4(blend_account_notional),
+            band_k=vwap_band_k,
+            max_hold_days=pg_max_hold_days,
+            now_fn_factory=HistoricalClock)
+        cards["blend"] = blend_card
 
     n = 0
     first_t = last_t = None
@@ -182,6 +209,11 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
                                            "price_e4": sig.price_e4,
                                            "symbol": symbol,
                                            "strategy": "sma"}, t=t)
+                if blend_card is not None:
+                    blend_card.on_sma_signal({"side": sig.side,
+                                             "price_e4": sig.price_e4,
+                                             "symbol": symbol,
+                                             "strategy": "sma"}, t=t)
 
             sig = ema_model.ingest(price_e4)
             if sig:
@@ -196,6 +228,9 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
 
             if vwap_card is not None:
                 vwap_card.on_tick(t, price_e4, qty)
+
+            if blend_card is not None:
+                blend_card.on_tick(t, price_e4, qty)
     except KeyboardInterrupt:
         # A partial result, honestly labeled, beats no result at all —
         # this is exactly the reported gap: Ctrl+C used to propagate
@@ -288,6 +323,47 @@ def main():
     ap.add_argument("--vwap-band-k", type=float, default=1.0,
                     help="band width in session standard deviations "
                          "(default 1.0)")
+    ap.add_argument("--pg-max-hold-days", type=float, default=5.0,
+                    help="profit-gated max hold: force-close a position "
+                         "held longer than this many days at the next "
+                         "signal, even at a loss — bounds the never-"
+                         "realize-a-loss rule's unbounded downside and "
+                         "makes its win rate a real number instead of a "
+                         "definitional 100%%. Applies to the standalone "
+                         "profit-gated row AND the blend's SMA-PG "
+                         "sleeve. <= 0 disables (restores the original "
+                         "unbounded behavior, for comparison runs). "
+                         "Default 5.0")
+    ap.add_argument("--blended", action="store_true",
+                    help="also backtest the two-sleeve portfolio blend: "
+                         "VWAP bounce + SMA profit-gated trading "
+                         "independently, each with its own carved-down "
+                         "RiskPolicy budget, under one account-level "
+                         "open-notional cap across both (see "
+                         "blended_strategy.py) — always score-only, "
+                         "regardless of --strategy. Implies the SMA and "
+                         "VWAP machinery it feeds from; run with "
+                         "--profit-gate --vwap-bounce to also get the "
+                         "standalone rows for comparison")
+    ap.add_argument("--blend-vwap-shares", type=int, default=6,
+                    help="VWAP sleeve max_shares (default 6 — the "
+                         "larger budget goes to the sleeve carrying "
+                         "the larger share of the historical edge)")
+    ap.add_argument("--blend-vwap-notional", type=float, default=1_300.0,
+                    help="VWAP sleeve per-order notional cap $ "
+                         "(default 1300)")
+    ap.add_argument("--blend-pg-shares", type=int, default=4,
+                    help="SMA-PG sleeve max_shares (default 4)")
+    ap.add_argument("--blend-pg-notional", type=float, default=700.0,
+                    help="SMA-PG sleeve per-order notional cap $ "
+                         "(default 700)")
+    ap.add_argument("--blend-account-notional", type=float,
+                    default=2_000.0,
+                    help="account-level cap: total open cost-basis "
+                         "notional across BOTH sleeves (default 2000 — "
+                         "matches the single-strategy --max-notional "
+                         "default, so the blend re-divides the same "
+                         "budget rather than adding capital)")
     ap.add_argument("--results-dir", default=RESULTS_DIR_DEFAULT,
                     help="where saved runs go — browse them with "
                          "list_backtest_results.py")
@@ -314,6 +390,9 @@ def main():
         # this gate would just be redundant work against real data
 
     trades_paths = [p.strip() for p in args.trades.split(",") if p.strip()]
+    pg_max_hold = (args.pg_max_hold_days
+                   if args.pg_max_hold_days and args.pg_max_hold_days > 0
+                   else None)
     cards, meta = run_backtest(trades_paths, args.symbol, args.fast,
                               args.slow, args.ema_kf, args.ema_ks, limits,
                               args.strategy, profit_gate=args.profit_gate,
@@ -321,7 +400,15 @@ def main():
                               htf_interval_s=args.htf_interval,
                               ltf_interval_s=args.ltf_interval,
                               vwap_bounce=args.vwap_bounce,
-                              vwap_band_k=args.vwap_band_k)
+                              vwap_band_k=args.vwap_band_k,
+                              pg_max_hold_days=pg_max_hold,
+                              blended=args.blended,
+                              blend_vwap_shares=args.blend_vwap_shares,
+                              blend_vwap_notional=args.blend_vwap_notional,
+                              blend_pg_shares=args.blend_pg_shares,
+                              blend_pg_notional=args.blend_pg_notional,
+                              blend_account_notional=
+                                  args.blend_account_notional)
     print()
     if meta.get("interrupted"):
         print("=" * 60)
@@ -348,6 +435,13 @@ def main():
             "ltf_interval_s": args.ltf_interval,
             "vwap_bounce": args.vwap_bounce,
             "vwap_band_k": args.vwap_band_k,
+            "pg_max_hold_days": pg_max_hold,
+            "blended": args.blended,
+            "blend_vwap_shares": args.blend_vwap_shares,
+            "blend_vwap_notional": args.blend_vwap_notional,
+            "blend_pg_shares": args.blend_pg_shares,
+            "blend_pg_notional": args.blend_pg_notional,
+            "blend_account_notional": args.blend_account_notional,
         }
         run_dir = save_backtest_result(cards, args.symbol, meta, params,
                                        results_dir=args.results_dir,

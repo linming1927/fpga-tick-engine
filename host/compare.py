@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from costs import FeeSchedule
 from tick_protocol import SIDE_BUY, SIDE_SELL, dollars
@@ -184,7 +184,86 @@ class ProfitGatedScorecard(StrategyScorecard):
         capital indefinitely instead of realizing a small, bounded
         loss. Built as asked; let the comparison numbers speak for
         themselves rather than assuming either outcome.
+
+    MAX-HOLD FORCED EXIT (max_hold_days): the bound the two caveats
+    above were begging for. When set, a position held longer than
+    max_hold_days is force-closed at the next signal's price,
+    REGARDLESS of profit — the one way a loss can now be realized.
+    This directly fixes what a 3-year backtest made undeniable: the
+    "100%" win rate was pure exit-rule artifact ("would realize a
+    loss" was the single largest gated-away reason, 1.4M+ signals on
+    VTI alone), and the perpetually-"1 open" position at report end
+    was carrying unbounded unrealized loss that net $ structurally
+    couldn't show. With the bound in place, win rate is a real number
+    again (a forced exit below cost counts as a LOSS), and the worst
+    case is capped at max_hold_days of adverse drift instead of
+    forever.
+
+    Honesty notes on the forced exit:
+      * it fires at SIGNAL time, not continuously — this card only
+        sees crossover signals, not raw ticks, so an expired hold
+        closes at the next signal's price after expiry (SMA crossovers
+        arrive thousands of times a month, so the granularity gap is
+        minutes, not days).
+      * it goes through the SAME RiskPolicy gate as any other sell
+        (cooldown / daily cap / market hours) — if gated, it simply
+        retries at the next signal rather than jumping the queue.
+      * expiry is measured against the trade's own timestamp (t) when
+        one is provided (backtests, startup replay); live signals
+        carry no t, so it falls back to the policy clock when a policy
+        is attached, and is inert otherwise.
+      * None (the default) preserves the original never-realize-a-loss
+        behavior exactly, so this stays an isolated, comparable
+        variable — run with and without to measure what the bound
+        costs or saves.
     """
+
+    max_hold_days: float | None = None
+    forced_exits: int = 0
+    entry_t: dict = field(default_factory=dict)   # symbol -> first-entry
+                                                  # time since last flat
+
+    def _now(self, t: datetime | None) -> datetime | None:
+        if t is not None:
+            return t
+        if self.policy is not None:
+            return self.policy._now_fn()
+        return None
+
+    def _hold_expired(self, sym: str, now: datetime | None) -> bool:
+        if self.max_hold_days is None or now is None:
+            return False
+        if self.positions.get(sym, 0) <= 0:
+            return False
+        entered = self.entry_t.get(sym)
+        return (entered is not None
+                and now - entered >= timedelta(days=self.max_hold_days))
+
+    def _close(self, sym: str, price: int, count: bool,
+              t: datetime | None, forced: bool = False):
+        """Shared close bookkeeping for both the normal profitable sell
+        and the max-hold forced exit — the ONLY difference is that a
+        forced exit's trip can be (and usually is) a loss."""
+        qty = self.positions.get(sym, 0)
+        entry = self.opens.get(sym, price)
+        if count:
+            trip = (price - entry) * qty
+            self.pnl_e4 += trip
+            self.trips += 1
+            win = trip > 0
+            if win:
+                self.wins = (self.wins or 0) + 1
+            if forced:
+                self.forced_exits += 1
+            fee = self.fees.sell_fees(qty, qty * price / 10_000.0)["total"]
+            self.fees_usd += fee
+            self.trip_log.append({
+                "close_t": t, "symbol": sym, "entry_e4": entry,
+                "exit_e4": price, "qty": qty, "pnl_e4": trip,
+                "fees_usd": fee, "win": win, "forced": forced})
+        self.positions[sym] = 0
+        self.opens.pop(sym, None)
+        self.entry_t.pop(sym, None)
 
     def on_signal(self, fr: dict, count: bool = True,
                  t: datetime | None = None) -> str:
@@ -192,6 +271,28 @@ class ProfitGatedScorecard(StrategyScorecard):
             self.signals += 1
         side, price = fr["side"], fr["price_e4"]
         sym = fr.get("symbol", "").strip()
+
+        # ---- max-hold forced exit: evaluated BEFORE the incoming
+        # signal, through the same policy gate as any other sell ------
+        now = self._now(t)
+        if self._hold_expired(sym, now):
+            pos = self.positions.get(sym, 0)
+            allowed = True
+            if self.policy is not None:
+                allowed, _, _ = self.policy.evaluate(SIDE_SELL, pos, price)
+            if allowed:
+                self._close(sym, price, count, t, forced=True)
+                if self.policy is not None and count:
+                    self.policy.record_order()
+                if side == SIDE_SELL:
+                    return "FILLED (scored, forced exit: max hold)"
+                # a BUY signal falls through and is processed normally
+                # against the now-flat position (it may then gate on
+                # the cooldown the forced exit just started — correct:
+                # a real account couldn't fire both inside the gap
+                # either)
+            # not allowed (cooldown/cap/hours): retry at next signal
+
         pos_qty = self.positions.get(sym, 0)
 
         if self.policy is not None:
@@ -216,6 +317,12 @@ class ProfitGatedScorecard(StrategyScorecard):
             self.opens[sym] = ((old_avg * old_qty + price * qty)
                                // new_qty) if old_qty else price
             self.positions[sym] = new_qty
+            if not old_qty and now is not None:
+                # hold time is measured from the FIRST lot since flat —
+                # adding to a position doesn't reset the clock (that
+                # would let averaging-down extend a loser indefinitely,
+                # the exact behavior the bound exists to prevent)
+                self.entry_t[sym] = now
             if self.policy is not None and count:
                 self.policy.record_order()
             return "FILLED (scored)"
@@ -234,22 +341,9 @@ class ProfitGatedScorecard(StrategyScorecard):
 
         if self.policy is not None and count:
             self.policy.record_order()
-        qty_to_sell = self.positions.get(sym, 0)
-        if count:
-            trip = (price - entry) * qty_to_sell
-            self.pnl_e4 += trip
-            self.trips += 1
-            self.wins = (self.wins or 0) + 1    # always true here, by rule
-            fee = self.fees.sell_fees(qty_to_sell,
-                                      qty_to_sell * price / 10_000.0)["total"]
-            self.fees_usd += fee
-            self.trip_log.append({
-                "close_t": t, "symbol": sym, "entry_e4": entry,
-                "exit_e4": price, "qty": qty_to_sell, "pnl_e4": trip,
-                "fees_usd": fee, "win": True})
-        self.positions[sym] = 0
-        self.opens.pop(sym, None)
-        return "FILLED (scored)"
+        self._close(sym, price, count, t)   # win by construction here:
+        return "FILLED (scored)"            # the price > entry gate above
+                                            # already passed
 
 
 def comparison_report(cards: dict[str, StrategyScorecard]) -> str:
