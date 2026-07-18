@@ -266,3 +266,22 @@ X()/the gridline agree on one consistent constant. Verified the new
 test actually catches the original bug by reverting the fix and
 confirming it fails, then restoring it. 9 new checks, 632 total
 across the host suite, 0 failures.
+
+**v3.15** — fixed a real diagnostic gap in the blend's report: the
+"gated-away signals" line took the top 3 reasons GLOBALLY over the
+merged, sleeve-prefixed block_reasons dict. Since SMA-PG fires on
+nearly every tick (millions of signals) and VWAP only on rare
+band-touch events, every one of SMA-PG's reason-buckets outnumbers
+every one of VWAP's — a global top-3 can never show a single VWAP
+reason, no matter how much of VWAP's own blocked count it explains.
+Confirmed on a real QQQ report: VWAP's sleeve showed 1.3M blocked
+signals of its own and zero of its reasons made the merged top-3.
+New BlendedScorecard.gate_summary() takes the top N reasons PER
+SLEEVE instead; comparison_report() calls it when a card exposes one
+(hasattr check), falling back to the original global top-3 for every
+other card type — zero behavior change for non-blend rows. Also
+fixed a small cosmetic bug found while testing this: a blend with
+max_hold_days=None (unbounded) rendered its row as "max-hold Noned"
+(an f-string pasting None directly against "d") instead of
+"max-hold unbounded". 15 new checks, 644 total across the host
+suite, 0 failures.

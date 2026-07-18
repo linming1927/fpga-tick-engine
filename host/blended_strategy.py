@@ -234,6 +234,29 @@ class BlendedScorecard:
                 merged[f"{label}: {reason}"] += n
         return merged
 
+    def gate_summary(self, top_n: int = 3) -> str:
+        """comparison_report()'s default 'gated-away signals' line takes
+        the top N reasons from block_reasons GLOBALLY. For a blend
+        that's actively misleading: SMA-PG fires on nearly every tick
+        (millions of signals) while VWAP fires only on rare band-touch
+        events (a small fraction of that) -- every one of SMA-PG's
+        reason-buckets outnumbers EVERY one of VWAP's, so a global
+        top-3 can NEVER show a single VWAP reason, no matter how much
+        of VWAP's own blocked count it explains. Confirmed on a real
+        report: VWAP's sleeve showed 1.3M blocked signals of its own,
+        and zero of its reasons made the merged top-3.
+
+        This takes the top N reasons PER SLEEVE instead, so each
+        sleeve's own gating story stays visible regardless of how the
+        other sleeve's volume compares."""
+        parts = []
+        for label, c in (("vwap", self.vwap), ("sma-pg", self.pg)):
+            if c.block_reasons:
+                top = ", ".join(f"{r} x{n}"
+                               for r, n in c.block_reasons.most_common(top_n))
+                parts.append(f"{label}: {top}")
+        return "; ".join(parts)
+
     @property
     def policy(self):
         # non-None so comparison_report() prints the merged gated-away
@@ -315,10 +338,11 @@ class BlendedScorecard:
         lines += [c.row() for c in self._sleeves]
         unreal = self.unrealized_usd()
         forced = getattr(self.pg, "forced_exits", 0)
+        hold_label = (f"{self.pg.max_hold_days}d" if self.pg.max_hold_days
+                     is not None else "unbounded")
         lines.append(
             f"      blend: unrealized {unreal:+.2f} on open positions, "
             f"combined realized max drawdown "
             f"{self.max_drawdown_usd():.2f}, "
-            f"{forced} forced exit(s) [SMA-PG max-hold "
-            f"{self.pg.max_hold_days}d]")
+            f"{forced} forced exit(s) [SMA-PG max-hold {hold_label}]")
         return "\n".join(lines)

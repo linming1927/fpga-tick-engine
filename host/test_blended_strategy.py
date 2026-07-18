@@ -12,9 +12,11 @@ from datetime import datetime, timedelta, timezone
 
 from blended_strategy import (AccountExposureCap, BlendedScorecard,
                               SleevePolicy)
-from compare import ProfitGatedScorecard, normalize_max_hold_days
+from compare import (ProfitGatedScorecard, comparison_report,
+                    normalize_max_hold_days)
 from order_manager import HistoricalClock, RiskLimits, RiskPolicy
 from tick_protocol import SIDE_BUY, SIDE_SELL, to_e4
+from vwap_bounce_strategy import VWAPBounceScorecard
 
 PASS = FAIL = 0
 
@@ -195,10 +197,27 @@ check("row has aggregate + 2 sleeve lines + blend note",
       len(row.split("\n")), 4)
 check("row reports unrealized/drawdown/forced",
       "unrealized" in row and "drawdown" in row and "forced" in row, True)
+check("max-hold label renders the bounded value cleanly, not just "
+     "str(5.0)+'d' pasted together oddly",
+     "max-hold 5.0d" in row, True)
+
+# unbounded (max_hold_days=None) must render as a real word, not the
+# literal text "Noned" (an f-string pasting None directly against "d")
+unbounded_blend = BlendedScorecard.build(
+    symbol="TEST", base_limits=base,
+    vwap_shares=6, vwap_notional_e4=to_e4(1300.0),
+    pg_shares=4, pg_notional_e4=to_e4(700.0),
+    account_cap_e4=to_e4(2000.0), band_k=1.0, max_hold_days=None,
+    now_fn_factory=HistoricalClock)
+unbounded_row = unbounded_blend.row()
+check("max_hold_days=None renders as 'unbounded', not the literal "
+     "text 'Noned'",
+     "unbounded" in unbounded_row, True)
+check("the old bug is gone", "Noned" in unbounded_row, False)
 
 # ---- G9: report functions render the blend without modification ------------
 print("[G9] comparison_report / monthly_breakdown_report accept the blend")
-from compare import comparison_report, monthly_breakdown_report
+from compare import monthly_breakdown_report
 rep = comparison_report({"blend": blend})
 check("comparison_report renders", "Blend (VWAP+SMA-PG)" in rep, True)
 check("sleeve-prefixed gate reasons",
@@ -217,6 +236,106 @@ check("negative disables (-> None)", normalize_max_hold_days(-1.0), None)
 check("None stays None", normalize_max_hold_days(None), None)
 check("fractional value passes through",
       normalize_max_hold_days(0.5), 0.5)
+
+# ---- G11: the reported bug -- a global top-3 over the merged reason
+# dict can NEVER show a VWAP reason when SMA-PG's bucket counts are
+# orders of magnitude larger, no matter how much of VWAP's own blocked
+# count it would explain. Reproduced deterministically: both sleeves
+# hit the exact same reason ("would exceed max_shares"), SMA-PG just
+# hits it far more often -- exactly the real QQQ/VTI report's shape.
+print("[G11] blend gate reasons: per-sleeve summary, not a global top-3 "
+     "that silently drops the quieter sleeve")
+account2 = AccountExposureCap(cap_e4=to_e4(100000.0))
+tiny_lim = RiskLimits(require_market_hours=False, cooldown_s=0.0,
+                      max_shares=1, max_notional_e4=to_e4(50.0))
+clk_v, clk_p = HistoricalClock(), HistoricalClock()
+vwap_small = VWAPBounceScorecard(
+    "  - VWAP sleeve", symbol="TEST", live=False,
+    policy=SleevePolicy(RiskPolicy(tiny_lim, now_fn=clk_v), account2))
+pg_big = ProfitGatedScorecard(
+    "  - SMA-PG sleeve",
+    policy=SleevePolicy(RiskPolicy(tiny_lim, now_fn=clk_p), account2))
+account2.attach(vwap_small); account2.attach(pg_big)
+
+clk_v.set(T0)
+vwap_small.on_signal(sig(SIDE_BUY, 10.00, "TEST"), t=T0)     # fills, at cap
+for _ in range(5):                                            # ONE small
+    vwap_small.on_signal(sig(SIDE_BUY, 10.00, "TEST"), t=T0) # reason bucket
+
+# SMA-PG gets THREE distinct reason buckets, each individually bigger
+# than vwap's one -- the real report's actual shape (three reasons
+# listed for SMA-PG, each in the millions). Two symbols keep the
+# "already holding, at cap" and "never bought" scenarios independent
+# within the same card.
+clk_p.set(T0)
+pg_big.on_signal(sig(SIDE_BUY, 10.00, "SYM_A"), t=T0)          # fills
+for _ in range(300):                                           # reason 1
+    pg_big.on_signal(sig(SIDE_SELL, 5.00, "SYM_A"), t=T0)      # (a loss)
+for _ in range(250):                                           # reason 2
+    pg_big.on_signal(sig(SIDE_BUY, 10.00, "SYM_A"), t=T0)      # (at cap)
+for _ in range(200):                                           # reason 3
+    pg_big.on_signal(sig(SIDE_BUY, 100.00, "SYM_B"), t=T0)     # (notional)
+
+check("VWAP's own blocked count is real and nonzero",
+      vwap_small.blocked > 0, True)
+check("SMA-PG has (at least) three distinct reason buckets, matching "
+     "the real QQQ/VTI report's shape -- not the single-reason "
+     "shortcut that would trivially fit both sleeves in a top-3",
+     len(pg_big.block_reasons), 3)
+check("every one of SMA-PG's three reasons individually outnumbers "
+     "vwap's one reason (the actual condition that causes the bug)",
+     all(n > vwap_small.blocked for n in pg_big.block_reasons.values()),
+     True)
+
+blend2 = BlendedScorecard("Blend (VWAP+SMA-PG)", "TEST", vwap_small,
+                          pg_big, account2)
+merged_top3 = ", ".join(f"{r} x{n}"
+                        for r, n in blend2.block_reasons.most_common(3))
+check("confirms the BUG this fixes: a naive global top-3 over the "
+     "merged dict really does drop vwap's reason entirely when sma-pg "
+     "outnumbers it this much",
+     "vwap:" in merged_top3, False)
+
+summary = blend2.gate_summary()
+check("gate_summary() shows vwap's reason despite being vastly "
+     "outnumbered -- the actual fix",
+     "vwap: would exceed max_shares" in summary, True)
+check("gate_summary() ALSO still shows all three of sma-pg's reasons "
+     "(fixing vwap's visibility shouldn't cost sma-pg any of its own; "
+     "the sleeve label prefixes its whole group once, so this checks "
+     "for the reason text within that group, not a repeated prefix)",
+     "sma-pg:" in summary
+     and "would realize a loss x300" in summary
+     and "would exceed max_shares x250" in summary
+     and "notional" in summary, True)
+
+rep2 = comparison_report({"blend": blend2})
+check("comparison_report uses gate_summary() for cards that expose "
+     "it, so the printed report line -- not just the underlying "
+     "method -- actually shows both sleeves",
+     "vwap: would exceed max_shares x5" in rep2
+     and "sma-pg:" in rep2
+     and "would realize a loss x300" in rep2, True)
+
+# regression: a plain (non-blend) card's report line is UNCHANGED --
+# gate_summary() is opt-in via hasattr, not a behavior change for
+# every other row
+plain_lim = RiskLimits(require_market_hours=False, cooldown_s=0.0,
+                       max_shares=1, max_notional_e4=to_e4(100000.0))
+plain_card = ProfitGatedScorecard(
+    "SMA profit-gated",
+    policy=RiskPolicy(plain_lim, now_fn=HistoricalClock()))
+plain_card.policy._now_fn.set(T0)
+plain_card.on_signal(sig(SIDE_BUY, 100.00, "TEST"), t=T0)
+for _ in range(3):
+    plain_card.on_signal(sig(SIDE_BUY, 100.00, "TEST"), t=T0)
+check("a plain card has no gate_summary -- comparison_report() falls "
+     "back to its original global top-3 behavior, unchanged",
+     hasattr(plain_card, "gate_summary"), False)
+rep3 = comparison_report({"plain": plain_card})
+check("plain card's report line still renders correctly (no "
+     "regression from the hasattr branch)",
+     "would exceed max_shares" in rep3, True)
 
 print("=" * 46)
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

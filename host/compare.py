@@ -372,8 +372,17 @@ def comparison_report(cards: dict[str, StrategyScorecard]) -> str:
             # for whichever row happens to be labeled [LIVE] was a real
             # gap: in a backtest it hid exactly the diagnostic you'd
             # want most, for no real benefit even in a true live session.
-            top = ", ".join(f"{r} x{n}"
-                            for r, n in c.block_reasons.most_common(3))
+            # Cards that duck-type a richer gate_summary() (currently
+            # just BlendedScorecard) control their own reason
+            # breakdown instead of this generic global top-3 -- see
+            # BlendedScorecard.gate_summary()'s docstring for why a
+            # flat top-3 over a merged, sleeve-prefixed Counter can
+            # silently hide an entire sleeve's reasons.
+            if hasattr(c, "gate_summary"):
+                top = c.gate_summary()
+            else:
+                top = ", ".join(f"{r} x{n}"
+                                for r, n in c.block_reasons.most_common(3))
             lines.append(f"    {c.name} gated-away signals: {top}")
     trips = [c.trips for c in cards.values()]
     if trips and max(trips) < 20:
