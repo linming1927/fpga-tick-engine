@@ -309,3 +309,39 @@ undocumented property the ladder has). Verified end-to-end with real
 sim sessions through emulator -> bridge -> order manager, single-
 and multi-symbol. 10 new checks, 654 total across the host suite,
 0 failures.
+
+**v3.17** — first RTL of the VWAP bounce engine: rtl/vwap_engine.sv +
+rtl/sessctl.sv, verified standalone in simulation (1236 + 22 checks,
+0 failures; all five existing benches still green including rtl/*.sv
+glob compiles proving no conflicts). Built explicitly for the
+higher-volume data feed future: the ACCUMULATION plane (3-stage
+multiply/add pipeline; Σv, Σp·v, Σp²·v updated together for snapshot
+consistency) accepts a tick EVERY cycle indefinitely, and the
+EVALUATION plane (two serial restoring divides from a snapshot, ~196
+cycles ≈ 500k evaluations/sec at 100 MHz) COALESCES under burst with
+an eval_skips counter instead of corrupting — the current link tops
+out near 480 ticks/sec (24-byte frames at 115 200 baud), so there's
+three orders of magnitude of headroom before coalescing even begins,
+and past that the failure mode is documented decimation of the
+signal-check rate with exact sums, never wrong numbers. Two
+algorithmic choices worth remembering: the band test runs entirely in
+the SQUARED domain ((vwap-price)² vs k²·variance, K2_Q8 fixed-point
+parameter) so no sqrt core is needed, and the engine emits POSITION-
+INDEPENDENT edge events (bounce-buy 0x01 / revert-sell 0x02, SELL
+dominant on simultaneity) because fabric cannot know host position —
+the host mirror model must adopt this convention when the FPGA path
+goes live; the event stream deliberately differs from the host-only
+scorecard's position-gated stream. Session boundaries are HOST-
+COMMANDED (sessctl.sv, TYPE 0x11, slot-indexed or 0xFF broadcast,
+echo-is-the-ack — symcfg's exact pattern) rather than computed in
+fabric: the host knows the market calendar; hardware calendar logic
+would be new bug surface replicating what Python already does right.
+The bench's directed-bounce phase also recorded a real strategy
+subtlety the first run caught: a dive below the band drags vwap down
+AND inflates sigma, so a "recovery" price can land above the new vwap
+and correctly fire the SELL edge instead of the expected BUY —
+computed exactly against the integer model before fixing the test's
+choreography, not the DUT. NOT YET INTEGRATED: top_arty generate loop
+(8 instances), 3-way signal arbiter extension, host-side integer
+mirror model — that is the next drop, deliberately separate so the
+engine's standalone verification stands on its own.
