@@ -285,3 +285,27 @@ max_hold_days=None (unbounded) rendered its row as "max-hold Noned"
 (an f-string pasting None directly against "d") instead of
 "max-hold unbounded". 15 new checks, 644 total across the host
 suite, 0 failures.
+
+**v3.16** — VWAP bounce wired into the LIVE session (score-only): the
+strategy the multi-year QQQ/VTI backtests found consistently
+profitable (+$7,639 QQQ, +$1,780 VTI standalone, real 55-77% win
+rates) gets its real-market evaluation path ahead of any FPGA/RTL
+investment in it — the same score-first discipline every other
+strategy here went through. New `--vwap-bounce` / `--vwap-band-k`
+flags on order_manager.py; one scored row per configured symbol,
+each card with its own RiskPolicy clone, fed raw ticks by chaining
+onto br.on_echo exactly as the ladder does. Two wiring details that
+matter: (1) TRADE echoes only — on_echo fires for every echo kind
+including QUOTE echoes (0x82), and folding a quote's two-sided price
+into Σ(p·v)/Σ(v) would corrupt the session VWAP; this is the same
+accept filter the RTL applies and documents. (2) Timestamps are ET
+wall-clock, because the card's session boundary is "the ET calendar
+day changed" — the semantics the strategy is defined in. Honest
+restart limitation, stated in --help rather than discovered later: a
+mid-day restart resets this row's session VWAP and scored totals,
+because the scored-signal audit replay that restores EMA/
+profit-gated cannot rebuild tick-derived state (same true-but-
+undocumented property the ladder has). Verified end-to-end with real
+sim sessions through emulator -> bridge -> order manager, single-
+and multi-symbol. 10 new checks, 654 total across the host suite,
+0 failures.

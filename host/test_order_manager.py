@@ -710,6 +710,62 @@ check("--pg-max-hold-days 0 still disables the bound live, same as "
      "backtest.py's convention",
      out.startswith("gated"), True)
 
+# ---- v3.16: --vwap-bounce wired into the LIVE session (score-only) --
+# the strategy the multi-year QQQ/VTI backtests found consistently
+# profitable gets its real-market evaluation path: one scored row per
+# symbol, fed raw ticks via the same br.on_echo chaining the ladder
+# uses. The wiring details that matter (and that these checks pin):
+# TRADE echoes only (quote echoes would corrupt session VWAP), one
+# card per symbol with its own policy, and honest restart semantics
+# (tick-derived state starts fresh; it can't replay from the audit).
+print("[G17] --vwap-bounce wired into the live session, score-only")
+
+r = subprocess.run([sys.executable, ORDER_MANAGER_PY, "--help"],
+                   capture_output=True, text=True, timeout=30)
+check("--vwap-bounce is a real CLI flag", "--vwap-bounce" in r.stdout,
+      True)
+check("--vwap-band-k is a real CLI flag", "--vwap-band-k" in r.stdout,
+      True)
+check("help is explicit that the row is SCORE ONLY",
+      "SCORE ONLY" in r.stdout, True)
+check("help is honest about the restart limitation (tick-derived "
+     "state starts fresh; audit replay can't rebuild it)",
+     "start fresh" in r.stdout, True)
+
+# The echo-hook filter, tested directly at the unit level: a QUOTE
+# echo must not touch the card. Reproduces the exact hook logic
+# (filter + symbol routing) against a real card.
+from vwap_bounce_strategy import VWAPBounceScorecard
+from tick_protocol import TYPE_ECHO_TRADE, TYPE_ECHO_QUOTE
+
+vcard = VWAPBounceScorecard("VWAP bounce", symbol="SPY", live=False,
+                            policy=None)
+vwap_cards_t = {"SPY": vcard}
+
+def vwap_hook(fr):   # mirror of _on_echo_with_vwap's decision logic
+    if fr["type"] != TYPE_ECHO_TRADE:
+        return "filtered"
+    card = vwap_cards_t.get(fr["symbol"].strip())
+    if card is not None:
+        card.on_tick(datetime.now(ET), fr["price_e4"], fr["qty"])
+        return "fed"
+    return "wrong symbol"
+
+check("trade echo for our symbol feeds the card",
+      vwap_hook({"type": TYPE_ECHO_TRADE, "symbol": "SPY   ",
+                "price_e4": 4_000_000, "qty": 100}), "fed")
+check("card ingested it (session tick count advanced)",
+      vcard._n, 1)
+check("QUOTE echo is filtered out — quotes carry two-sided prices "
+     "and would corrupt session VWAP; same accept filter as the RTL",
+     vwap_hook({"type": TYPE_ECHO_QUOTE, "symbol": "SPY   ",
+               "price_e4": 4_000_100, "qty": 100}), "filtered")
+check("card did NOT ingest the quote", vcard._n, 1)
+check("other symbols' trades don't cross-feed this card",
+      vwap_hook({"type": TYPE_ECHO_TRADE, "symbol": "QQQ   ",
+                "price_e4": 3_000_000, "qty": 50}), "wrong symbol")
+check("card still at 1 tick", vcard._n, 1)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

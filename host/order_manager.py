@@ -680,6 +680,25 @@ def main():
                     "ladder_strategy").BASELINE_METHODS),
                     default="week_vwap",
                     help="how to compute each symbol's weekly baseline")
+    ap.add_argument("--vwap-bounce", action="store_true",
+                    help="also score the session-VWAP mean-reversion "
+                         "bounce strategy on live ticks (see "
+                         "vwap_bounce_strategy.py) — SCORE ONLY, never "
+                         "trades, regardless of --strategy. One scored "
+                         "row per configured symbol. This is the "
+                         "real-market evaluation step for the strategy "
+                         "the multi-year QQQ/VTI backtests found "
+                         "consistently profitable, ahead of any FPGA/RTL "
+                         "investment in it. NOTE: like the ladder, this "
+                         "consumes raw ticks (not verified signals), so "
+                         "its session VWAP and scored totals start fresh "
+                         "on every process start — a mid-day restart "
+                         "resets this row (the scored-signal audit "
+                         "replay that restores EMA/profit-gated cannot "
+                         "rebuild tick-derived state)")
+    ap.add_argument("--vwap-band-k", type=float, default=1.0,
+                    help="VWAP bounce band width in session standard "
+                         "deviations (default 1.0, matching backtest.py)")
     ap.add_argument("--profit-gate", action="store_true",
                     help="also score the SAME SMA crossover signals with "
                          "one added rule: a sell only executes if price "
@@ -845,6 +864,29 @@ def main():
             max_hold_days=pg_max_hold)
         cards["sma_pg"] = profit_gated
 
+    vwap_cards = {}
+    if args.vwap_bounce:
+        from vwap_bounce_strategy import VWAPBounceScorecard
+        # VWAPBounceScorecard is single-symbol by design (its session
+        # state — Σpv, Σv, Σp²v, band edge tracking — is per symbol),
+        # so a multi-symbol session gets one card per symbol, each with
+        # its OWN RiskPolicy clone (same limits), exactly like every
+        # other shadow row. Wall-clock policies: on_tick's historical-
+        # clock hook (hasattr _now_fn.set) is a no-op live, as intended.
+        for _sym in om.symbols:
+            _name = (f"VWAP bounce {_sym}" if len(om.symbols) > 1
+                     else "VWAP bounce")
+            _card = VWAPBounceScorecard(
+                _name, symbol=_sym, live=False,
+                policy=RiskPolicy(limits), band_k=args.vwap_band_k)
+            vwap_cards[_sym] = _card
+            cards[f"vwap_{_sym.lower()}"] = _card
+        print(f"[vwap] scoring session-VWAP bounce "
+             f"(k={args.vwap_band_k}) on: {', '.join(om.symbols)} — "
+             f"score-only; note: this row starts fresh each process "
+             f"start (tick-derived state can't replay from the audit "
+             f"log — see --help)")
+
     def route_to_shadow_cards(fr: dict, count: bool = True):
         """Feed a signal to whichever SCORED (non-live) cards should see
         it — the single routing rule used both for live signals
@@ -929,6 +971,33 @@ def main():
             if ev:
                 ladder.on_signal(ev)
         br.on_echo = _on_echo_with_ladder
+
+    if vwap_cards:
+        from tick_protocol import TYPE_ECHO_TRADE
+        # same chaining pattern as the ladder above — VWAP also consumes
+        # raw ticks, in parallel with whoever's already listening. Two
+        # deliberate differences from the ladder's hook:
+        #   * TRADE echoes only. on_echo fires for every echo kind,
+        #     including QUOTE echoes (0x82) — quotes carry two-sided
+        #     prices with different semantics, and folding them into
+        #     Σ(p·v)/Σ(v) would corrupt the session VWAP. This is the
+        #     same accept filter the RTL applies (TYPE_TRADE only) and
+        #     the same reason indicator_engine.sv documents for it.
+        #   * timestamps are ET wall-clock, because the card's session
+        #     boundary is "the ET calendar day changed" — the semantics
+        #     the strategy is defined in (backtests feed it the trade's
+        #     own exchange timestamp for the same reason).
+        _prev_echo_v = br.on_echo
+        def _on_echo_with_vwap(fr):
+            if _prev_echo_v:
+                _prev_echo_v(fr)
+            if fr["type"] != TYPE_ECHO_TRADE:
+                return
+            _card = vwap_cards.get(fr["symbol"].strip())
+            if _card is not None:
+                _card.on_tick(datetime.now(ET), fr["price_e4"],
+                              fr["qty"])
+        br.on_echo = _on_echo_with_vwap
 
     def on_verified(fr):
         strat = fr["strategy"]
