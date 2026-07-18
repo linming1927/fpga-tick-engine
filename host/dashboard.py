@@ -384,12 +384,19 @@ function drawChart(canvasId,series,signals){
     if(pt[3]){lo=Math.min(lo,pt[1],pt[2]);hi=Math.max(hi,pt[1],pt[2]);}
     if(pt[6]){lo=Math.min(lo,pt[4],pt[5]);hi=Math.max(hi,pt[4],pt[5]);}}
   const pad=(hi-lo)*0.08||1;lo-=pad;hi+=pad;
-  const X=i=>i/(series.length-1)*(W-46),Y=v=>H-8-(v-lo)/(hi-lo)*(H-16);
+  const X=i=>i/(series.length-1)*(W-60),Y=v=>H-8-(v-lo)/(hi-lo)*(H-16);
   g.strokeStyle='#232C38';g.fillStyle='#66788E';
   g.font='10px ui-monospace,monospace';g.textAlign='left';
   for(let k=0;k<4;k++){const v=lo+(hi-lo)*k/3,y=Y(v);
-    g.beginPath();g.moveTo(0,y);g.lineTo(W-46,y);g.stroke();
-    g.fillText((v/1e4).toFixed(2),W-42,y+3);}
+    g.beginPath();g.moveTo(0,y);g.lineTo(W-60,y);g.stroke();
+    // usd() (defined above), not a bare toFixed -- matches every other
+    // price on the page ($436.72, not 436.72). Gutter is 60px (was 46)
+    // specifically so a 4-digit price with cents ("$1234.56", ~48px at
+    // this font) has room to fully render instead of clipping against
+    // the canvas edge -- confirmed by measuring actual glyph widths,
+    // not guessed: the old 46px gutter gave "$436.72" alone only 42px,
+    // already tight, and cut off anything priced in four digits.
+    g.fillText(usd(v),W-56,y+3);}
   const line=(idx,color,wid,gate,dash)=>{g.strokeStyle=color;g.lineWidth=wid;
     g.setLineDash(dash||[]);g.beginPath();let started=false;
     series.forEach((pt,i)=>{if(gate>=0&&!pt[gate])return;

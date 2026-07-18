@@ -197,6 +197,57 @@ check("the GLOBAL table-facing list is independent of the per-symbol "
 
 dash.stop(); br.close(); emu.stop()
 
+# ---- v3.14: right-axis chart labels weren't showing real prices -- two
+# compounding bugs in the embedded chart JS: (1) bare toFixed(2) instead
+# of the usd() helper used everywhere else on the page, so labels read
+# "436.72" instead of "$436.72", and (2) even fixed, the reserved gutter
+# was too narrow to fit a $-prefixed label without clipping against the
+# canvas edge -- measured against the actual font ("$1234.56" is ~48px
+# at the page's 10px monospace, and the old 46px-wide gutter only gave
+# it 42px before the canvas boundary). This is a structural test, not a
+# rendered-pixel one: this test suite is pure Python with no other
+# dependency on node or a canvas library anywhere, so it parses the
+# PAGE source the server actually ships rather than executing the JS.
+print("\n[G_axis] right-axis chart labels: $-formatted and wide enough "
+     "not to clip")
+import re
+from dashboard import PAGE
+m = re.search(r"function drawChart.*?\n}\n", PAGE, re.S)
+check("drawChart() is present in the served page", m is not None, True)
+draw_src = m.group(0)
+
+fill_line = [l for l in draw_src.splitlines() if "fillText(usd" in l
+            or "fillText((v" in l]
+check("exactly one axis-label fillText call found", len(fill_line), 1)
+check("axis label uses usd() -- matches every other price on the page "
+     "($436.72), not a bare number (436.72, the actual reported bug)",
+     "fillText(usd(v)" in fill_line[0] if fill_line else False, True)
+
+x_gutter_m = re.search(r"X=i=>i/\(series\.length-1\)\*\(W-(\d+)\)", draw_src)
+grid_gutter_m = re.search(r"moveTo\(0,y\);g\.lineTo\(W-(\d+),y\)", draw_src)
+label_offset_m = re.search(r"fillText\(usd\(v\),W-(\d+)", draw_src)
+check("X() gutter found", x_gutter_m is not None, True)
+check("gridline gutter found", grid_gutter_m is not None, True)
+check("label offset found", label_offset_m is not None, True)
+x_gutter = int(x_gutter_m.group(1)) if x_gutter_m else -1
+grid_gutter = int(grid_gutter_m.group(1)) if grid_gutter_m else -2
+label_offset = int(label_offset_m.group(1)) if label_offset_m else -1
+check("X() and the gridline endpoint agree on ONE gutter width (no "
+     "mismatched constant left over from a partial edit)",
+     x_gutter, grid_gutter)
+gutter = x_gutter
+# same measured-not-guessed budget as the manual verification: "$1234.56"
+# is ~48px at this font; require the gutter leave it real margin, not
+# just barely fit
+check(f"gutter ({gutter}px) leaves a 4-digit dollar price "
+     f"(~48px rendered) comfortable margin before the canvas edge",
+     gutter >= 56, True)
+check("label starts 4px inside the gutter boundary (X()'s plot area "
+     "and the gridline both stop at W-gutter; the label sitting exactly "
+     "4px further right, same margin convention as the original code, "
+     "not flush against the plotted line)",
+     gutter - label_offset, 4)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

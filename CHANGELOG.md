@@ -243,3 +243,26 @@ real wall-clock fallback (`datetime.now(ET)`, no `HistoricalClock`
 injected) — the actual configuration `order_manager.py`'s live row
 uses, as opposed to every existing test's backtest-style historical
 clock. 8 new checks, 623 total across the host suite, 0 failures.
+
+**v3.14** — fixed the reported bug: both tick-graph canvases' right
+axis wasn't showing real prices. Root cause was two compounding
+issues in the embedded chart JS, found by extracting drawChart() into
+an offline node-canvas harness and rendering it against realistic
+tick data rather than guessing from reading the code: (1) the axis
+label used a bare `(v/1e4).toFixed(2)` instead of the page's own
+`usd()` helper, so it rendered "436.72" instead of "$436.72" like
+every other price on the page, and (2) even fixed, the 46px gutter
+reserved for the label was too narrow — measuring actual glyph widths
+at the page's 10px monospace font, "$436.72" alone is ~42px (already
+flush against the edge) and any 4-digit price ("$1234.56", ~48px)
+would visibly clip. Gutter widened to 60px (confirmed against three
+scenarios: a normal 3-digit price, a 4-digit price, and a narrow
+mobile-width panel — all fit with real margin now, not just barely).
+New structural regression test in test_dashboard.py parses the
+served PAGE source directly (this suite has zero JS/node dependency
+elsewhere, so the test stays pure Python rather than introducing one)
+and confirms: the label calls usd(), the gutter is wide enough, and
+X()/the gridline agree on one consistent constant. Verified the new
+test actually catches the original bug by reverting the fix and
+confirming it fails, then restoring it. 9 new checks, 632 total
+across the host suite, 0 failures.
