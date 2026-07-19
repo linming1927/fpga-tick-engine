@@ -345,3 +345,38 @@ choreography, not the DUT. NOT YET INTEGRATED: top_arty generate loop
 (8 instances), 3-way signal arbiter extension, host-side integer
 mirror model — that is the next drop, deliberately separate so the
 engine's standalone verification stands on its own.
+
+**v3.18** — VWAP engine integrated into top_arty: 8 per-slot instances
+in the generate loop (VWAP_WARMUP / VWAP_K2_Q8 top-level parameters),
+sessctl wired into the frame bus (TYPE 0x11 -> per-slot sess_rst
+pulses, echoed as 0x91 = the host's ack), and the same-cycle signal
+arbiter extended from 2-way/1-deep-pend to 3-way/2-deep-pend-queue
+(priority SMA > EMA > VWAP, matching the existing SMA-first
+convention). VWAP record type 0x05 (wire 0x85) reuses the two 32-bit
+indicator payload fields for the session vwap at the evaluated
+snapshot (the host verifier's cross-check value) and the engine's
+eval_skips counter — saturation observability riding along in a field
+that would otherwise be zero. The new pend queue also closes a latent
+gap in the old 2-way arbiter (a pended record could in principle be
+silently overwritten by a new collision on the very next cycle —
+impossible at real tick spacing, but now impossible by construction
+AND counted if it ever happens: pend_drop_count). New
+tb_vwap_integration.sv drives the ACTUAL UART waveform through the
+real parser/sessctl/engine/arbiter/frame_tx/uart_tx path: slot config
+ack, 0x91 session-reset ack, warm-up with zero events, a directed
+dive-bounce firing exactly one 0x85 BUY whose vwap field matches an
+independent integer mirror, the SELL edge, a second reset proving
+state really clears, and SMA crossovers still arriving as 0x83
+through the 3-way arbiter — 22 checks. Two bench-authoring lessons
+recorded in comments: the original drain-wait returned mid-frame (40
+clock cycles of idle line is SHORTER than one stop bit at this baud),
+and an alternating warm-up tape legitimately fires a SELL on the
+first post-priming up-tick because it crosses vwap every tick — both
+found because the DUT was right and the bench was wrong, verified
+tick-by-tick against the integer model before touching either. All
+eight RTL benches green (4117 checks total); host suite untouched at
+654. BITSTREAM NOTE: this drop is synthesizable and IS the point
+where a rebuild becomes meaningful — but hold the flash until the
+host-side drop lands (0x85 parsing + bridge.py integer mirror +
+verifier), because the current host misfiles unknown 0x85 frames as
+echoes, where an unfiltered ladder hook would ingest their prices.

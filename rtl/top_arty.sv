@@ -52,7 +52,13 @@ module top_arty #(
     parameter int          SLOW_N         = 32,      // slow SMA window (pow 2)
     parameter int          EMA_KF         = 3,       // fast EMA: alpha 2^-KF
     parameter int          EMA_KS         = 5,       // slow EMA: alpha 2^-KS
-    parameter int          EMA_WARMUP     = 32       // = SLOW_N: fair start
+    parameter int          EMA_WARMUP     = 32,      // = SLOW_N: fair start
+    parameter int          VWAP_WARMUP    = 20,      // ticks before VWAP
+                                                     // events (host default
+                                                     // min_session_ticks)
+    parameter int          VWAP_K2_Q8     = 256      // band k² in Q8:
+                                                     // 256 = k of 1.0
+                                                     // (host default)
 )(
     input  wire  logic       clk100,        // 100 MHz board oscillator (E3)
     input  wire  logic       ck_rst,        // red RESET button, ACTIVE LOW (C2)
@@ -208,13 +214,39 @@ module top_arty #(
         .slots_flat ( slots_flat  )
     );
 
-    logic [7:0]  sma_v_a, ema_v_a;
+    logic [7:0]  sma_v_a, ema_v_a, vwap_v_a;
     logic [47:0] sma_sym_a [0:7];   logic [47:0] ema_sym_a [0:7];
     logic [7:0]  sma_side_a [0:7];  logic [7:0]  ema_side_a [0:7];
     logic [31:0] sma_price_a [0:7]; logic [31:0] ema_price_a [0:7];
     logic [63:0] sma_fts_a [0:7];   logic [63:0] ema_fts_a [0:7];
     logic [31:0] sma_f_a [0:7], sma_s_a [0:7];
     logic [31:0] ema_f_a [0:7], ema_s_a [0:7];
+    logic [47:0] vwap_sym_a [0:7];
+    logic [7:0]  vwap_side_a [0:7];
+    logic [31:0] vwap_price_a [0:7];
+    logic [63:0] vwap_fts_a [0:7];
+    logic [31:0] vwap_q_a [0:7];      // vwap at signal time (verification)
+    logic [31:0] vwap_skips_a [0:7];  // coalesced-tick counter (saturation
+                                      // observability — see vwap_engine.sv)
+
+    //-------------------------------------------------------------------------
+    // v3: host-commanded session boundary for the VWAP engines (TYPE 0x11
+    // -> per-slot 1-cycle pulses; see sessctl.sv for why the HOST owns the
+    // market calendar and the fabric deliberately does not). Fed from the
+    // same registered tick_* bus as symcfg; the frame's echo (wire 0x91)
+    // is the host's acknowledgement, through the same path as data.
+    //-------------------------------------------------------------------------
+    logic [7:0] sess_rst;
+
+    sessctl u_sessctl (
+        .clk        ( clk100      ),
+        .rst_n      ( rst_n       ),
+        .tick_valid ( tick_valid  ),
+        .msg_type   ( tick_type   ),
+        .qty        ( tick_qty    ),
+        .side       ( tick_side   ),
+        .sess_rst   ( sess_rst    )
+    );
 
     generate
         for (genvar g = 0; g < 8; g++) begin : g_engines
@@ -251,18 +283,57 @@ module top_arty #(
                 .ema_fast(ema_f_a[g]), .ema_slow(ema_s_a[g]),
                 .emas_valid()
             );
+            vwap_engine #(
+                .WARMUP_N ( VWAP_WARMUP ),
+                .K2_Q8    ( VWAP_K2_Q8  )
+            ) u_vwap (
+                .clk(clk100), .rst_n(rst_n),
+                .target_symbol ( slots_flat[g*48 +: 48] ),
+                .slot_en       ( slot_valid[g] ),
+                .state_rst     ( slot_wr[g]    ),
+                .sess_rst      ( sess_rst[g]   ),
+                .tick_valid(tick_valid), .msg_type(tick_type),
+                .symbol(tick_symbol), .price(tick_price),
+                .qty(tick_qty),
+                .host_ts(tick_host_ts), .fpga_ts(tick_fpga_ts),
+                .signal_valid(vwap_v_a[g]), .signal_symbol(vwap_sym_a[g]),
+                .signal_side(vwap_side_a[g]), .signal_price(vwap_price_a[g]),
+                .signal_host_ts(), .signal_fpga_ts(vwap_fts_a[g]),
+                .vwap_out(vwap_q_a[g]), .vwap_valid(),
+                .eval_skips(vwap_skips_a[g])
+            );
         end
     endgenerate
 
     //-------------------------------------------------------------------------
     // Per-strategy lowest-slot priority encoder -> one record per strategy,
-    // then the existing SMA-vs-EMA same-cycle pend arbiter (unchanged logic,
-    // wider records: REC_W = 8+48+32+16+8+64+64 = 240).
+    // then a 3-way same-cycle arbiter (v3: was SMA-vs-EMA 2-way with a
+    // 1-deep pend register; VWAP makes worst-case simultaneity 3 records
+    // in one cycle, so the pend side is now a 2-deep queue).
+    //
+    // VWAP record type 0x05 (wire 0x85 after frame_tx's 0x80 OR). Payload
+    // reuses the two 32-bit indicator fields: the session vwap at the
+    // evaluated snapshot (the host verifier's cross-check value) and the
+    // engine's eval_skips counter (saturation observability, riding along
+    // for free in a field that would otherwise be zero).
+    //
+    // Timing note, for honesty about how often 3-way collisions happen:
+    // SMA and EMA evaluate combinationally against the same tick and fire
+    // on the SAME cycle as each other; a VWAP evaluation takes ~196 cycles
+    // after its tick, so a VWAP signal only lands on an SMA/EMA cycle when
+    // ticks arrive close together (bursts). The arbiter handles every
+    // combination regardless — new signals always outrank the queue for
+    // the FIFO write slot, queue overflow is impossible by construction
+    // at real tick spacing (records drain within 2 idle cycles, ticks are
+    // >2000 cycles apart even at the fastest link), and if the impossible
+    // happens anyway it is COUNTED (pend_drop_count), never silent. (The
+    // old 2-way pend could in principle overwrite silently; the queue
+    // closes that gap for all three strategies.)
     //-------------------------------------------------------------------------
     localparam int REC_W = 240;
 
-    logic             signal_valid, ema_sig_valid;
-    logic [REC_W-1:0] sma_rec, ema_rec;
+    logic             signal_valid, ema_sig_valid, vwap_sig_valid;
+    logic [REC_W-1:0] sma_rec, ema_rec, vwap_rec;
 
     always_comb begin
         signal_valid = |sma_v_a;
@@ -279,34 +350,117 @@ module top_arty #(
                 ema_rec = { 8'h04, ema_sym_a[i], ema_price_a[i],
                             16'h0000, ema_side_a[i],
                             ema_f_a[i], ema_s_a[i], ema_fts_a[i] };
+        vwap_sig_valid = |vwap_v_a;
+        vwap_rec = '0;
+        for (int i = 7; i >= 0; i--)
+            if (vwap_v_a[i])
+                vwap_rec = { 8'h05, vwap_sym_a[i], vwap_price_a[i],
+                             16'h0000, vwap_side_a[i],
+                             vwap_q_a[i], vwap_skips_a[i], vwap_fts_a[i] };
     end
 
     logic [REC_W-1:0] sig_rd_data;
     logic             sig_full, sig_empty, sig_rd_en;
 
-    logic             pend_v;
-    logic [REC_W-1:0] pend_d;
+    // 2-deep pend queue: q0 is the head (drains first)
+    logic             pend_v0, pend_v1;
+    logic [REC_W-1:0] pend_d0, pend_d1;
     logic             sig_wr_en;
     logic [REC_W-1:0] sig_wr_data;
 
+    (* mark_debug = "true" *) logic [15:0] pend_drop_count;
+
+    // this cycle's new records, priority-packed (SMA > EMA > VWAP —
+    // extending the existing SMA-first convention)
+    logic [1:0]       new_cnt;
+    logic [REC_W-1:0] new_first, new_second, new_third;
+
     always_comb begin
-        if (signal_valid)        begin sig_wr_en = 1'b1; sig_wr_data = sma_rec; end
-        else if (ema_sig_valid)  begin sig_wr_en = 1'b1; sig_wr_data = ema_rec; end
-        else if (pend_v)         begin sig_wr_en = 1'b1; sig_wr_data = pend_d;  end
-        else                     begin sig_wr_en = 1'b0; sig_wr_data = '0;      end
+        new_cnt    = 2'd0;
+        new_first  = '0;
+        new_second = '0;
+        new_third  = '0;
+        if (signal_valid) begin
+            new_first = sma_rec;
+            new_cnt   = 2'd1;
+            if (ema_sig_valid) begin
+                new_second = ema_rec;
+                new_cnt    = 2'd2;
+                if (vwap_sig_valid) begin
+                    new_third = vwap_rec;
+                    new_cnt   = 2'd3;
+                end
+            end else if (vwap_sig_valid) begin
+                new_second = vwap_rec;
+                new_cnt    = 2'd2;
+            end
+        end else if (ema_sig_valid) begin
+            new_first = ema_rec;
+            new_cnt   = 2'd1;
+            if (vwap_sig_valid) begin
+                new_second = vwap_rec;
+                new_cnt    = 2'd2;
+            end
+        end else if (vwap_sig_valid) begin
+            new_first = vwap_rec;
+            new_cnt   = 2'd1;
+        end
+    end
+
+    // FIFO write: newest first (same rule as before), else queue head
+    always_comb begin
+        if (new_cnt != 2'd0) begin
+            sig_wr_en   = 1'b1;
+            sig_wr_data = new_first;
+        end else if (pend_v0) begin
+            sig_wr_en   = 1'b1;
+            sig_wr_data = pend_d0;
+        end else begin
+            sig_wr_en   = 1'b0;
+            sig_wr_data = '0;
+        end
     end
 
     always_ff @(posedge clk100) begin
         if (!rst_n) begin
-            pend_v <= 1'b0;
-            pend_d <= '0;
+            pend_v0 <= 1'b0; pend_v1 <= 1'b0;
+            pend_d0 <= '0;   pend_d1 <= '0;
+            pend_drop_count <= '0;
         end else begin
-            if (signal_valid && ema_sig_valid) begin
-                pend_v <= 1'b1;
-                pend_d <= ema_rec;
-            end else if (pend_v && !signal_valid && !ema_sig_valid) begin
-                pend_v <= 1'b0;
-            end
+            unique case (new_cnt)
+                2'd0: begin
+                    // idle cycle drains the queue head into the FIFO
+                    if (pend_v0) begin
+                        pend_v0 <= pend_v1;
+                        pend_d0 <= pend_d1;
+                        pend_v1 <= 1'b0;
+                    end
+                end
+                2'd1: begin
+                    // new record took the write slot; queue unchanged
+                end
+                2'd2: begin
+                    // one loser enqueues
+                    if (!pend_v0) begin
+                        pend_v0 <= 1'b1; pend_d0 <= new_second;
+                    end else if (!pend_v1) begin
+                        pend_v1 <= 1'b1; pend_d1 <= new_second;
+                    end else if (pend_drop_count != 16'hFFFF)
+                        pend_drop_count <= pend_drop_count + 1'b1;
+                end
+                2'd3: begin
+                    // two losers enqueue in priority order
+                    if (!pend_v0) begin
+                        pend_v0 <= 1'b1; pend_d0 <= new_second;
+                        pend_v1 <= 1'b1; pend_d1 <= new_third;
+                    end else if (!pend_v1) begin
+                        pend_v1 <= 1'b1; pend_d1 <= new_second;
+                        if (pend_drop_count != 16'hFFFF)
+                            pend_drop_count <= pend_drop_count + 1'b1;
+                    end else if (pend_drop_count != 16'hFFFE)
+                        pend_drop_count <= pend_drop_count + 2'd2;
+                end
+            endcase
         end
     end
 
