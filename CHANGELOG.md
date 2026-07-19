@@ -419,3 +419,28 @@ gap concrete), and dashboard.on_signal no longer KeyErrors on vwap
 frames (vwap maps into the "fast" column as the cross-check value;
 null fields render as a dash, not $NaN). 30 new checks; 684 total
 across the host suite, 0 failures.
+
+**v3.20** — timing closure for the VWAP engine. First synthesis of the
+v3.18 bitstream failed at 100 MHz: WNS -7.437 ns, ~13.4k failing
+endpoints (wide arithmetic cones replicated 8x, one per slot). Two
+causes, both invisible in simulation: (1) EV_DECIDE chained vwap²
+(32x32), the variance subtract, diff² (a second 32x32), the threshold
+scale, and two 64-bit compares in ONE combinational cycle — two
+cascaded 32x32 multiplies alone exceed a 10 ns budget on Artix-7;
+(2) the accumulation multiplies had no registers around them, so
+synthesis could not use the DSP48's internal MREG/PREG pipeline
+registers. Fix is structural and free — the evaluation has a
+~200,000-cycle budget per tick at any realistic link rate: the
+decision now does ONE operation per FSM state (MSQ -> VSQ -> VAR ->
+THR -> EMIT, +4 cycles), and the accumulation pipeline gained an
+operand-register stage (A0 operands -> A1 products -> A2 second
+product -> A3 accumulate) so every multiply has registered inputs
+AND outputs — still one tick per cycle throughput, it is a straight
+pipeline with no stalls. Total cost ~5 cycles out of ~200,000. Zero
+behavioral change, proven: all 1236 tb_vwap checks, the 22-check
+bit-level integration bench, and every other bench pass unchanged
+(4117 RTL checks total); the three mirror implementations (RTL, SV
+bench model, tick_protocol.VWAPMirror) agree exactly as before. The
+lesson is recorded in the engine header's new "Timing closure"
+section. Only rtl/vwap_engine.sv changed; host suite untouched at
+684.

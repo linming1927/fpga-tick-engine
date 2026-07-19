@@ -94,6 +94,28 @@
 // parameter default matches). The first completed evaluation after warm-up
 // PRIMES the edge state without firing — same rule, same reason, as the
 // SMA and EMA engines (see indicator_engine.sv header).
+// ---- Timing closure (the v3.20 lesson) --------------------------------------
+// The first synthesis of this engine FAILED timing at 100 MHz with
+// WNS -7.4 ns across ~13k endpoints. Two causes, both invisible in
+// simulation and obvious in hindsight:
+//   1. EV_DECIDE chained vwap² (32x32), the variance subtract, diff²
+//      (another 32x32), the threshold scale, and two 64-bit compares in
+//      ONE combinational cycle — two cascaded 32x32 multiplies alone
+//      exceed a 10 ns budget on Artix-7.
+//   2. The accumulation multiplies (p·q, p·p, p²·q) had no registers
+//      around them, so synthesis could not use the DSP48's internal
+//      MREG/PREG pipeline registers.
+// The fix is structural and free: the evaluation has a ~200,000-cycle
+// budget per tick at any realistic link rate, so the decision now does
+// ONE operation per FSM state (MSQ -> VSQ -> VAR -> THR -> EMIT, +4
+// cycles), and the accumulation pipeline gained an operand-register
+// stage so every multiply has registered inputs AND outputs (A0 operands
+// -> A1 products -> A2 second product -> A3 accumulate, still one tick
+// per cycle throughput — it is a straight pipeline, no stalls). Total
+// cost: ~5 cycles out of ~200,000. Zero behavioral change: the same
+// integer math in the same order; all three mirror implementations
+// (this RTL, tb_vwap.sv's model, tick_protocol.VWAPMirror) agree
+// unchanged.
 //-----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 `default_nettype none
@@ -158,8 +180,20 @@ module vwap_engine #(
     assign clear = state_rst | sess_rst;
 
     //-------------------------------------------------------------------------
-    // Accumulation plane — a tick every cycle, forever.
+    // Accumulation plane — a tick every cycle, forever. Four stages so
+    // every multiply has REGISTERED operands and REGISTERED results
+    // (DSP48 MREG/PREG inference — see the timing-closure header note):
+    //   A0: register operands + metadata
+    //   A1: register products  pq = p·q (32x16), pp = p·p (32x32)
+    //   A2: register product   ppq = pp·q (64x16); carry pq
+    //   A3: the three accumulator adds, together (snapshot consistency)
     //-------------------------------------------------------------------------
+    logic        a0_v;
+    logic [31:0] a0_price;
+    logic [15:0] a0_qty;
+    logic [47:0] a0_sym;
+    logic [63:0] a0_hts, a0_fts;
+
     logic        a1_v;
     logic [47:0] a1_pq;
     logic [63:0] a1_pp;
@@ -188,7 +222,9 @@ module vwap_engine #(
 
     always_ff @(posedge clk) begin
         if (!rst_n || clear) begin
-            a1_v <= 1'b0; a2_v <= 1'b0; a3_done <= 1'b0;
+            a0_v <= 1'b0; a1_v <= 1'b0; a2_v <= 1'b0; a3_done <= 1'b0;
+            a0_price <= '0; a0_qty <= '0; a0_sym <= '0;
+            a0_hts <= '0; a0_fts <= '0;
             a1_pq <= '0; a1_pp <= '0; a1_qty <= '0; a1_price <= '0;
             a1_sym <= '0; a1_hts <= '0; a1_fts <= '0;
             a2_ppq <= '0; a2_pq <= '0; a2_qty <= '0; a2_price <= '0;
@@ -197,16 +233,27 @@ module vwap_engine #(
             sum_v <= '0; sum_pv <= '0; sum_ppv <= '0;
             sess_ticks <= '0;
         end else begin
-            a1_v <= accept;
+            // A0: operand registers
+            a0_v <= accept;
             if (accept) begin
-                a1_pq    <= 48'(price) * 48'(qty);
-                a1_pp    <= 64'(price) * 64'(price);
-                a1_qty   <= qty;
-                a1_price <= price;
-                a1_sym   <= symbol;
-                a1_hts   <= host_ts;
-                a1_fts   <= fpga_ts;
+                a0_price <= price;
+                a0_qty   <= qty;
+                a0_sym   <= symbol;
+                a0_hts   <= host_ts;
+                a0_fts   <= fpga_ts;
             end
+            // A1: first products, from registered operands
+            a1_v <= a0_v;
+            if (a0_v) begin
+                a1_pq    <= 48'(a0_price) * 48'(a0_qty);
+                a1_pp    <= 64'(a0_price) * 64'(a0_price);
+                a1_qty   <= a0_qty;
+                a1_price <= a0_price;
+                a1_sym   <= a0_sym;
+                a1_hts   <= a0_hts;
+                a1_fts   <= a0_fts;
+            end
+            // A2: second product, from a registered product
             a2_v <= a1_v;
             if (a1_v) begin
                 a2_ppq   <= 80'(a1_pp) * 80'(a1_qty);
@@ -217,6 +264,7 @@ module vwap_engine #(
                 a2_hts   <= a1_hts;
                 a2_fts   <= a1_fts;
             end
+            // A3 — the one place the sums change, all three together
             a3_done <= a2_v;
             if (a2_v) begin
                 sum_v      <= sum_v   + V_W'(a2_qty);
@@ -234,19 +282,25 @@ module vwap_engine #(
     assign vwap_valid = (sess_ticks >= WARMUP_N);
 
     //-------------------------------------------------------------------------
-    // Evaluation plane — snapshot, two serial divides, one decision.
+    // Evaluation plane — snapshot, two serial divides, then ONE operation
+    // per state (the timing-closure restructure; see header):
     //
     //   EV_IDLE   : wait for an unevaluated tick; snapshot sums + identity
     //   EV_DIV1   : DIV_N restoring-division steps  (vwap = Σpv / Σv)
     //   EV_LATCH1 : capture quotient 1, load dividend 2
     //   EV_DIV2   : DIV_N steps                     (msq  = Σppv / Σv)
-    //   EV_DECIDE : capture quotient 2; band test, edges, maybe fire
+    //   EV_MSQ    : register quotient 2
+    //   EV_VSQ    : register vwap² (32x32, its own cycle), diff, above
+    //   EV_VAR    : register variance (clamped) and diff² (32x32)
+    //   EV_THR    : register the band threshold (K2_Q8·variance)»8
+    //   EV_EMIT   : compares + edge logic + fire (ALU-only cycle)
     //
     // Divide-by-zero guard: the wire format allows qty=0 frames, so sum_v
     // can be zero even after accepted ticks. sum_v==0 skips evaluation.
     //-------------------------------------------------------------------------
-    typedef enum logic [2:0]
-        { EV_IDLE, EV_DIV1, EV_LATCH1, EV_DIV2, EV_DECIDE } ev_state_t;
+    typedef enum logic [3:0]
+        { EV_IDLE, EV_DIV1, EV_LATCH1, EV_DIV2,
+          EV_MSQ, EV_VSQ, EV_VAR, EV_THR, EV_EMIT } ev_state_t;
     ev_state_t ev;
 
     // snapshot
@@ -269,31 +323,18 @@ module vwap_engine #(
     logic [DIV_N-1:0] div_x;
     logic [CW-1:0]    div_i;
 
-    logic [31:0] q_vwap;
+    // staged decision registers (one multiply or ALU op per state)
+    logic [31:0] q_vwap;       // EV_LATCH1
+    logic [63:0] q_msq;        // EV_MSQ
+    logic [63:0] vwap_sq;      // EV_VSQ  (32x32)
+    logic [31:0] diff;         // EV_VSQ
+    logic        above_now;    // EV_VSQ
+    logic [63:0] variance;     // EV_VAR
+    logic [63:0] diff_sq;      // EV_VAR  (32x32)
+    logic [71:0] thr;          // EV_THR  (const-scale + shift)
 
     // edge state
     logic below_prev, above_prev, primed;
-
-    // decision arithmetic (combinational; q_msq comes straight off div_q
-    // in EV_DECIDE, q_vwap was registered in EV_LATCH1)
-    logic [63:0] q_msq_c;
-    logic [63:0] vwap_sq;
-    logic [63:0] variance;
-    logic [31:0] diff;
-    logic [63:0] diff_sq;
-    logic [71:0] thr_wide;
-    logic        below_now, above_now;
-
-    always_comb begin
-        q_msq_c   = 64'(div_q);
-        vwap_sq   = 64'(q_vwap) * 64'(q_vwap);
-        variance  = (q_msq_c >= vwap_sq) ? (q_msq_c - vwap_sq) : 64'd0;
-        diff      = (s_price < q_vwap) ? (q_vwap - s_price) : 32'd0;
-        diff_sq   = 64'(diff) * 64'(diff);
-        thr_wide  = 72'(variance) * 72'(K2_Q8);
-        below_now = (s_price < q_vwap) && (diff_sq > 64'(thr_wide >> 8));
-        above_now = (s_price >= q_vwap);
-    end
 
     // one restoring-division step (shared by both divide states)
     logic [V_W:0] r_shift, r_sub;
@@ -301,6 +342,10 @@ module vwap_engine #(
         r_shift = { div_r[V_W-1:0], div_x[DIV_N-1] };
         r_sub   = r_shift - {1'b0, s_den};
     end
+
+    logic below_now;           // EV_EMIT: two compares, ALU-only
+    always_comb
+        below_now = (diff != 32'd0) && ({8'd0, diff_sq} > thr);
 
     always_ff @(posedge clk) begin
         if (!rst_n || clear) begin
@@ -311,7 +356,9 @@ module vwap_engine #(
             s_price <= '0; s_sym <= '0; s_hts <= '0; s_fts <= '0;
             s_warm <= 1'b0;
             div_q <= '0; div_r <= '0; div_x <= '0; div_i <= '0;
-            q_vwap <= '0;
+            q_vwap <= '0; q_msq <= '0;
+            vwap_sq <= '0; diff <= '0; above_now <= 1'b0;
+            variance <= '0; diff_sq <= '0; thr <= '0;
             below_prev <= 1'b0; above_prev <= 1'b0; primed <= 1'b0;
             signal_valid <= 1'b0; signal_symbol <= '0; signal_side <= '0;
             signal_price <= '0; signal_host_ts <= '0; signal_fpga_ts <= '0;
@@ -336,10 +383,6 @@ module vwap_engine #(
 
             unique case (ev)
                 EV_IDLE: begin
-                    // note: reads pend_v as latched LAST cycle; the same-
-                    // cycle a3_done path above lands in pend_* this edge
-                    // and starts next cycle — one dead cycle, irrelevant
-                    // against a 192-cycle evaluation.
                     if (pend_v) begin
                         if (sum_v != '0) begin
                             s_den   <= sum_v;
@@ -396,12 +439,42 @@ module vwap_engine #(
                     div_x <= { div_x[DIV_N-2:0], 1'b0 };
                     if (div_i == CW'(DIV_N-1)) begin
                         div_i <= '0;
-                        ev    <= EV_DECIDE;
+                        ev    <= EV_MSQ;
                     end else
                         div_i <= div_i + 1'b1;
                 end
 
-                EV_DECIDE: begin
+                EV_MSQ: begin
+                    q_msq <= 64'(div_q);
+                    ev    <= EV_VSQ;
+                end
+
+                EV_VSQ: begin
+                    // the 32x32 multiply gets its own registered cycle
+                    vwap_sq   <= 64'(q_vwap) * 64'(q_vwap);
+                    diff      <= (s_price < q_vwap) ? (q_vwap - s_price)
+                                                    : 32'd0;
+                    above_now <= (s_price >= q_vwap);
+                    ev        <= EV_VAR;
+                end
+
+                EV_VAR: begin
+                    // clamped variance (ALU) + the second 32x32 multiply
+                    variance <= (q_msq >= vwap_sq) ? (q_msq - vwap_sq)
+                                                   : 64'd0;
+                    diff_sq  <= 64'(diff) * 64'(diff);
+                    ev       <= EV_THR;
+                end
+
+                EV_THR: begin
+                    // K2_Q8 is a parameter (default 256 -> pure shift);
+                    // a non-power-of-2 k² becomes a real multiply and
+                    // still gets this whole cycle to itself
+                    thr <= (72'(variance) * 72'(K2_Q8)) >> 8;
+                    ev  <= EV_EMIT;
+                end
+
+                EV_EMIT: begin
                     vwap_out <= q_vwap;
                     if (s_warm) begin
                         if (primed) begin
