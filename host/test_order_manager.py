@@ -766,6 +766,60 @@ check("other symbols' trades don't cross-feed this card",
                 "price_e4": 3_000_000, "qty": 50}), "wrong symbol")
 check("card still at 1 tick", vcard._n, 1)
 
+# ---- v3.19: verified FABRIC vwap signals route without crashing -----
+# The on_verified/route_to_shadow_cards indexing (cards[strat]) had no
+# "vwap_bounce" key — the FIRST hardware VWAP signal would have been a
+# KeyError crash in the live session. Covered end to end: an emulator
+# that now emits 0x85, a bridge that verifies it, and an OM whose
+# routing must land it in a per-symbol VWAP-FPGA scored row.
+print("[G18] verified fabric-VWAP signals route to a scored row "
+     "(the cards['vwap_bounce'] KeyError path), ladder filters quotes")
+
+r = subprocess.run(
+    [sys.executable, "-c", '''
+import sys, time, subprocess
+sys.path.insert(0, ".")
+from fpga_emulator import FPGAEmulator
+emu = FPGAEmulator(symbol="SPY", fast_n=4, slow_n=8)
+port = emu.start()
+r = subprocess.run(
+    [sys.executable, "order_manager.py", "--port", port,
+     "--source", "sim", "--broker", "mock", "--cooldown", "0",
+     "--n", "600", "--rate", "200", "--fast", "4", "--slow", "8",
+     "--audit", "/tmp/g18_audit.jsonl"],
+    capture_output=True, text=True, timeout=110)
+emu.stop()
+print(r.stdout)
+sys.exit(r.returncode)
+'''],
+    capture_output=True, text=True, timeout=140)
+check("session with fabric-VWAP signals exits cleanly (no KeyError)",
+      r.returncode, 0)
+check("the startup session reset was acked",
+      "session reset ACK" in r.stdout, True)
+g18_has_sig = "FPGA[vwap_bounce]" in r.stdout
+check("the emulated fabric emitted at least one vwap signal on the "
+     "random-walk tape (tape-dependent but overwhelmingly likely at "
+     "600 ticks; if this ever flakes, the routing checks below are "
+     "the load-bearing ones)",
+     g18_has_sig, True)
+if g18_has_sig:
+    check("it was VERIFIED against the host mirror",
+          "verified: FPGA vwap" in r.stdout, True)
+    check("and it landed in the VWAP-FPGA scored row",
+          "VWAP-FPGA" in r.stdout, True)
+
+# ladder hook: now filters to TRADE echoes (structural check on the
+# actual wiring — the hook chain is built inside main(), so the test
+# pins the source the same way [G_axis] pins the dashboard JS)
+om_src = open(ORDER_MANAGER_PY).read()
+ladder_hook = om_src.split("def _on_echo_with_ladder")[1].split(
+    "br.on_echo = _on_echo_with_ladder")[0]
+check("ladder's echo hook filters non-trade echoes (quote frames and "
+     "any unknown type the parser files as an echo would otherwise "
+     "feed its level comparison as trade prints)",
+     'fr["type"] != _TET' in ladder_hook, True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

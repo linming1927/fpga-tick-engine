@@ -41,10 +41,18 @@ SYM_LEN = 6            # fits every S&P 500 ticker (GOOGL, BRK.B, ...)
 
 TYPE_TRADE, TYPE_QUOTE = 0x01, 0x02
 TYPE_SYMCFG, TYPE_SYMCFG_ACK = 0x10, 0x90   # runtime symbol slots (v2)
+TYPE_SESSRST, TYPE_SESSRST_ACK = 0x11, 0x91  # VWAP session boundary (v3):
+                                             # the HOST owns the market
+                                             # calendar and commands the
+                                             # session reset; the fabric's
+                                             # 0x91 echo is the ack — see
+                                             # rtl/sessctl.sv
 TYPE_ECHO_TRADE, TYPE_ECHO_QUOTE = 0x81, 0x82
 TYPE_SIGNAL_SMA, TYPE_SIGNAL_EMA = 0x83, 0x84
+TYPE_SIGNAL_VWAP = 0x85                          # v3: vwap_engine events
 TYPE_SIGNAL = TYPE_SIGNAL_SMA                    # back-compat alias
-STRATEGY_NAME = {TYPE_SIGNAL_SMA: "sma", TYPE_SIGNAL_EMA: "ema"}
+STRATEGY_NAME = {TYPE_SIGNAL_SMA: "sma", TYPE_SIGNAL_EMA: "ema",
+                TYPE_SIGNAL_VWAP: "vwap_bounce"}
 
 SIDE_NEUTRAL, SIDE_BUY, SIDE_SELL = 0x00, 0x01, 0x02
 SIDE_NAME = {SIDE_BUY: "BUY", SIDE_SELL: "SELL", SIDE_NEUTRAL: "NEUTRAL"}
@@ -83,6 +91,22 @@ def pack_symcfg(slot: int, symbol: str, enable: bool = True,
         raise ValueError(f"slot {slot} out of range 0-7")
     return pack_tick(TYPE_SYMCFG, symbol if enable else symbol or "X",
                      0, slot, 0x01 if enable else 0x00, host_ts_us)
+
+
+def pack_sessrst(slot: int = None, host_ts_us: int = 0) -> bytes:
+    """TYPE 0x11 session-reset frame for the fabric VWAP engines.
+
+    slot=None (the normal session-open case) broadcasts to ALL slots
+    (SIDE=0xFF); a specific slot 0-7 resets just that one — e.g. a
+    trading-halt reopen whose auction print shouldn't anchor one
+    symbol's band, without touching the other seven. The FPGA's echo
+    of this frame (wire TYPE 0x91) is the acknowledgement, through
+    the same data path as everything else — see rtl/sessctl.sv."""
+    if slot is None:
+        return pack_tick(TYPE_SESSRST, "ALL", 0, 0, 0xFF, host_ts_us)
+    if not 0 <= slot <= 7:
+        raise ValueError(f"slot {slot} out of range 0-7")
+    return pack_tick(TYPE_SESSRST, "SLOT", 0, slot, 0x01, host_ts_us)
 
 
 def parse_tick(frame: bytes) -> dict:
@@ -133,10 +157,26 @@ def _decode_fpga_frame(frame: bytes) -> dict:
                 "price_e4": price_e4, "side": side,
                 "sma_fast": sma_fast, "sma_slow": sma_slow,
                 "fpga_ts": fpga_ts}
+    if ftype == TYPE_SIGNAL_VWAP:
+        # same 32-byte layout; the two indicator payload fields carry
+        # the session vwap at the evaluated snapshot (the verifier's
+        # cross-check value) and the engine's eval_skips counter
+        # (coalesced-tick count — nonzero means the tick rate exceeded
+        # the evaluation rate; see rtl/vwap_engine.sv)
+        vwap, eval_skips = struct.unpack(">II", frame[15:23])
+        return {"kind": "signal", "type": ftype,
+                "strategy": STRATEGY_NAME[ftype], "symbol": symbol,
+                "price_e4": price_e4, "side": side,
+                "vwap": vwap, "eval_skips": eval_skips,
+                "fpga_ts": fpga_ts}
     host_ts = struct.unpack(">Q", frame[15:23])[0]
     if ftype == TYPE_SYMCFG_ACK:
         return {"kind": "symcfg_ack", "type": ftype, "symbol": symbol,
                 "slot": qty & 7, "enabled": bool(side & 1),
+                "fpga_ts": fpga_ts}
+    if ftype == TYPE_SESSRST_ACK:
+        return {"kind": "sessrst_ack", "type": ftype,
+                "slot": qty & 7, "broadcast": (side == 0xFF),
                 "fpga_ts": fpga_ts}
     return {"kind": "echo", "type": ftype, "symbol": symbol,
             "price_e4": price_e4, "qty": qty, "side": side,
@@ -333,6 +373,126 @@ class EMAMirror:
                             sma_slow=self.ema_slow)
         self.above_prev = above
         self.primed = True
+        return sig
+
+
+# ---------------------------------------------------------------------------
+# VWAP mirror model — the third implementation of the same specification
+# (1: vwap_engine.sv, 2: tb_vwap.sv's bench mirror, 3: this)
+# ---------------------------------------------------------------------------
+@dataclass
+class VWAPSignal:
+    side: int
+    price_e4: int
+    vwap: int            # session vwap at the evaluated snapshot — the
+                         # cross-check value the 0x85 frame carries
+
+    @property
+    def side_name(self) -> str:
+        return SIDE_NAME.get(self.side, f"0x{self.side:02x}")
+
+
+@dataclass
+class VWAPMirror:
+    """Mirror of vwap_engine.sv — session accumulators, truncating
+    integer divides, squared-domain band test, position-independent
+    edge events.
+
+    Fidelity rules (see the RTL header, which is normative):
+      * sums: Σv, Σp·v, Σp²·v over accepted trades since session start;
+        Python ints are unbounded so the RTL's parameterized widths
+        need no mirroring
+      * vwap = Σpv // Σv and mean_sq = Σppv // Σv — floor division,
+        exactly the restoring divider's truncation
+      * variance = max(0, mean_sq - vwap²); band test entirely in the
+        squared domain: below ⟺ price < vwap and (vwap-price)² >
+        (K2_Q8·variance) >> 8 — no sqrt, same as the fabric
+      * EVENTS, NOT POSITIONS: bounce-buy on below-band → not-below,
+        revert-sell on the upward vwap cross, SELL dominant when one
+        evaluation sees both edges. This is the ENGINE's convention —
+        deliberately different from VWAPBounceScorecard.on_tick()'s
+        position-gated stream (fabric cannot know host position; the
+        host layer applies position logic downstream)
+      * WARMUP_N accepted trades gate; the first warm evaluation primes
+        the edge state without firing
+      * sess_reset() = the host-commanded TYPE 0x11 boundary (and a
+        slot rewrite behaves identically)
+
+    This model assumes the per-tick evaluation regime — every accepted
+    tick evaluated, which holds whenever tick spacing exceeds ~196
+    fabric cycles (~2 µs). The current link's floor is ~2 ms/tick, three
+    orders of magnitude above that; if a future link ever saturates the
+    engine, the 0x85 frame's eval_skips field is the observable (the
+    verifier should treat nonzero skips as "mirror comparison suspended",
+    not as divergence — the engine is coalescing, exactly as documented).
+    """
+    warmup_n: int = 20
+    k2_q8: int = 256          # k² in Q8: 256 = k of 1.0
+
+    sum_v: int = 0
+    sum_pv: int = 0
+    sum_ppv: int = 0
+    ticks: int = 0
+    vwap: int = 0
+    below_prev: bool = False
+    above_prev: bool = False
+    primed: bool = False
+    signals: int = 0
+
+    @property
+    def warmed_up(self) -> bool:
+        return self.ticks >= self.warmup_n
+
+    def sess_reset(self):
+        """The TYPE 0x11 boundary: clears sums, warm-up, edge state —
+        exactly what sess_rst (or a slot rewrite) does in fabric."""
+        self.sum_v = 0
+        self.sum_pv = 0
+        self.sum_ppv = 0
+        self.ticks = 0
+        self.vwap = 0
+        self.below_prev = False
+        self.above_prev = False
+        self.primed = False
+
+    def ingest(self, price_e4: int, qty: int) -> VWAPSignal | None:
+        """Feed one accepted TRADE; returns the engine-convention event
+        if this evaluation fires one.
+
+        Caller owns the accept filter (target symbol, trades only),
+        mirroring the RTL where the filter sits in front of the engine.
+        """
+        self.ticks += 1
+        self.sum_v += qty
+        self.sum_pv += price_e4 * qty
+        self.sum_ppv += price_e4 * price_e4 * qty
+        if self.sum_v == 0:
+            return None            # qty=0-only session: no divide (RTL guard)
+
+        self.vwap = self.sum_pv // self.sum_v
+        mean_sq = self.sum_ppv // self.sum_v
+        variance = mean_sq - self.vwap * self.vwap
+        if variance < 0:
+            variance = 0           # truncation clamp, same as the RTL
+        diff = self.vwap - price_e4 if price_e4 < self.vwap else 0
+        below = (price_e4 < self.vwap
+                 and diff * diff > (self.k2_q8 * variance) >> 8)
+        above = price_e4 >= self.vwap
+
+        sig = None
+        if self.warmed_up:
+            if self.primed:
+                if not self.above_prev and above:      # SELL dominates
+                    self.signals += 1
+                    sig = VWAPSignal(side=SIDE_SELL, price_e4=price_e4,
+                                     vwap=self.vwap)
+                elif self.below_prev and not below:
+                    self.signals += 1
+                    sig = VWAPSignal(side=SIDE_BUY, price_e4=price_e4,
+                                     vwap=self.vwap)
+            self.below_prev = below
+            self.above_prev = above
+            self.primed = True
         return sig
 
 

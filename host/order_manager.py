@@ -806,6 +806,22 @@ def main():
                 ema_kf=args.ema_kf, ema_ks=args.ema_ks, baud=args.baud,
                 log_path=args.log, verify_grace_s=args.verify_grace_s)
 
+    # v3.19: command the fabric VWAP session boundary at startup. Every
+    # process start IS a session start from the fabric's point of view —
+    # the board may hold yesterday's accumulators (it has no calendar; see
+    # rtl/sessctl.sv for why the HOST owns that), and the host mirrors
+    # start empty, so the two sides must be zeroed together before the
+    # first tick or the verifier would flag divergences that are really
+    # just mismatched session baselines. Safe against every board
+    # revision: a pre-v3.18 bitstream has no sessctl but still ECHOES the
+    # 0x11 frame as 0x91 (the echo path echoes every decoded frame, and
+    # tick_parser accepts any type byte), so the ack arrives either way —
+    # a timeout here means the link itself is in trouble.
+    if not br.send_sessrst():
+        print("[om] WARNING: VWAP session reset not acknowledged — the "
+              "link may be down; fabric VWAP state may span sessions "
+              "until a reset is acked")
+
     labels = {"sma": f"SMA {args.fast}/{args.slow}",
               "ema": f"EMA 1/{1 << args.ema_kf}:1/{1 << args.ema_ks}"}
     cards = {}
@@ -887,6 +903,28 @@ def main():
              f"start (tick-derived state can't replay from the audit "
              f"log — see --help)")
 
+    def _vwap_fpga_card(sym: str):
+        """The scored row for VERIFIED FABRIC VWAP signals (wire 0x85),
+        one per symbol, created on first use. Distinct from the
+        --vwap-bounce row on purpose: that one is the HOST-computed,
+        position-gated tick stream; this one is the engine-convention
+        event stream (position-independent edges, SELL dominant — see
+        rtl/vwap_engine.sv), gated through its own RiskPolicy clone,
+        which IS the "host layer applies position logic" half of the
+        hardware/host split. The two rows measuring the same strategy
+        through two different paths is the point, not duplication.
+        Lazy creation keeps the comparison table clean when the
+        board's bitstream predates the VWAP engines (no zero rows for
+        signals that can never arrive)."""
+        key = f"vwapfpga_{sym.lower()}"
+        if key not in cards:
+            from compare import StrategyScorecard
+            cards[key] = StrategyScorecard(
+                name=(f"VWAP-FPGA {sym}" if len(om.symbols) > 1
+                      else "VWAP-FPGA"),
+                live=False, policy=RiskPolicy(limits))
+        return cards[key]
+
     def route_to_shadow_cards(fr: dict, count: bool = True):
         """Feed a signal to whichever SCORED (non-live) cards should see
         it — the single routing rule used both for live signals
@@ -895,7 +933,13 @@ def main():
         one place means replay can never reach a different set of
         cards than live signals do."""
         strat = fr["strategy"]
-        if strat != args.strategy:
+        if strat == "vwap_bounce":
+            # verified fabric VWAP signals: per-symbol scored row (the
+            # cards dict has no "vwap_bounce" key — this indexing gap
+            # would have been a KeyError crash on the first hardware
+            # VWAP signal, caught while wiring the routing, not live)
+            _vwap_fpga_card(fr["symbol"].strip()).on_signal(fr, count=count)
+        elif strat != args.strategy:
             cards[strat].on_signal(fr, count=count)
         if profit_gated is not None and strat == "sma":
             profit_gated.on_signal(fr, count=count)
@@ -962,10 +1006,19 @@ def main():
         # dashboard, if running) rather than replace it — the ladder
         # needs EVERY accepted trade, not just verified crossover
         # signals, since it compares raw price against static levels.
+        # v3.19: now filters to TRADE echoes, same as the VWAP hook
+        # below. This was a latent inconsistency (quote echoes carry
+        # two-sided prices the ladder was never meant to compare), and
+        # the fabric VWAP path made it concrete: any frame type the
+        # parser files under "echo" would have fed the ladder's level
+        # comparison as if it were a trade print.
+        from tick_protocol import TYPE_ECHO_TRADE as _TET
         _prev_echo = br.on_echo
         def _on_echo_with_ladder(fr):
             if _prev_echo:
                 _prev_echo(fr)
+            if fr["type"] != _TET:
+                return
             sym = fr["symbol"].strip()
             ev = ladder.on_tick(sym, fr["price_e4"])
             if ev:
@@ -1005,6 +1058,11 @@ def main():
             cards[strat].signals += 1     # real routing/gating/fills below
             outcome = om.on_signal(fr)
             sync_live_card(cards, args.strategy, om)  # keep dashboard fresh
+        elif strat == "vwap_bounce":
+            # verified FABRIC vwap signal — same per-symbol scored row
+            # route_to_shadow_cards uses (cards has no "vwap_bounce"
+            # key; the old cards[strat] here would have crashed)
+            outcome = _vwap_fpga_card(fr["symbol"].strip()).on_signal(fr)
         else:
             outcome = cards[strat].on_signal(fr)  # hypothetical, gated
         # profit_gated is ALWAYS score-only, regardless of --strategy —

@@ -380,3 +380,42 @@ where a rebuild becomes meaningful — but hold the flash until the
 host-side drop lands (0x85 parsing + bridge.py integer mirror +
 verifier), because the current host misfiles unknown 0x85 frames as
 echoes, where an unfiltered ladder hook would ingest their prices.
+
+**v3.19** — the host side of the fabric VWAP path; with this pushed,
+building the v3.18 bitstream is safe. tick_protocol.py: TYPE_SESSRST/
+TYPE_SESSRST_ACK (0x11/0x91), pack_sessrst() (broadcast or per-slot),
+0x85 signal parsing ({vwap, eval_skips} in the payload fields), and
+VWAPMirror — the THIRD implementation of the engine spec (RTL, SV
+bench mirror, Python), cross-checked against the exact values the RTL
+simulation emitted on the same tape (BUY @3975000 vwap=3988909, SELL
+@4020000 vwap=3991500: all three agree bit-for-bit). bridge.py:
+vwap_bounce models + verifiers per symbol; the verifier's matcher
+generalized off its hard-coded sma_fast/sma_slow keys (a vwap frame
+was a KeyError) with eval_skips deliberately EXCLUDED from matching —
+it is telemetry about engine load, not math, and including it would
+turn a saturation report into a false divergence; send_sessrst() with
+ACK-DRIVEN mirror clearing (the ack is the trigger, not the send, so
+host state tracks what the fabric actually did; a timeout means
+neither side reset — safe to retry); a loud warning when eval_skips
+goes nonzero (mirror comparison is not tick-for-tick under
+coalescing). fpga_emulator.py now emulates sessctl and the VWAP
+engine, so the whole path tests without hardware. order_manager.py:
+session-reset broadcast at startup (every process start IS a session
+start from the fabric's view — it has no calendar; even pre-v3.18
+bitstreams ack via the universal echo path, so a timeout means link
+trouble); verified fabric VWAP signals route to a lazily-created
+per-symbol "VWAP-FPGA" scored row — the old cards[strat] indexing had
+no "vwap_bounce" key and the FIRST hardware VWAP signal would have
+been a KeyError crash in the live session, caught while wiring, not
+live; the same routing serves startup replay, so restored history
+cannot reach different cards than live signals. Deliberate design:
+the VWAP-FPGA row is DISTINCT from the --vwap-bounce row — host-
+computed position-gated stream vs engine-convention event stream;
+two rows measuring one strategy through two paths is the point.
+Also fixed while here: the ladder's echo hook now filters to TRADE
+echoes (previously latent — quote echoes carry two-sided prices its
+level comparison was never meant to see; the 0x85 wire type made the
+gap concrete), and dashboard.on_signal no longer KeyErrors on vwap
+frames (vwap maps into the "fast" column as the cross-check value;
+null fields render as a dash, not $NaN). 30 new checks; 684 total
+across the host suite, 0 failures.

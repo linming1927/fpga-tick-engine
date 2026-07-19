@@ -89,8 +89,13 @@ class DashboardServer:
                   "symbol": fr["symbol"].strip(),
                   "side": fr["side"],
                   "price_e4": fr["price_e4"],
-                  "sma_fast": fr["sma_fast"],
-                  "sma_slow": fr["sma_slow"],
+                  # v3.19: fabric VWAP signals (0x85) carry {vwap,
+                  # eval_skips} instead of {sma_fast, sma_slow}; map the
+                  # vwap into the "fast" column so the signals table
+                  # shows the cross-check value, and leave "slow" None
+                  # (rendered as a dash, not $NaN — see the JS side)
+                  "sma_fast": fr.get("sma_fast", fr.get("vwap")),
+                  "sma_slow": fr.get("sma_slow"),
                   "outcome": outcome}
             self._signals.appendleft(rec)
             sym = rec["symbol"]
@@ -507,8 +512,9 @@ async function poll(){
       '<td>'+x.symbol+'</td>'+
       '<td>'+x.strategy.toUpperCase()+'</td>'+
       '<td class="'+(x.side===1?'buy">BUY':'sell">SELL')+'</td>'+
-      '<td>'+usd(x.price_e4)+'</td><td>'+usd(x.sma_fast)+'</td>'+
-      '<td>'+usd(x.sma_slow)+'</td>'+
+      '<td>'+usd(x.price_e4)+'</td>'+
+      '<td>'+(x.sma_fast==null?'—':usd(x.sma_fast))+'</td>'+
+      '<td>'+(x.sma_slow==null?'—':usd(x.sma_slow))+'</td>'+
       '<td class="outcome '+(x.outcome.startsWith('FILLED')?'buy':
                      x.outcome.startsWith('rejected')?'sell':'')+
       '" style="'+(x.outcome.startsWith('blocked')||

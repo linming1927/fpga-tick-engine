@@ -58,7 +58,9 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tick_protocol import (FrameParser, SMAMirror, EMAMirror, SMASignal,
-                           pack_tick, pack_symcfg, dollars, to_e4,
+                           VWAPMirror, VWAPSignal,
+                           pack_tick, pack_symcfg, pack_sessrst,
+                           dollars, to_e4,
                            TYPE_TRADE, TYPE_ECHO_TRADE,
                            SIDE_NEUTRAL, SIDE_NAME)
 
@@ -141,13 +143,27 @@ class SignalVerifier:
 
     @staticmethod
     def _fields(item) -> dict:
-        """Normalize either an fr dict (FPGA signal) or an SMASignal
-        (model signal) into the same shape for logging, so both orphan
-        cases carry the same diagnostic detail."""
+        """Normalize either an fr dict (FPGA signal) or a model signal
+        object (SMASignal / VWAPSignal) into the same comparable shape,
+        so matching and orphan logging carry identical diagnostics.
+
+        SMA-family items carry {side, price_e4, sma_fast, sma_slow};
+        VWAP items carry {side, price_e4, vwap}. The 0x85 frame's
+        eval_skips field is deliberately EXCLUDED from the comparable
+        shape: it is telemetry about the engine's own load (coalesced
+        ticks), not part of the math the model mirrors — including it
+        would turn a saturation report into a false divergence."""
         if isinstance(item, dict):
+            if "vwap" in item:
+                return {"side": item.get("side"),
+                       "price_e4": item.get("price_e4"),
+                       "vwap": item.get("vwap")}
             return {"side": item.get("side"), "price_e4": item.get("price_e4"),
                    "sma_fast": item.get("sma_fast"),
                    "sma_slow": item.get("sma_slow")}
+        if hasattr(item, "vwap"):
+            return {"side": item.side, "price_e4": item.price_e4,
+                   "vwap": item.vwap}
         return {"side": item.side, "price_e4": item.price_e4,
                "sma_fast": item.sma_fast, "sma_slow": item.sma_slow}
 
@@ -155,14 +171,17 @@ class SignalVerifier:
         while self.pending_fpga and self.pending_model:
             _, _, fr = self.pending_fpga.pop(0)
             _, _, sig = self.pending_model.pop(0)
-            ok = (fr["side"] == sig.side
-                  and fr["price_e4"] == sig.price_e4
-                  and fr["sma_fast"] == sig.sma_fast
-                  and fr["sma_slow"] == sig.sma_slow)
-            if ok:
+            ff = self._fields(fr)
+            mf = self._fields(sig)
+            if ff == mf:
                 self.verified += 1
-                print(f"   verified: FPGA SMAs {fr['sma_fast']}/"
-                      f"{fr['sma_slow']} == model — hardware math confirmed")
+                if "vwap" in ff:
+                    print(f"   verified: FPGA vwap {ff['vwap']} == model "
+                          f"— hardware math confirmed")
+                else:
+                    print(f"   verified: FPGA SMAs {ff['sma_fast']}/"
+                          f"{ff['sma_slow']} == model — hardware math "
+                          f"confirmed")
                 if self.on_verified:
                     self.on_verified(fr)
             else:
@@ -171,15 +190,10 @@ class SignalVerifier:
                      f"FPGA {fr} vs model {sig}")
                 if self.on_divergence:
                     self.on_divergence({
-                        "reason": "SMA mismatch",
+                        "reason": f"{self.strategy} mismatch",
                         "symbol": self.symbol, "strategy": self.strategy,
-                        "fpga_side": fr["side"],
-                        "fpga_price_e4": fr["price_e4"],
-                        "fpga_sma_fast": fr["sma_fast"],
-                        "fpga_sma_slow": fr["sma_slow"],
-                        "model_side": sig.side, "model_price_e4": sig.price_e4,
-                        "model_sma_fast": sig.sma_fast,
-                        "model_sma_slow": sig.sma_slow})
+                        **{f"fpga_{k}": v for k, v in ff.items()},
+                        **{f"model_{k}": v for k, v in mf.items()}})
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +203,17 @@ class Bridge:
     def __init__(self, port: str, symbols, fast_n: int, slow_n: int,
                  ema_kf: int = 3, ema_ks: int = 5,
                  baud: int = 115_200, log_path: str | None = None,
-                 verify_grace_s: float = 2.0):
+                 verify_grace_s: float = 2.0,
+                 vwap_warmup: int = 20, vwap_k2_q8: int = 256):
         if isinstance(symbols, str):
             symbols = [symbols]
         self.symbols = [t.strip().upper() for t in symbols][:8]
         self.symbol = self.symbols[0]            # primary (OM default)
         self.params = (fast_n, slow_n, ema_kf, ema_ks)
+        self.vwap_params = (vwap_warmup, vwap_k2_q8)   # must match the
+                                                 # bitstream's VWAP_WARMUP /
+                                                 # VWAP_K2_Q8, same rule as
+                                                 # params vs FAST_N/SLOW_N
         self.verify_grace_s = verify_grace_s     # real seconds, not an echo
                                                  # count — see SignalVerifier
         self.ser = serial.Serial(port, baud, timeout=0.05)
@@ -203,6 +222,7 @@ class Bridge:
         # the slot register file (configure_symbols keeps them in lockstep)
         self._build_models()
         self.symcfg_acks: dict[int, dict] = {}
+        self.sessrst_acks: list[dict] = []
         self.on_symbols_changed = None            # alpaca resubscribe hook
         self.parser = FrameParser()
         self.frames: queue.Queue = queue.Queue()
@@ -211,7 +231,7 @@ class Bridge:
         self.sent = 0
         self.echoes = 0
         self.fpga_signals = 0                    # total across strategies
-        self.fpga_by_strategy = {"sma": 0, "ema": 0}
+        self.fpga_by_strategy = {"sma": 0, "ema": 0, "vwap_bounce": 0}
         self.rtt_us: list[int] = []
         self.min_offset: int | None = None   # min(host_ts - fpga_ts) seen
 
@@ -234,13 +254,17 @@ class Bridge:
         # its own slot's state_rst
         self.echoes_by_symbol = {}
         f, sl, kf, ks = self.params
+        vw, vk2 = self.vwap_params
         self.models = {
             "sma": {t: SMAMirror(fast_n=f, slow_n=sl) for t in self.symbols},
             "ema": {t: EMAMirror(k_fast=kf, k_slow=ks, warmup_n=sl)
-                    for t in self.symbols}}
+                    for t in self.symbols},
+            "vwap_bounce": {t: VWAPMirror(warmup_n=vw, k2_q8=vk2)
+                            for t in self.symbols}}
         self.verifiers = {(st, t): SignalVerifier(symbol=t, strategy=st,
                                                   min_grace_s=self.verify_grace_s)
-                          for st in ("sma", "ema") for t in self.symbols}
+                          for st in ("sma", "ema", "vwap_bounce")
+                          for t in self.symbols}
         for v in self.verifiers.values():
             v.on_verified = lambda fr: (self.on_verified and
                                         self.on_verified(fr))
@@ -284,6 +308,27 @@ class Bridge:
         else:
             print(f"[bridge] symbol configuration FAILED "
                   f"({len(self.symcfg_acks)}/8 acks)")
+        return ok
+
+    def send_sessrst(self, slot: int = None, timeout: float = 3.0) -> bool:
+        """Command a VWAP session boundary (TYPE 0x11) and wait for the
+        fabric's 0x91 ack. slot=None broadcasts (the normal session-open
+        call); a specific slot resets one symbol (halt-reopen case).
+
+        The HOST MIRRORS ARE NOT CLEARED HERE — they clear when the ack
+        arrives (_handle's sessrst_ack path), so host state tracks what
+        the fabric actually did rather than what we asked it to do. A
+        timeout therefore means neither side reset — safe to retry."""
+        n_before = len(self.sessrst_acks)
+        self.ser.write(pack_sessrst(slot, now_us()))
+        deadline = time.monotonic() + timeout
+        while len(self.sessrst_acks) == n_before \
+                and time.monotonic() < deadline:
+            self.pump(timeout=0.05)
+        ok = len(self.sessrst_acks) > n_before
+        if not ok:
+            print("[bridge] session reset NOT acked — fabric and host "
+                  "mirrors both unchanged; retry or check the link")
         return ok
 
     # ---- serial RX thread: bytes -> frames -> queue --------------------------
@@ -361,6 +406,18 @@ class Bridge:
                               f"fast={sig.sma_fast} slow={sig.sma_slow}")
                         self.verifiers[(name, sym)].on_model_signal(
                             sig, time.monotonic(), self.echoes_by_symbol[sym])
+                # VWAP mirror: same accept filter (this symbol's TRADE
+                # echoes only — the quote-corruption hazard is the same
+                # one the RTL and the live scorecard hook filter), plus
+                # the qty the volume-weighted math needs
+                vsig = self.models["vwap_bounce"][sym].ingest(
+                    fr["price_e4"], fr["qty"])
+                if vsig:
+                    print(f">> model[vwap_bounce] {sym}: {vsig.side_name} "
+                          f"@ ${dollars(vsig.price_e4):.4f}  "
+                          f"vwap={vsig.vwap}")
+                    self.verifiers[("vwap_bounce", sym)].on_model_signal(
+                        vsig, time.monotonic(), self.echoes_by_symbol[sym])
             for (_, vsym), v in self.verifiers.items():
                 v.on_echo(time.monotonic(), self.echoes_by_symbol.get(vsym, 0))
             if self.on_echo:
@@ -373,10 +430,30 @@ class Bridge:
             self.fpga_signals += 1
             self.fpga_by_strategy[strat] += 1
             self.fpga_by_key[key] = self.fpga_by_key.get(key, 0) + 1
-            print(f">> FPGA[{strat}] {sym}: "
-                  f"{SIDE_NAME.get(fr['side'], '?')} @ "
-                  f"${dollars(fr['price_e4']):.4f}  "
-                  f"fast={fr['sma_fast']} slow={fr['sma_slow']}")
+            if strat == "vwap_bounce":
+                print(f">> FPGA[{strat}] {sym}: "
+                      f"{SIDE_NAME.get(fr['side'], '?')} @ "
+                      f"${dollars(fr['price_e4']):.4f}  "
+                      f"vwap={fr['vwap']}")
+                if fr.get("eval_skips", 0):
+                    # nonzero means the tick rate exceeded the engine's
+                    # evaluation rate and ticks were coalesced (exact
+                    # sums, decimated signal checks — see the RTL
+                    # header). The mirror evaluates EVERY tick, so its
+                    # event stream can legitimately differ while this is
+                    # nonzero: treat verifier output with suspicion here
+                    # rather than as proof of a hardware bug. Cannot
+                    # happen at the current link's ~480 ticks/s; this is
+                    # the paid-feed-future observable.
+                    print(f"!! [{sym}] engine eval_skips="
+                          f"{fr['eval_skips']}: tick rate exceeded the "
+                          f"evaluation rate — mirror comparison is not "
+                          f"tick-for-tick while this is nonzero")
+            else:
+                print(f">> FPGA[{strat}] {sym}: "
+                      f"{SIDE_NAME.get(fr['side'], '?')} @ "
+                      f"${dollars(fr['price_e4']):.4f}  "
+                      f"fast={fr['sma_fast']} slow={fr['sma_slow']}")
             if self.log:
                 self.log.write(json.dumps(
                     {"t": now_us(), "signal": True, **fr}) + "\n")
@@ -389,6 +466,28 @@ class Bridge:
 
         elif fr["kind"] == "symcfg_ack":
             self.symcfg_acks[fr["slot"]] = fr
+
+        elif fr["kind"] == "sessrst_ack":
+            # the fabric's 0x91 echo of a TYPE 0x11 session reset: keep
+            # the latest ack and mirror the reset into the host models —
+            # THE ACK IS THE TRIGGER, not the send, so the mirrors track
+            # what the fabric actually did, through the same data path
+            # (symcfg's exact philosophy)
+            self.sessrst_acks.append(fr)
+            if fr["broadcast"]:
+                for m in self.models["vwap_bounce"].values():
+                    m.sess_reset()
+                print("[bridge] session reset ACK (broadcast) — VWAP "
+                      "mirrors cleared for all symbols")
+            else:
+                # single-slot: map slot -> symbol via configured order
+                if fr["slot"] < len(self.symbols):
+                    s = self.symbols[fr["slot"]]
+                    if s in self.models["vwap_bounce"]:
+                        self.models["vwap_bounce"][s].sess_reset()
+                        print(f"[bridge] session reset ACK (slot "
+                              f"{fr['slot']}) — VWAP mirror cleared "
+                              f"for {s}")
 
     # ---- teardown / report ------------------------------------------------------
     def close(self):

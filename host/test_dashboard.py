@@ -97,7 +97,10 @@ check("signals mirror verifiers", s["verified"],
       sum(v.verified for v in br.verifiers.values()))
 check("series carries both strategies", len(s["series"][0]), 7)
 check("signals carry strategy tags",
-      all(x["strategy"] in ("sma", "ema") for x in s["signals"]), True)
+      all(x["strategy"] in ("sma", "ema", "vwap_bounce")
+          for x in s["signals"]), True)
+# ^ v3.19: verified fabric-VWAP signals (0x85) join the log; the
+# emulator now emits them, so the tape can legitimately contain all 3
 check("signals carry symbols",
       all(x["symbol"] == "SPY" for x in s["signals"]), True)
 check("slot list in state", s["symbols"], ["SPY"])

@@ -410,7 +410,10 @@ check("both strategies signaled once",
        br5.fpga_by_key.get(("ema", "SPY"), 0)), (1, 1))
 check("all verified, no divergence",
       (sum(v.verified for v in br5.verifiers.values()),
-       sum(v.divergences for v in br5.verifiers.values())), (2, 0))
+       sum(v.divergences for v in br5.verifiers.values())), (3, 0))
+# ^ was (2, 0) pre-v3.19: sma + ema. The selftest tape's dive-and-recover
+# shape ALSO fires the new vwap_bounce mirror+emulator pair once, and
+# they verify against each other -- 3 verified is the correct total now
 br5.close(); emu5.stop()
 
 # ---- v2.2: per-symbol grace window (fixes a real divergence bug) ----------
@@ -484,7 +487,9 @@ check("mismatch detected immediately (both sides present, values differ)",
       len(captured2), 1)
 info2 = captured2[0]
 check("mismatch reason is distinct from an orphan", info2["reason"],
-      "SMA mismatch")
+      "sma mismatch")
+# ^ v3.19: the reason string now carries the verifier's own strategy name
+# (f"{strategy} mismatch") so vwap divergences aren't mislabeled "SMA"
 check("both FPGA's and the model's conflicting values are captured "
      "side by side, not just 'they disagreed'",
      (info2["fpga_sma_fast"], info2["model_sma_fast"]), (10, 99))
@@ -509,6 +514,123 @@ check("SPY's count reflects its own higher tick share",
 check("reconfigure resets the per-symbol counters",
       br2.configure_symbols(["SPY", "QQQ"]) and br2.echoes_by_symbol, {})
 br2.close(); emu2.stop()
+
+# ---------------------------------------------------------------------------
+print("[G9] v3.19 VWAP host side: protocol, mirror fidelity vs the RTL, "
+     "verifier, session reset")
+# ---------------------------------------------------------------------------
+from tick_protocol import (VWAPMirror, VWAPSignal, pack_sessrst,
+                          parse_tick, pack_fpga_signal,
+                          _decode_fpga_frame as parse_fpga_frame,
+                          TYPE_SESSRST, TYPE_SIGNAL_VWAP)
+
+# -- protocol: the 0x11 frame round-trips through the tick parser
+frb = pack_sessrst()                       # broadcast
+t = parse_tick(frb)
+check("sessrst broadcast: type 0x11", t["type"], TYPE_SESSRST)
+check("sessrst broadcast: side 0xFF", t["side"], 0xFF)
+frs = pack_sessrst(slot=5)
+t = parse_tick(frs)
+check("sessrst slot form: slot in qty[2:0]", t["qty"] & 7, 5)
+check("sessrst slot form: side is not broadcast", t["side"], 0x01)
+
+# -- protocol: 0x85 signal frames parse with vwap + eval_skips
+sf = pack_fpga_signal("QQQ", 3_975_000, 1, 3_988_909, 7, 123456,
+                      TYPE_SIGNAL_VWAP)
+fr = parse_fpga_frame(sf)
+check("0x85 parses as kind=signal", fr["kind"], "signal")
+check("0x85 strategy name", fr["strategy"], "vwap_bounce")
+check("0x85 vwap payload field", fr["vwap"], 3_988_909)
+check("0x85 eval_skips payload field", fr["eval_skips"], 7)
+
+# -- mirror fidelity: replay tb_vwap_integration.sv's EXACT tape and
+# demand the EXACT events its DUT emitted in the bit-level RTL sim
+# (BUY @3975000 vwap=3988909, SELL @4020000 vwap=3991500) — the
+# three-implementations-agree check, now spanning fabric to Python
+m = VWAPMirror(warmup_n=6)
+g9_events = []
+for i in range(8):
+    s = m.ingest(4_000_000 + i * 1000, 10)
+    if s: g9_events.append(s)
+for p in (3_940_000, 3_935_000, 3_975_000, 4_020_000):
+    s = m.ingest(p, 10)
+    if s: g9_events.append(s)
+check("mirror fires exactly the RTL sim's two events", len(g9_events), 2)
+check("BUY at the bounce", g9_events[0].side, SIDE_BUY)
+check("BUY vwap == the RTL sim's exact value",
+      g9_events[0].vwap, 3_988_909)
+check("SELL at the vwap cross", g9_events[1].side, SIDE_SELL)
+check("SELL vwap == the RTL sim's exact value",
+      g9_events[1].vwap, 3_991_500)
+
+# -- sess_reset really clears (mirrors tb V6)
+m.sess_reset()
+check("sess_reset zeroes the tick count", m.ticks, 0)
+g9_replay = [m.ingest(4_000_000 + i * 1000, 10) for i in range(8)]
+check("re-warm-up fires nothing (matches the RTL's V6)",
+      any(s is not None for s in g9_replay), False)
+
+# -- SELL dominance on a gap through both edges (mirrors tb_vwap P7)
+m2 = VWAPMirror(warmup_n=8)
+for i in range(10):
+    m2.ingest(4_004_000 if i % 2 == 0 else 3_996_000, 10)
+m2.ingest(3_940_000, 10); m2.ingest(3_935_000, 10)
+s = m2.ingest(4_050_000, 10)
+check("gap through band AND vwap -> exactly the SELL",
+      s is not None and s.side == SIDE_SELL, True)
+
+# -- verifier: matches on (side, price, vwap); eval_skips EXCLUDED
+from bridge import SignalVerifier
+v = SignalVerifier(symbol="QQQ", strategy="vwap_bounce", min_grace_s=5.0)
+good = dict(parse_fpga_frame(pack_fpga_signal(
+    "QQQ", 3_975_000, SIDE_BUY, 3_988_909, 99, 1, TYPE_SIGNAL_VWAP)))
+v.on_fpga_signal(good, 0.0, 0)
+v.on_model_signal(VWAPSignal(side=SIDE_BUY, price_e4=3_975_000,
+                             vwap=3_988_909), 0.0, 0)
+check("vwap signal verifies on content", v.verified, 1)
+check("no divergence on the match", v.divergences, 0)
+check("eval_skips=99 did NOT block the match (telemetry, not math)",
+      v.verified, 1)
+bad = dict(good); bad["vwap"] = 3_988_910          # off by one
+v.on_fpga_signal(bad, 0.0, 0)
+v.on_model_signal(VWAPSignal(side=SIDE_BUY, price_e4=3_975_000,
+                             vwap=3_988_909), 0.0, 0)
+check("a one-count vwap mismatch IS a divergence", v.divergences, 1)
+
+# -- emulator end to end: sessctl + 0x85 through a real pty bridge
+emu3 = FPGAEmulator(symbol="QQQ", fast_n=4, slow_n=8)
+port3 = emu3.start()
+br3 = Bridge(port3, "QQQ", 4, 8, vwap_warmup=20)
+time.sleep(0.2)
+check("send_sessrst is acked end to end", br3.send_sessrst(), True)
+# drive the integration tape at qty=10 through the emulator; the
+# emulator's VWAPMirror (warmup 20) needs 20 ticks — use a 20-warm tape
+for i in range(22):
+    br3.send_trade(4_000_000 + i * 1000, 10, symbol="QQQ")
+for p in (3_900_000, 3_890_000):
+    br3.send_trade(p, 10, symbol="QQQ")
+br3.send_trade(3_975_000, 10, symbol="QQQ")   # bounce: computed with the
+                                              # mirror itself — the dives
+                                              # inflate sigma to ~32.5k, so
+                                              # 3.975M (diff ~25k) is back
+                                              # INSIDE the band yet below
+                                              # vwap (3999840) -> BUY;
+                                              # 3.96M would still be BELOW
+                                              # the band (diff ~40k) and
+                                              # fire nothing
+deadline = time.time() + 5
+while br3.fpga_by_strategy["vwap_bounce"] < 1 and time.time() < deadline:
+    br3.pump(timeout=0.05)
+check("emulator emitted a vwap_bounce signal", 
+      br3.fpga_by_strategy["vwap_bounce"] >= 1, True)
+vv = br3.verifiers[("vwap_bounce", "QQQ")]
+deadline = time.time() + 3
+while vv.verified < 1 and time.time() < deadline:
+    br3.pump(timeout=0.05)
+check("and the bridge VERIFIED it against its own mirror",
+      vv.verified >= 1, True)
+check("zero divergences on the emulated path", vv.divergences, 0)
+br3.close(); emu3.stop()
 
 # ---------------------------------------------------------------------------
 print(f"\n==============================================")

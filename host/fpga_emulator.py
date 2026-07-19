@@ -38,11 +38,12 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from tick_protocol import (FrameParser, SMAMirror, EMAMirror,
+from tick_protocol import (FrameParser, SMAMirror, EMAMirror, VWAPMirror,
                            pack_fpga_echo, pack_fpga_signal, parse_tick,
                            TICK_SOF, TICK_EOF, TICK_LEN, TYPE_TRADE,
-                           TYPE_SYMCFG, TYPE_SIGNAL_SMA, TYPE_SIGNAL_EMA,
-                           SYM_LEN, dollars)
+                           TYPE_SYMCFG, TYPE_SESSRST,
+                           TYPE_SIGNAL_SMA, TYPE_SIGNAL_EMA,
+                           TYPE_SIGNAL_VWAP, SYM_LEN, dollars)
 
 
 class FPGAEmulator:
@@ -52,7 +53,7 @@ class FPGAEmulator:
         self.params = (fast_n, slow_n, ema_kf, ema_ks)
         # slot register file, mirroring symcfg.sv: slot 0 seeded
         self.slots = {0: symbol.strip().upper()}
-        self.models = {"sma": {}, "ema": {}}
+        self.models = {"sma": {}, "ema": {}, "vwap_bounce": {}}
         self._ensure_models(self.slots[0])
         self.verbose = verbose
         self.t0 = time.monotonic_ns()
@@ -85,6 +86,8 @@ class FPGAEmulator:
             self.models["sma"][sym] = SMAMirror(fast_n=f, slow_n=sl)
             self.models["ema"][sym] = EMAMirror(k_fast=kf, k_slow=ks,
                                                 warmup_n=sl)
+            self.models["vwap_bounce"][sym] = VWAPMirror()   # RTL defaults:
+                                                 # WARMUP_N=20, K2_Q8=256
 
     # ---- the board ---------------------------------------------------------
     def _fpga_ts(self) -> int:
@@ -114,6 +117,16 @@ class FPGAEmulator:
                 self._ensure_models(sym, fresh=True)
             else:
                 self.slots.pop(slot, None)
+        elif tick["type"] == TYPE_SESSRST:                 # v3: sessctl.sv
+            # 0x11 -> per-slot (or broadcast) VWAP session reset; the
+            # echo built above (wire 0x91) is the ack, same as hardware
+            if tick["side"] == 0xFF:
+                for m in self.models["vwap_bounce"].values():
+                    m.sess_reset()
+            else:
+                s = self.slots.get(tick["qty"] & 7)
+                if s and s in self.models["vwap_bounce"]:
+                    self.models["vwap_bounce"][s].sess_reset()
         elif tick["type"] == TYPE_TRADE and sym in self.slots.values():
             for name, ftype in (("sma", TYPE_SIGNAL_SMA),
                                 ("ema", TYPE_SIGNAL_EMA)):
@@ -126,6 +139,20 @@ class FPGAEmulator:
                         print(f"[emu] {name.upper()} {sym} SIGNAL "
                               f"{sig.side_name} @ "
                               f"${dollars(sig.price_e4):.4f}")
+            vsig = self.models["vwap_bounce"][sym].ingest(
+                tick["price_e4"], tick["qty"])
+            if vsig:
+                # 0x85: the two indicator payload fields carry
+                # {vwap, eval_skips} — the emulator never coalesces
+                # (it evaluates every tick, like the fabric at any
+                # realistic link rate), so skips is always 0
+                out += pack_fpga_signal(sym, vsig.price_e4, vsig.side,
+                                        vsig.vwap, 0,
+                                        ts, TYPE_SIGNAL_VWAP)
+                if self.verbose:
+                    print(f"[emu] VWAP {sym} SIGNAL {vsig.side_name} @ "
+                          f"${dollars(vsig.price_e4):.4f} "
+                          f"vwap={vsig.vwap}")
         try:
             os.write(self.master_fd, out)
         except OSError:
