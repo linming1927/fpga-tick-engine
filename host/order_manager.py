@@ -663,6 +663,22 @@ def main():
     ap.add_argument("--ema-kf", type=int, default=3,
                     help="fast EMA shift of the built bitstream (alpha 2^-k)")
     ap.add_argument("--ema-ks", type=int, default=5)
+    ap.add_argument("--vwap-warmup", type=int, default=20,
+                    help="VWAP_WARMUP of the built bitstream — ticks "
+                         "before the fabric VWAP engine allows events "
+                         "(default 20 matches top_arty.sv's parameter "
+                         "default; only pass this if you rebuilt with "
+                         "a different value)")
+    ap.add_argument("--vwap-k2-q8", type=int, default=256,
+                    help="VWAP_K2_Q8 of the built bitstream — band "
+                         "width k² in Q8 fixed point (default 256 = "
+                         "k of 1.0, matches top_arty.sv's default). "
+                         "NOT the same thing as --vwap-band-k below: "
+                         "that one tunes the independent HOST-side "
+                         "--vwap-bounce scorecard's own band math; "
+                         "this one must match the FABRIC bitstream's "
+                         "build parameter or the hardware verifier "
+                         "will report false divergences")
     ap.add_argument("--strategy", choices=["sma", "ema"], default="sma",
                     help="which engine's signals TRADE; the other is "
                          "scored hypothetically for comparison")
@@ -767,7 +783,33 @@ def main():
     ap.add_argument("--log", default=None, help="bridge tick JSONL")
     ap.add_argument("--dashboard", type=int, default=None, metavar="PORT",
                     help="serve the web console on this port (e.g. 8000)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="hardware acceptance test: connect to --port, "
+                         "run a deterministic warm-up + spike stimulus, "
+                         "and verify the board's SMA/EMA/VWAP signals "
+                         "against independent host models bit-for-bit. "
+                         "Prints PASS or DIAG lines explaining what's "
+                         "wrong, then exits — no trading, no dashboard. "
+                         "Run this FIRST after any bitstream change, "
+                         "before a live or historical-replay session.")
     args = ap.parse_args()
+
+    if args.selftest:
+        # hardware acceptance test — real board, no broker, no
+        # trading, no dashboard, no OrderManager: none of that setup
+        # below is needed, so this exits BEFORE any of it runs (a
+        # --broker alpaca selftest shouldn't need ALPACA_KEY set, and
+        # a --live selftest should never arm live trading at all).
+        # run_selftest() prints its own PASS/DIAG/FAIL lines.
+        symbols = [t for t in args.symbols.split(",") if t.strip()]
+        br = Bridge(args.port, symbols, args.fast, args.slow,
+                    ema_kf=args.ema_kf, ema_ks=args.ema_ks,
+                    baud=args.baud, vwap_warmup=args.vwap_warmup,
+                    vwap_k2_q8=args.vwap_k2_q8)
+        from bridge import run_selftest
+        run_selftest(br)
+        br.close()
+        return
 
     from compare import normalize_max_hold_days
     pg_max_hold = normalize_max_hold_days(args.pg_max_hold_days)
@@ -804,7 +846,8 @@ def main():
     from compare import StrategyScorecard, comparison_report
     br = Bridge(args.port, symbols, args.fast, args.slow,
                 ema_kf=args.ema_kf, ema_ks=args.ema_ks, baud=args.baud,
-                log_path=args.log, verify_grace_s=args.verify_grace_s)
+                log_path=args.log, verify_grace_s=args.verify_grace_s,
+                vwap_warmup=args.vwap_warmup, vwap_k2_q8=args.vwap_k2_q8)
 
     # v3.19: command the fabric VWAP session boundary at startup. Every
     # process start IS a session start from the fabric's point of view —

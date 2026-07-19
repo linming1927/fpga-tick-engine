@@ -444,3 +444,34 @@ bench model, tick_protocol.VWAPMirror) agree exactly as before. The
 lesson is recorded in the engine header's new "Timing closure"
 section. Only rtl/vwap_engine.sv changed; host suite untouched at
 684.
+
+**v3.21** — the hardware acceptance test you can actually run.
+run_selftest() existed in bridge.py but was reachable only from the
+test suite; new --selftest flag on order_manager.py wires it to the
+CLI (no broker, no dashboard, no OrderManager spun up — exits right
+after printing PASS/DIAG). Extended run_selftest() itself to cover
+what it never did before: the fabric VWAP engine and the session-
+reset control path (sessctl.sv's TYPE 0x11/0x91), tested against real
+hardware for the first time (simulation had already proven it in
+tb_sessctl.sv / tb_vwap_integration.sv). The existing warm-up-then-
+spike stimulus needed no changes — traced it exactly through
+VWAPMirror before relying on it: a strictly descending price stream
+keeps price at/below its own running vwap the whole warm-up (vwap
+lags above the latest price by construction), so the spike is a big
+upward gap that deterministically fires the SELL edge. One board
+program now exercises all three engines plus session reset. New
+--vwap-warmup / --vwap-k2-q8 CLI flags so the host mirror can be told
+if a rebuild ever changes VWAP_WARMUP/VWAP_K2_Q8 from their top_arty.sv
+defaults — the same role --fast/--slow/--ema-kf/--ema-ks already play
+for SMA/EMA, closing a latent gap where VWAP had no equivalent. Help
+text explicitly distinguishes --vwap-k2-q8 (must match the fabric
+bitstream) from the pre-existing --vwap-band-k (tunes the independent
+host-side --vwap-bounce scorecard) — easy to confuse, worth being
+explicit. New [G19] in test_order_manager.py: CLI wiring, end-to-end
+PASS against the emulator through the real entry point, and a
+PreVWAPEmulator regression proving the diagnostic correctly isolates
+"engine missing" from "link broken" — verified against tick_parser.sv
+first (no type whitelist; an older board really would still ack a
+0x11 frame, so the simulated failure needed to be the engine's silence,
+not a suppressed ack, to be a realistic test). 15 new checks; 699
+total across the host suite, 0 failures.

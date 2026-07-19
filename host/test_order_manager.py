@@ -820,6 +820,88 @@ check("ladder's echo hook filters non-trade echoes (quote frames and "
      "feed its level comparison as trade prints)",
      'fr["type"] != _TET' in ladder_hook, True)
 
+# ---- v3.21: --selftest wired to the CLI, and run_selftest() extended --
+# to cover VWAP + the session-reset control path. Previously run_selftest
+# existed only in bridge.py, reachable from tests but not from a user
+# actually holding a flashed board -- there was no way to run it short of
+# writing a script. This closes that gap.
+print("[G19] --selftest: hardware acceptance test wired to the CLI, now "
+     "covers VWAP + session reset")
+
+r = subprocess.run([sys.executable, ORDER_MANAGER_PY, "--help"],
+                   capture_output=True, text=True, timeout=30)
+check("--selftest is a real CLI flag", "--selftest" in r.stdout, True)
+check("--vwap-warmup is a real CLI flag", "--vwap-warmup" in r.stdout, True)
+check("--vwap-k2-q8 is a real CLI flag", "--vwap-k2-q8" in r.stdout, True)
+check("help distinguishes --vwap-k2-q8 (fabric) from --vwap-band-k "
+     "(host scorecard) -- easy to confuse, worth being explicit",
+     "NOT the same thing as --vwap-" in r.stdout
+     and "band-k below" in r.stdout, True)
+
+# end to end, through the ACTUAL CLI entry point (not calling
+# run_selftest() directly — that's G5 in test_host.py; this proves the
+# flag really reaches it, with no broker/dashboard/OrderManager spun up
+# along the way, which --selftest's docstring promises)
+emu19 = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port19 = emu19.start()
+r = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port19,
+     "--symbol", "SPY", "--fast", "8", "--slow", "32", "--selftest"],
+    capture_output=True, text=True, timeout=60)
+emu19.stop()
+check("--selftest exits cleanly", r.returncode, 0)
+check("prints PASS against a healthy (emulated) board",
+      "[selftest] PASS" in r.stdout, True)
+check("exercises and reports the session-reset control path",
+      "session reset (TYPE 0x11): acked" in r.stdout, True)
+check("verifies all three engines, not just SMA/EMA",
+      all(s in r.stdout for s in
+          ("FPGA[sma]", "FPGA[ema]", "FPGA[vwap_bounce]")), True)
+check("no broker was constructed (selftest's promise: no trading spun "
+     "up around it)",
+     "[om] broker:" not in r.stdout, True)
+
+# a board that predates the VWAP engine (but NOT sessctl — verified
+# against tick_parser.sv: S_TYPE captures rx_data unconditionally, no
+# type whitelist, so a real pre-v3.18 board's parser accepts a 0x11
+# frame structurally like any other and frame_tx's echo is type-
+# agnostic (0x80 | type) — it WOULD still ack 0x91. The realistic
+# failure signature is narrower: the ack arrives, but no vwap_engine
+# means no 0x85 ever comes back, no matter what ticks are sent)
+class PreVWAPEmulator(FPGAEmulator):
+    def _ensure_models(self, sym, fresh=False):
+        super()._ensure_models(sym, fresh)
+        # neuter the vwap mirror in place: a missing engine never
+        # signals no matter what ticks arrive. Nothing else about
+        # _handle changes — the echo/ack path (built unconditionally
+        # at the top of the real _handle, before any type-specific
+        # branch) is untouched, so 0x91 still goes out normally
+        self.models["vwap_bounce"][sym].ingest = lambda *a, **k: None
+
+emu19b = PreVWAPEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port19b = emu19b.start()
+r = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port19b,
+     "--symbol", "SPY", "--fast", "8", "--slow", "32", "--selftest"],
+    capture_output=True, text=True, timeout=60)
+emu19b.stop()
+check("a pre-VWAP board's selftest still exits cleanly (no crash)",
+      r.returncode, 0)
+check("session reset still acks normally (the parser has no type "
+     "whitelist -- a real older board acks 0x11 too; the engine's "
+     "absence is the ONLY thing that should differ)",
+     "session reset (TYPE 0x11): acked" in r.stdout, True)
+check("but VWAP is correctly diagnosed as never having signaled",
+      "DIAG [vwap_bounce]: fpga=0" in r.stdout, True)
+check("with the specific pre-v3.18 rebuild guidance, not a generic "
+     "failure message",
+     "bitstream likely predates the VWAP engine" in r.stdout, True)
+check("overall verdict is FAIL, not a false PASS",
+      "[selftest] FAIL" in r.stdout, True)
+check("SMA and EMA still verify fine on the same (otherwise healthy) "
+     "board -- this is specifically a VWAP gap, not a broken link",
+     "verified: FPGA SMAs" in r.stdout, True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

@@ -555,6 +555,16 @@ def run_selftest(br: Bridge):
     computed by the models themselves, so any FAST/SLOW/EMA-K build passes
     as long as the CLI params match the bitstream.
 
+    v3.21: also exercises the fabric VWAP path (sessctl + vwap_engine).
+    The SAME stimulus, unmodified, produces exactly one VWAP event as a
+    side effect — computed exactly via VWAPMirror before relying on it,
+    not assumed: a strictly descending price stream keeps price at or
+    below its own running vwap the whole warm-up (vwap lags above the
+    latest price by construction), so the spike is a big upward gap that
+    fires the SELL edge (see vwap_engine.sv's SELL-dominates convention).
+    No separate stimulus needed — one board program exercises all three
+    engines plus the session-reset control path.
+
     On failure, the diagnosis lines map each fingerprint to its usual
     cause: no echoes = link/programming; echoes but no signals = bitstream
     predates the indicator drops; SMA fine but EMA orphaned = bitstream
@@ -564,13 +574,25 @@ def run_selftest(br: Bridge):
     sym = br.symbol
     m0 = br.models["sma"][sym]
     print(f"[selftest] SMA {m0.fast_n}/{m0.slow_n}, EMA "
-          f"k={br.models['ema'][sym].k_fast}/{br.models['ema'][sym].k_slow} "
-          f"on '{sym}'")
+          f"k={br.models['ema'][sym].k_fast}/{br.models['ema'][sym].k_slow}, "
+          f"VWAP warmup={br.models['vwap_bounce'][sym].warmup_n} "
+          f"k2_q8={br.models['vwap_bounce'][sym].k2_q8} on '{sym}'")
     # first: exercise the runtime slot write + ACK path
     if not br.configure_symbols([sym]):
         print("[selftest] FAIL — slot configuration not acked "
               "(bitstream may predate v2 / wire-format mismatch)")
         return
+    # v3.21: exercise the session-reset control path (TYPE 0x11 -> 0x91)
+    # on REAL hardware for the first time — simulation proved sessctl.sv
+    # in tb_sessctl.sv and tb_vwap_integration.sv, but this is its first
+    # run against an actual board. configure_symbols() above already
+    # reset the VWAP engine too (state_rst is shared with slot_wr), so
+    # this call is redundant for CLEARING state — it's here specifically
+    # to prove the 0x11/0x91 path itself works, independent of slot
+    # writes, before anything downstream depends on it.
+    sessrst_ok = br.send_sessrst()
+    print(f"[selftest] session reset (TYPE 0x11): "
+         f"{'acked' if sessrst_ok else 'NOT ACKED'}")
     m0 = br.models["sma"][sym]                        # rebuilt by configure
     p0 = to_e4(200.0)
     for k in range(m0.slow_n):                        # descending warm-up
@@ -581,14 +603,18 @@ def run_selftest(br: Bridge):
     br.send_trade(to_e4(510.0), 1)                   # hold above: no retrigger
     br.pump(timeout=1.5)
 
-    ok = True
+    ok = sessrst_ok
+    if not sessrst_ok:
+        print("[selftest] DIAG: session reset not acked — bitstream may "
+              "predate v3.18 (no sessctl.sv); the VWAP checks below will "
+              "likely fail for the same reason")
     if br.echoes != br.sent:
         ok = False
         print(f"[selftest] DIAG: {br.echoes}/{br.sent} echoes — "
               + ("no link: check --port and that the board is programmed "
                  "(LD7 heartbeat?)" if br.echoes == 0 else
                  "frames lost: check cabling/baud"))
-    for name in ("sma", "ema"):
+    for name in ("sma", "ema", "vwap_bounce"):
         m, v = br.models[name][sym], br.verifiers[(name, sym)]
         f = br.fpga_by_key.get((name, sym), 0)
         if f == m.signals == v.verified and v.divergences == 0:
@@ -597,21 +623,33 @@ def run_selftest(br: Bridge):
         print(f"[selftest] DIAG [{name}]: fpga={f} model={m.signals} "
               f"verified={v.verified} diverged={v.divergences}")
         if f == 0 and m.signals > 0:
-            print(f"[selftest]   -> board never sent a {name.upper()} "
-                  "signal: bitstream likely predates this engine — "
-                  "rebuild with all rtl/*.sv files")
+            cause = ("bitstream likely predates the VWAP engine — rebuild "
+                     "with vwap_engine.sv + sessctl.sv + the top_arty "
+                     "integration (v3.18+)" if name == "vwap_bounce" else
+                     f"board never sent a {name.upper()} signal: "
+                     "bitstream likely predates this engine — rebuild "
+                     "with all rtl/*.sv files")
+            print(f"[selftest]   -> {cause}")
         elif v.divergences:
+            params = ("--vwap-warmup/--vwap-k2-q8" if name == "vwap_bounce"
+                      else "--fast/--slow/--ema-kf/--ema-ks")
             print(f"[selftest]   -> values disagree: CLI params "
-                  "(--fast/--slow/--ema-kf/--ema-ks) don't match the "
-                  "bitstream's build parameters")
+                  f"({params}) don't match the bitstream's build "
+                  "parameters")
     if br.models["sma"][sym].signals != 1:
         ok = False
         print("[selftest] DIAG: stimulus should produce exactly one SMA "
               "BUY — check --symbol matches the bitstream's TARGET_SYMBOL")
+    if br.models["vwap_bounce"][sym].signals != 1:
+        ok = False
+        print("[selftest] DIAG: stimulus should produce exactly one VWAP "
+              "SELL — if session reset wasn't acked this is expected; "
+              "otherwise check --symbol / --vwap-warmup / --vwap-k2-q8")
 
     if ok:
-        print("[selftest] PASS — board decodes, computes, and signals both "
-              "strategies in agreement with the models")
+        print("[selftest] PASS — board decodes, computes, and signals "
+              "all three strategies in agreement with the models, and "
+              "the session-reset control path is acked")
     else:
         print("[selftest] FAIL — see DIAG lines above and the summary")
 
