@@ -651,7 +651,7 @@ def sync_live_card(cards: dict, strategy: str, om: "OrderManager"):
 
 
 def main():
-    from bridge import Bridge, run_sim, run_alpaca   # reuse everything
+    from bridge import Bridge, run_sim, run_alpaca, run_historical   # reuse everything
 
     ap = argparse.ArgumentParser(
         description="FPGA signal -> risk-checked paper order")
@@ -751,10 +751,33 @@ def main():
                          "skips the Alpaca weekly-bars fetch (required "
                          "for --source sim, since there's no real feed "
                          "to compute a baseline from)")
-    ap.add_argument("--source", choices=["sim", "alpaca"], default="sim")
+    ap.add_argument("--source", choices=["sim", "alpaca", "historical"],
+                    default="sim",
+                    help="'historical' replays REAL market trades from "
+                         "--trades against the board — the bring-up step "
+                         "after --selftest passes, before any live "
+                         "session trusts a fabric signal")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--rate", type=float, default=10.0)
     ap.add_argument("--start-price", type=float, default=500.0)
+    ap.add_argument("--trades", default=None,
+                    help="one or more JSONL files from "
+                         "fetch_historical_trades.py, comma-separated in "
+                         "chronological order (e.g. widening date ranges: "
+                         "SPY_2026-01-01_2026-04-01.trades.jsonl,"
+                         "SPY_2026-04-01_2026-07-01.trades.jsonl) — "
+                         "required for --source historical, single "
+                         "symbol only (one file = one symbol)")
+    ap.add_argument("--replay-rate", type=float, default=200.0,
+                    help="--source historical: ticks/sec cap (real "
+                         "recorded gaps between ticks are NOT replayed — "
+                         "this paces by rate alone, same as --source "
+                         "sim; see run_historical()'s docstring)")
+    ap.add_argument("--replay-max", type=int, default=20_000,
+                    help="--source historical: stop after this many "
+                         "trades (files can be hundreds of millions of "
+                         "trades; 0 or negative means no cap — use with "
+                         "real caution, could run for many hours)")
     ap.add_argument("--broker", choices=["mock", "alpaca"], default="mock")
     ap.add_argument("--live", action="store_true",
                     help="REAL MONEY. Requires --broker alpaca plus the full "
@@ -823,6 +846,13 @@ def main():
                                               (args.broker == "alpaca"
                                                and not args.ignore_market_hours)),
                         max_daily_loss=args.max_daily_loss)
+
+    if args.source == "historical" and args.live:
+        sys.exit("--source historical replays ALREADY-HAPPENED market "
+                 "data — combining it with --live would place REAL "
+                 "trades on stale prices. Use --broker mock (the "
+                 "default) or --broker alpaca without --live for "
+                 "historical replay; --live is for --source alpaca only.")
 
     if args.live:
         if args.broker != "alpaca":
@@ -909,7 +939,8 @@ def main():
                       f"${base/10_000:.2f}")
             else:
                 print(f"[ladder] WARNING: no baseline for {sym} — pass "
-                      f"--ladder-baseline {sym}:<price> for --source sim")
+                      f"--ladder-baseline {sym}:<price> for --source "
+                      "sim/historical")
 
     profit_gated = None
     if args.profit_gate:
@@ -1140,6 +1171,14 @@ def main():
     try:
         if args.source == "sim":
             run_sim(br, args.n, args.rate, args.start_price)
+        elif args.source == "historical":
+            if not args.trades:
+                print("[om] --source historical requires --trades "
+                      "PATH[,PATH...]")
+                sys.exit(2)
+            paths = [p.strip() for p in args.trades.split(",") if p.strip()]
+            cap = args.replay_max if args.replay_max > 0 else None
+            run_historical(br, paths, rate=args.replay_rate, max_trades=cap)
         else:
             run_alpaca(br)
     except KeyboardInterrupt:

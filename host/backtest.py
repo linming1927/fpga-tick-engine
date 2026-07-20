@@ -44,62 +44,14 @@ from backtest_results import save_backtest_result, RESULTS_DIR_DEFAULT
 from compare import (StrategyScorecard, comparison_report,
                      monthly_breakdown_report)
 from order_manager import RiskPolicy, RiskLimits, HistoricalClock
-from tick_protocol import SMAMirror, EMAMirror, to_e4
+from tick_protocol import (SMAMirror, EMAMirror, to_e4,
+                          iter_trades, iter_trades_multi)
 BacktestClock = HistoricalClock   # backward-compatible alias — this class
                                  # moved to order_manager.py so the same
                                  # replay mechanism could be reused for
                                  # restoring scored-strategy state across
                                  # a live restart, not just backtests
 
-
-
-def iter_trades(path: str):
-    """Stream one (datetime, price_e4, qty) triple per line — never
-    loads the whole file, since these can be gigabytes for a multi-
-    year pull. qty is Alpaca's own trade-size field ("s", the same
-    field name bridge.py's live path already reads) — real historical
-    downloads always have it since fetch_historical_trades.py writes
-    Alpaca's trade record verbatim; defaults to 1 for synthetic test
-    data that doesn't bother setting it, so every existing caller that
-    only cares about price keeps working unmodified."""
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            t = datetime.fromisoformat(rec["t"].replace("Z", "+00:00"))
-            qty = int(rec.get("s", 1))
-            yield t, to_e4(float(rec["p"])), qty
-
-
-def iter_trades_multi(paths: list[str]):
-    """Stream several trade files IN THE ORDER GIVEN, as if they were
-    one continuous file. Meant for combining separately-fetched,
-    non-overlapping date ranges (fetch_historical_trades.py now scopes
-    filenames to their exact range, so incrementally widening your
-    history means MULTIPLE files rather than one growing file — this
-    is how you replay them together without re-downloading anything).
-
-    Does a cheap streaming sanity check, not a full sort: if a later
-    file's first trade is timestamped BEFORE the previous file's last
-    trade, that's very likely the files were passed out of
-    chronological order (or the ranges overlap), which would corrupt
-    the backtest's notion of "historical time" — this raises rather
-    than silently replaying history out of order."""
-    prev_last_t = None
-    for path in paths:
-        first_in_file = True
-        for t, price_e4, qty in iter_trades(path):
-            if first_in_file and prev_last_t is not None and t < prev_last_t:
-                raise ValueError(
-                    f"{path} starts at {t}, which is BEFORE the previous "
-                    f"file's last trade at {prev_last_t} — files must be "
-                    f"passed in chronological order with non-overlapping "
-                    f"ranges, or the backtest's historical clock breaks")
-            first_in_file = False
-            prev_last_t = t
-            yield t, price_e4, qty
 
 
 def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,

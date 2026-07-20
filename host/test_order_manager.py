@@ -902,6 +902,93 @@ check("SMA and EMA still verify fine on the same (otherwise healthy) "
      "board -- this is specifically a VWAP gap, not a broken link",
      "verified: FPGA SMAs" in r.stdout, True)
 
+# ---- v3.22: --source historical -- the bring-up step between --selftest
+# and a live/paper session. Real market ticks (not synthetic) driving a
+# real board, verified the same bit-for-bit way as everything else.
+print("[G20] --source historical: real-data replay wired to the CLI")
+
+r = subprocess.run([sys.executable, ORDER_MANAGER_PY, "--help"],
+                   capture_output=True, text=True, timeout=30)
+check("historical is a real --source choice", "historical" in r.stdout,
+      True)
+check("--trades is a real CLI flag", "--trades" in r.stdout, True)
+check("--replay-rate is a real CLI flag", "--replay-rate" in r.stdout, True)
+check("--replay-max is a real CLI flag", "--replay-max" in r.stdout, True)
+
+# safety: --live + --source historical must be refused, not silently
+# accepted -- replaying stale data through a real broker would place
+# real trades on prices that already happened
+r = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", "/dev/null",
+     "--source", "historical", "--trades", "/tmp/does_not_matter.jsonl",
+     "--live"],
+    capture_output=True, text=True, timeout=15)
+check("--live + --source historical is refused (nonzero exit)",
+      r.returncode != 0, True)
+check("with a clear reason, not a stack trace",
+      "ALREADY-HAPPENED" in r.stdout or "ALREADY-HAPPENED" in r.stderr,
+      True)
+
+# --source historical with no --trades errors clearly
+r = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", "/dev/null",
+     "--source", "historical"],
+    capture_output=True, text=True, timeout=15)
+check("--source historical without --trades is refused",
+      r.returncode != 0, True)
+
+# build a small real-shaped trades file (same schema fetch_historical_
+# trades.py writes: {"t","p","s"}) and replay it end to end against the
+# emulator through the actual CLI entry point
+import json as _json
+g20_tmp = tempfile.mkdtemp()
+g20_trades_path = os.path.join(g20_tmp, "SYNTH_test.trades.jsonl")
+with open(g20_trades_path, "w") as f:
+    price = 400.00
+    rng = random.Random(11)
+    for i in range(80):
+        price += rng.uniform(-0.3, 0.3)
+        f.write(_json.dumps({
+            "t": f"2026-07-17T14:{30 + i // 60:02d}:{i % 60:02d}.000000Z",
+            "p": round(price, 2), "s": rng.randint(1, 200)}) + "\n")
+
+emu20 = FPGAEmulator(symbol="SYNTH", fast_n=8, slow_n=32)
+port20 = emu20.start()
+r = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port20,
+     "--symbol", "SYNTH", "--fast", "8", "--slow", "32",
+     "--source", "historical", "--trades", g20_trades_path,
+     "--replay-rate", "300", "--broker", "mock"],
+    capture_output=True, text=True, timeout=60)
+emu20.stop()
+check("historical replay exits cleanly", r.returncode, 0)
+check("replayed all 80 trades", "done: 80 real trades replayed" in r.stdout,
+      True)
+check("session reset was exercised before replay",
+      "session reset ACK" in r.stdout, True)
+check("real-data VWAP signals verified against the host mirror",
+      "verified: FPGA vwap" in r.stdout, True)
+g20_diverge_lines = [l for l in r.stdout.splitlines() if "diverged" in l]
+check("all three strategies' summary lines are present",
+      len(g20_diverge_lines), 3)
+check("zero divergences on real-shaped data, across all three",
+      all(l.rstrip().endswith("/ 0") for l in g20_diverge_lines), True)
+
+# multi-symbol + --source historical is refused (one trades file = one
+# symbol; interleaving isn't supported, and silently replaying only
+# the first symbol would be a worse failure mode than refusing)
+emu20b = FPGAEmulator(symbol="SYNTH", fast_n=8, slow_n=32)
+port20b = emu20b.start()
+r = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port20b,
+     "--symbol", "SYNTH,QQQ", "--source", "historical",
+     "--trades", g20_trades_path, "--broker", "mock"],
+    capture_output=True, text=True, timeout=30)
+emu20b.stop()
+check("multi-symbol historical replay aborts rather than silently "
+     "replaying only one symbol",
+     "single-symbol only" in r.stdout, True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

@@ -475,3 +475,32 @@ first (no type whitelist; an older board really would still ack a
 0x11 frame, so the simulated failure needed to be the engine's silence,
 not a suppressed ack, to be a realistic test). 15 new checks; 699
 total across the host suite, 0 failures.
+
+**v3.22** — real historical market data replay against real hardware,
+the bring-up step promised (but not yet built) when --selftest passed.
+New --source historical on order_manager.py: replays REAL trades from
+fetch_historical_trades.py's JSONL (the exact files backtest.py scores
+offline) through the actual board, verified the same bit-for-bit way
+as every other signal here — --source sim's random walk can only ever
+prove the math works on synthetic data; this proves it on the actual
+price/volume patterns the strategy will trade on. Single-symbol only
+(one trades file = one symbol, backtest.py's own convention);
+--replay-rate paces the replay (real recorded inter-tick gaps are NOT
+reproduced — files can span hundreds of millions of trades, replaying
+verbatim gaps would take hours per trading day) and --replay-max caps
+how many trades a bring-up run touches. Safety guard: --live combined
+with --source historical is now a hard refusal with a clear reason —
+replaying already-happened data through a real broker would place
+real trades on stale prices; this gap existed before this drop and is
+closed by it. Refactor along the way: iter_trades/iter_trades_multi
+moved from backtest.py to tick_protocol.py (the shared, dependency-
+free base — moving them into bridge.py directly would have created a
+circular import via bridge -> backtest -> order_manager -> bridge), so
+offline backtesting and live hardware replay now share ONE exact file
+reader instead of two that could quietly diverge; backtest.py imports
+them from their new home, zero behavioral change (test_backtest.py
+unchanged, 71/71). New [G20] in test_order_manager.py: CLI wiring, the
+--live safety refusal, missing---trades refusal, multi-symbol refusal,
+and an end-to-end replay against the emulator with a real-shaped
+synthetic trades file — all three engines verified, zero divergence.
+16 new checks; 713 total across the host suite, 0 failures.

@@ -546,6 +546,74 @@ def run_sim(br: Bridge, n: int, rate: float, start_price: float):
     br.pump(timeout=1.0)
 
 
+def run_historical(br: Bridge, paths: list[str], rate: float = 200.0,
+                   max_trades: int | None = 20_000):
+    """The bring-up step promised after --selftest passes: REAL market
+    ticks (from fetch_historical_trades.py's JSONL, the exact same
+    files backtest.py scores) driving the REAL board, verified the
+    same way every other signal here is — against an independent host
+    model, bit-for-bit, zero divergence required. Where --source sim's
+    random walk can only ever prove the math works on synthetic data,
+    this proves it on the actual price/volume PATTERNS the strategy
+    will trade on.
+
+    Single-symbol only, deliberately: a trades file has one symbol's
+    data (backtest.py's own convention — one file per symbol), and
+    interleaving multiple symbols' real files chronologically is real
+    added complexity this bring-up step doesn't need. Configure the
+    board with exactly one --symbol to use this.
+
+    rate caps replay speed — historical files span months and can be
+    hundreds of millions of trades (a real one seen in this project:
+    218M for a multi-year QQQ pull), and even the current link's
+    ceiling (~480 ticks/sec, see vwap_engine.sv's header) would take
+    a real trading day's worth of ticks HOURS to replay tick-for-tick.
+    This does NOT replay at the recorded real-world gaps between
+    ticks — it streams REAL prices/volumes, in REAL order, paced by
+    `rate` alone, same as --source sim's pacing model. That is
+    correct for what a bring-up run needs (does the math hold on real
+    market patterns?) and wrong for anything claiming to reproduce
+    actual session timing.
+
+    max_trades bounds the run so a bring-up session finishes in a
+    reasonable time rather than accidentally kicking off a many-hour
+    replay of an entire multi-year file; pass None for no cap.
+    """
+    from tick_protocol import iter_trades_multi
+    if len(br.symbols) != 1:
+        print(f"[historical] aborting: {len(br.symbols)} symbols "
+             f"configured ({br.symbols}) — historical replay is "
+             "single-symbol only (one trades file = one symbol, "
+             "matching backtest.py's convention); pass exactly one "
+             "--symbol")
+        return
+    sym = br.symbols[0]
+    if not br.configure_symbols(br.symbols):
+        print("[historical] aborting: slot configuration failed")
+        return
+    if not br.send_sessrst():
+        print("[historical] aborting: session reset not acked — link "
+              "trouble, or a bitstream predating v3.18 (no sessctl.sv). "
+              "Run --selftest first.")
+        return
+    period = 1.0 / rate
+    print(f"[historical] replaying {paths} for {sym} @ up to {rate}/s"
+         + (f", capped at {max_trades} trades" if max_trades else ""))
+    n = 0
+    for t, price_e4, qty in iter_trades_multi(paths):
+        br.send_trade(price_e4, qty, symbol=sym)
+        br.pump(timeout=period)
+        n += 1
+        if n % 1000 == 0:
+            print(f"[historical] {n} trades replayed "
+                 f"(real timestamp reached: {t})")
+        if max_trades is not None and n >= max_trades:
+            print(f"[historical] stopping at --replay-max ({max_trades})")
+            break
+    br.pump(timeout=1.0)
+    print(f"[historical] done: {n} real trades replayed for {sym}")
+
+
 def run_selftest(br: Bridge):
     """Hardware acceptance test: descending warm-up then a spike.
 
