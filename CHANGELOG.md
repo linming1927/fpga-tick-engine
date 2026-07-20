@@ -556,3 +556,21 @@ still arms, and the banner text itself is checked (not just the
 gate's return value) to confirm an operator reading it before typing
 anything already sees which strategy is about to trade. 7 new
 checks; 729 total across the host suite, 0 failures.
+
+**v3.25** — README.md caught up with everything since v2.0 (which is
+where it had stopped — none of the profit-gated/blend/dashboard/VWAP
+work in v3.12-v3.24 was documented there). Fixed two now-inaccurate
+examples rather than leave them misleading: the live-arming command
+and confirmation phrase (was "LIVE SPY", now must include the
+strategy per v3.24), and the "run the whole system" section now
+points to the newer, more complete examples instead of stopping at
+basic paper trading. New "VWAP FPGA Engine & Live Strategy Selection"
+section: what the RTL/host verification chain actually is, the
+--selftest hardware acceptance test command, the --source historical
+replay command (with the flags that matter: --trades, --replay-rate,
+--replay-max, the --live refusal), and --strategy vwap_bounce for
+making VWAP the live strategy — plus an explicit reminder of the
+pre-live gate (clean historical replay, zero divergence, before
+--live). Final test census corrected to the current 4846 (4117 RTL +
+729 host); the old count was 6+ drops stale. Documentation only, no
+code changes — no new checks, host suite unchanged at 729.

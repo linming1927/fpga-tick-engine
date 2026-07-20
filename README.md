@@ -578,6 +578,10 @@ ALPACA_KEY=... ALPACA_SECRET=... \
 python3 host/order_manager.py --port /dev/ttyUSB1 --source alpaca \
         --broker alpaca --symbol SPY --qty 1 --max-shares 5
 ```
+(For real-money live trading and replaying real historical data against
+the board, see "Live Trading Enablement" and "VWAP FPGA Engine & Live
+Strategy Selection" further down — both grew significant new interlocks
+and capability well past this basic paper-trading example.)
 
 ## Full-system status
 ```
@@ -643,10 +647,17 @@ asserts refusal.
 export ALPACA_LIVE_KEY=... ALPACA_LIVE_SECRET=...
 export ALPACA_LIVE_ACK=I-UNDERSTAND-THIS-TRADES-REAL-MONEY
 python3 host/order_manager.py --port /dev/ttyUSB1 --source alpaca \
-    --broker alpaca --live --symbol SPY --qty 1 --max-shares 1 \
-    --max-daily-loss 50 --household-income 185000
-# ...then type: LIVE SPY
+    --broker alpaca --live --symbol SPY --strategy vwap_bounce --qty 1 \
+    --max-shares 1 --max-daily-loss 50 --household-income 185000
+# banner shows: symbol SPY / strategy VWAP_BOUNCE <-- this one TRADES
+# ...then type: LIVE SPY VWAP_BOUNCE
 ```
+`--strategy` also accepts `sma` or `ema` — v3.24: the confirmation phrase
+now names the strategy, not just the symbol (`arm_live_trading()` takes it
+as a required argument). With three tradeable strategies possible, a typo'd
+`--strategy` or a stale saved command line could otherwise arm live trading
+against a different strategy than intended with nothing in the banner or
+confirmation to catch it.
 
 ## Final test census
 ```
@@ -768,4 +779,94 @@ framing/ack DIAG lines — that mismatch is detected, not silent.
 RTL:   31 + 20 + 850 + 1900 + 36        = 2837
 Host:  83 + 27 + 31 + 31 + 21           =  193
 Total                                   = 3030 checks, 0 failures
+```
+
+---
+
+# VWAP FPGA Engine & Live Strategy Selection (v3.17 – v3.24)
+
+A third strategy, built in fabric from scratch after its host-only version
+(`vwap_bounce_strategy.py`) earned it on multi-year backtests: session-VWAP
+mean-reversion, computed in hardware instead of on the host, verified the
+same way SMA/EMA always have been, and now selectable as the strategy that
+actually trades.
+
+**RTL** (`rtl/vwap_engine.sv`, `rtl/sessctl.sv`): a shared serial divider
+(no DSP-hungry single-cycle divide needed — ticks arrive orders of
+magnitude slower than the ~200-cycle evaluation budget), a band test done
+entirely in the squared domain so no sqrt core is needed, and
+position-independent edge events (fabric can't know host position — the
+host layer applies that). Session boundaries are HOST-commanded (TYPE
+0x11/0x91, reusing symcfg's exact write-and-echo-is-the-ack pattern)
+rather than computed in fabric — the host already knows the market
+calendar; hardware calendar logic would just be new bug surface
+replicating what Python already does correctly. First synthesis failed
+timing (WNS -7.4 ns, wide arithmetic chained combinationally); fixed by
+spreading the decision across one FSM state per operation and registering
+every multiply's inputs/outputs for DSP48 MREG/PREG inference — ~5 extra
+cycles out of a ~200,000-cycle budget, zero behavioral change.
+
+**Host** (`tick_protocol.VWAPMirror`, `bridge.py`): the third independent
+implementation of the same spec (RTL -> SV testbench model -> Python),
+cross-checked bit-for-bit against the RTL simulation's own emitted values
+before being trusted. `--selftest` (below) now exercises the session-reset
+control path and all three engines in one deterministic run against real
+hardware.
+
+## Hardware acceptance test (run this after any bitstream change)
+```bash
+python3 host/order_manager.py --port /dev/ttyUSB1 --symbol SPY --selftest
+```
+No broker, no trading — a deterministic stimulus, checked against
+independent host models bit-for-bit. Prints `PASS` or specific `DIAG`
+lines. Also exercises the VWAP session-reset path (TYPE 0x11/0x91)
+against real hardware, not just simulation.
+
+## Replay REAL historical data against the real board
+```bash
+python3 host/order_manager.py --port /dev/ttyUSB1 --symbol QQQ \
+    --source historical \
+    --trades historical_trades/QQQ_2026-01-01_2026-04-01.trades.jsonl \
+    --broker mock
+```
+The bring-up step between `--selftest` and a live/paper session:
+`--selftest`'s stimulus is one hand-computed sequence; `--source sim` is a
+synthetic random walk; this is the actual market data your backtests
+scored, driving the actual board. `--trades` accepts comma-separated files
+in chronological order (same convention `backtest.py` uses); `--replay-rate`
+(default 200/s) paces the replay — the real recorded gaps between historical
+ticks are NOT reproduced, since a full day's ticks at real spacing would
+take hours; `--replay-max` (default 20,000) bounds how much of a
+potentially enormous file one run touches. Single-symbol only. Refuses
+outright if combined with `--live` — replaying already-happened prices
+through a real broker would place real trades on stale data. Watch for
+`RESULT: OK` and zero `diverged` counts in the session summary; add
+`--dashboard PORT` to watch it visually (slow `--replay-rate` down to
+~20 to actually follow it on screen).
+
+## VWAP as the live strategy
+```bash
+python3 host/order_manager.py --port /dev/ttyUSB1 --symbol QQQ \
+    --strategy vwap_bounce \
+    --source alpaca --broker paper --dashboard 8000
+```
+`--strategy` now accepts `sma`, `ema`, or `vwap_bounce` — whichever is
+picked trades for real (or on paper); the other two are scored in the
+background under identical RiskPolicy clones, same relationship EMA has
+always had to a live SMA, now generalized to three peers. This is a
+DIFFERENT thing from the separate `--vwap-bounce` flag, which adds an
+always-score-only HOST-computed VWAP row for comparison and can be used
+alongside any `--strategy` choice.
+
+Before trusting this with real capital: same gate as the historical
+replay above, specifically with `--strategy vwap_bounce` — `RESULT: OK`,
+zero divergence, on recent real data for the symbol you intend to trade —
+*then* `--live` (see "Live Trading Enablement" above; the confirmation
+banner and retyped phrase now include the strategy name too).
+
+## Final test census
+```
+RTL:   850+1900+36+31+20+1236+22+22                = 4117
+Host:  71+29+56+49+50+40+155+30+50+28+154+17       =  729
+Total                                               = 4846 checks, 0 failures
 ```
