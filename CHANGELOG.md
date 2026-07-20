@@ -574,3 +574,22 @@ pre-live gate (clean historical replay, zero divergence, before
 --live). Final test census corrected to the current 4846 (4117 RTL +
 729 host); the old count was 6+ drops stale. Documentation only, no
 code changes — no new checks, host suite unchanged at 729.
+
+**v3.26** — full order_manager.py CLI reference added to README.md:
+every flag (~40), grouped by what it actually controls (connection,
+bitstream-matching params, strategy selection, scored-only comparisons,
+data source, broker/risk limits, verification tuning, logging, cost/
+tax estimate, monitoring/diagnostics), with a short accurate description
+of each — including several that had no --help text at all (--port,
+--fast/--slow, --n/--rate/--start-price, --broker, --qty, --max-shares,
+--max-notional, --max-orders-per-day, --cooldown, --audit,
+--filing-status), written from reading the actual enforcement code
+rather than guessed. Caught and fixed two inaccuracies before they
+went in: --ignore-market-hours isn't refused when --live is set, it's
+silently overridden (require_market_hours is forced on unconditionally
+in live mode regardless of the flag) — a meaningfully different and
+more useful thing to know than "cannot be set"; and the cost/tax
+estimate flags work in any mode, it's specifically the resulting fee/
+tax figures that are real vs. hypothetical depending on paper or live,
+not the flags' applicability. Documentation only, no code changes —
+host suite unchanged at 729.

@@ -592,6 +592,103 @@ Pipeline: Alpaca WebSocket -> host bridge -> UART -> tick_parser -> SMA
 crossover engine -> priority TX -> verified 0x83 -> risk policy -> Alpaca
 paper order. Optional remaining: ntfy.sh push notifications on fills.
 
+## `order_manager.py` — full command-line reference
+
+Grown a lot since this section was first written (see the later drops
+below for VWAP, historical replay, live trading, and cost estimation).
+Every flag, grouped by what it actually controls — pulled from
+`--help` and the code, not reconstructed from memory, so treat this as
+current for the wire-format/parameter versions elsewhere in this file.
+
+**Connection**
+| Flag | Default | What it does |
+|---|---|---|
+| `--port` | *required* | Serial device (e.g. `/dev/ttyUSB1`, or a pty from `fpga_emulator.py`) |
+| `--symbol`, `--symbols` | `SPY` | Comma-separated, up to 8 (e.g. `SPY,QQQ,AAPL`) |
+| `--baud` | `921600` | Must match the bitstream's `BAUD` parameter — 115200 for anything built before that change |
+
+**Must match the bitstream's build parameters** (mismatches show up as
+false `DIVERGENCE` lines, not wrong values — the host mirror and the
+fabric are just computing against different assumptions)
+| Flag | Default | What it does |
+|---|---|---|
+| `--fast` | `8` | SMA fast window, in ticks |
+| `--slow` | `32` | SMA slow window, in ticks |
+| `--ema-kf` | `3` | Fast EMA shift (alpha = 2⁻ᵏ) |
+| `--ema-ks` | `5` | Slow EMA shift |
+| `--vwap-warmup` | `20` | Ticks before the fabric VWAP engine allows events (`VWAP_WARMUP`) |
+| `--vwap-k2-q8` | `256` | VWAP band width, k² in Q8 fixed point (`VWAP_K2_Q8`; 256 = k of 1.0) — NOT the same as `--vwap-band-k` below, which tunes a different, host-only VWAP calculation |
+
+**Which strategy trades**
+| Flag | Default | What it does |
+|---|---|---|
+| `--strategy` | `sma` | `sma`, `ema`, or `vwap_bounce` — this one's verified signals actually place orders; the other two are scored alongside for comparison, gated identically, never trading |
+
+**Extra scored-only comparisons** (never trade, regardless of `--strategy`)
+| Flag | Default | What it does |
+|---|---|---|
+| `--ladder` | off | Adds a weekly-anchored buy-the-dip ladder row (`ladder_strategy.py`) |
+| `--ladder-step` | `0.03` | Trigger spacing between ladder levels (3%) |
+| `--ladder-levels` | `3` | Max buy levels before the ladder is "full" |
+| `--ladder-qty` | `1` | Shares bought at each level |
+| `--ladder-method` | `week_vwap` | How each symbol's weekly baseline is computed (`friday_close`, `week_avg_close`, `week_vwap`, `week_midpoint`) |
+| `--ladder-baseline` | none | Manual override, e.g. `SPY:500.00,QQQ:450.00` — skips the Alpaca weekly-bars fetch; required for `--source sim` |
+| `--vwap-bounce` | off | Adds a HOST-computed session-VWAP mean-reversion row, one per symbol — a different implementation from the fabric engine, useful for comparing the two |
+| `--vwap-band-k` | `1.0` | That host-only row's band width, directly in session standard deviations |
+| `--profit-gate` | off | Adds an SMA-crossover row with one rule added: never sell below cost basis |
+| `--pg-max-hold-days` | `5.0` | `--profit-gate` only: force-close a position held longer than this many days, even at a loss — bounds the never-sell-at-a-loss rule's unbounded downside. `<= 0` disables (restores unbounded) |
+
+**Data source**
+| Flag | Default | What it does |
+|---|---|---|
+| `--source` | `sim` | `sim` (synthetic random walk), `alpaca` (live/paper market data), or `historical` (real recorded trades) |
+| `--n` | `200` | `--source sim` only: number of synthetic ticks |
+| `--rate` | `10.0` | `--source sim` only: ticks/sec |
+| `--start-price` | `500.0` | `--source sim` only: starting price for the random walk |
+| `--trades` | none | `--source historical` only: one or more JSONL files from `fetch_historical_trades.py`, comma-separated, chronological order — required, single symbol only |
+| `--replay-rate` | `200.0` | `--source historical` only: ticks/sec cap (does not reproduce real recorded gaps between ticks) |
+| `--replay-max` | `20000` | `--source historical` only: stop after this many trades; `0` or negative means no cap |
+
+**Broker & risk limits** (apply to whichever strategy is live)
+| Flag | Default | What it does |
+|---|---|---|
+| `--broker` | `mock` | `mock` (simulated fills) or `alpaca` (paper or live, depending on `--live`) |
+| `--live` | off | REAL MONEY. Requires `--broker alpaca` plus the full interlock chain — see "Live Trading Enablement" below |
+| `--max-daily-loss` | none | $ realized loss that halts the session; MANDATORY when `--live` |
+| `--qty` | `1` | Shares bought per entry |
+| `--max-shares` | `10` | Max total position size, in shares |
+| `--max-notional` | `2000.0` | Max dollar value ($) of any single buy order (`qty × price`) — independent of `--max-shares`, checked separately |
+| `--max-orders-per-day` | `1000` | Daily order cap |
+| `--cooldown` | `60.0` | Minimum seconds between orders |
+| `--ignore-market-hours` | off | For mock/off-hours testing; has NO EFFECT when `--live` is set — `require_market_hours` is forced on unconditionally in live mode, silently overriding this flag rather than refusing it as an error |
+
+**Verification tuning**
+| Flag | Default | What it does |
+|---|---|---|
+| `--verify-grace-s` | `2.0` | Real seconds an unmatched FPGA/model signal may wait before the kill switch trips on "orphan signal" — raise this if that divergence recurs during genuinely high signal-volume periods rather than a real hardware fault |
+
+**Logging & audit**
+| Flag | Default | What it does |
+|---|---|---|
+| `--log` | none | Bridge tick JSONL path |
+| `--audit` | `om_audit.jsonl` | Order/decision audit log — also what restart-restore reads to rebuild today's fills and scored-signal history |
+
+**Cost & tax estimate** (works in any mode; figures are real fees/tax for
+`--live` fills, purely hypothetical estimates for paper fills — see
+"Costs & Tax Estimation" below)
+| Flag | Default | What it does |
+|---|---|---|
+| `--household-income` | none | Taxable household income for the after-tax estimate |
+| `--gross` | off | Treat `--household-income` as gross; subtracts the 2026 standard deduction |
+| `--filing-status` | `mfj` | `single` or `mfj` |
+| `--state-rate` | `4.40` | Flat state income tax %, applied on top of federal (default: Colorado) |
+
+**Monitoring & diagnostics**
+| Flag | Default | What it does |
+|---|---|---|
+| `--dashboard` | none | Serve the web console on this port (e.g. `8000`) |
+| `--selftest` | off | Hardware acceptance test: deterministic stimulus, verified against host models, then exits — no broker, no trading, no dashboard. Run this first after any bitstream change |
+
 ---
 
 # Costs & Tax Estimation (sixth drop)
