@@ -287,7 +287,7 @@ class AlpacaLiveBroker(_AlpacaREST):
         super().__init__(key, secret, LIVE_URL)
 
 
-def arm_live_trading(symbol: str, limits: "RiskLimits",
+def arm_live_trading(symbol: str, limits: "RiskLimits", strategy: str,
                      env=os.environ, input_fn=input,
                      isatty=sys.stdin.isatty) -> AlpacaLiveBroker:
     """The live interlock chain. ALL of these must pass, independently:
@@ -301,8 +301,17 @@ def arm_live_trading(symbol: str, limits: "RiskLimits",
                                            bound is not allowed to exist)
       5. interactive terminal             (no accidental scripted/cron
                                            live starts)
-      6. operator retypes 'LIVE <SYMBOL>' after reading the limits banner
-         (confirmation restates parameters — two-key discipline)
+      6. operator retypes 'LIVE <SYMBOL> <STRATEGY>' after reading the
+         limits banner (confirmation restates parameters — two-key
+         discipline)
+
+    strategy is REQUIRED, not defaulted — v3.24: with three tradeable
+    strategies now possible (sma/ema/vwap_bounce), the confirmation
+    phrase names which one is about to place real orders, not just
+    which symbol. A --strategy flag typo or a stale saved command
+    line arming the wrong strategy live is exactly the class of
+    mistake this banner exists to catch before it costs money; the
+    old phrase ("LIVE SPY" alone) couldn't catch it at all.
 
     Testable: env/input_fn/isatty are injectable.
     """
@@ -323,10 +332,13 @@ def arm_live_trading(symbol: str, limits: "RiskLimits",
                          "(no scripted live starts)")
 
     sym = symbol.strip().upper()
+    strat = strategy.strip().upper()
     print("\n" + "!" * 62)
     print("!!  LIVE TRADING — REAL MONEY — READ BEFORE CONFIRMING       !!")
     print("!" * 62)
     print(f"  symbol            {sym}")
+    print(f"  strategy          {strat}   <-- this one TRADES; the "
+         f"others are scored only")
     print(f"  shares per entry  {limits.order_qty}")
     print(f"  max position      {limits.max_shares} shares")
     print(f"  max notional      ${limits.max_notional_e4/10_000:,.2f} per order")
@@ -334,7 +346,7 @@ def arm_live_trading(symbol: str, limits: "RiskLimits",
     print(f"  cooldown          {limits.cooldown_s:.0f} s")
     print(f"  DAILY LOSS HALT   ${limits.max_daily_loss:,.2f} realized")
     print(f"  market hours      enforced (cannot be disabled in live)")
-    expected = f"LIVE {sym}"
+    expected = f"LIVE {sym} {strat}"
     if input_fn(f"  type '{expected}' to arm, anything else aborts: ")\
             .strip() != expected:
         raise SystemExit("live aborted by operator")
@@ -866,7 +878,7 @@ def main():
         if args.broker != "alpaca":
             sys.exit("--live requires --broker alpaca")
         broker = arm_live_trading(args.symbols.split(",")[0].strip().upper(),
-                                  limits)
+                                  limits, strategy=args.strategy)
         print(f"[om] broker: Alpaca *** LIVE *** ({LIVE_URL})")
     elif args.broker == "alpaca":
         key = os.environ.get("ALPACA_KEY")

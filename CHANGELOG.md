@@ -534,3 +534,25 @@ a real fill, zero divergence across all three), and a restart
 simulation confirming the generalized replay restores both non-live
 strategies by name, not just one. 9 new checks; 722 total across the
 host suite, 0 failures.
+
+**v3.24** — a real gap found while reviewing v3.23 for real-money
+readiness, fixed before it mattered: the live-trading confirmation
+banner never showed WHICH STRATEGY was about to place real orders —
+only the symbol. With --strategy now a 3-way choice (v3.23), a flag
+typo or a stale saved command could arm live trading against a
+completely different strategy than intended, and the operator would
+have no way to catch it from the banner or the confirmation prompt.
+arm_live_trading() now takes a REQUIRED strategy parameter (no
+default — every caller must be explicit), prints it plainly in the
+banner ("strategy VWAP_BOUNCE <-- this one TRADES; the others are
+scored only"), and requires it in the retyped confirmation phrase
+("LIVE SPY VWAP_BOUNCE", not just "LIVE SPY") — the same two-key
+discipline this banner already used for the symbol, extended to
+cover the dimension that just became variable. New checks in
+test_live_gating.py: the old symbol-only phrase now correctly
+refuses, a mismatched strategy name in the confirmation refuses (the
+exact mistake this exists to catch), a correctly matching phrase
+still arms, and the banner text itself is checked (not just the
+gate's return value) to confirm an operator reading it before typing
+anything already sees which strategy is about to trade. 7 new
+checks; 729 total across the host suite, 0 failures.

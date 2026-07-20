@@ -39,10 +39,11 @@ GOOD_LIMITS = RiskLimits(order_qty=1, max_shares=1,
                          max_daily_loss=100.0)
 
 
-def attempt(env=None, limits=GOOD_LIMITS, typed="LIVE SPY", tty=True):
+def attempt(env=None, limits=GOOD_LIMITS, typed="LIVE SPY SMA", tty=True,
+           strategy="sma"):
     """Run the arming chain with injected gates; return 'armed' or 'refused'."""
     try:
-        b = arm_live_trading("SPY", limits,
+        b = arm_live_trading("SPY", limits, strategy,
                              env=GOOD_ENV if env is None else env,
                              input_fn=lambda prompt: typed,
                              isatty=lambda: tty)
@@ -70,9 +71,42 @@ check("zero daily loss limit", attempt(limits=RiskLimits(
 check("not a tty", attempt(tty=False), "refused")
 check("wrong confirmation text", attempt(typed="live spy"), "refused")
 check("empty confirmation", attempt(typed=""), "refused")
-check("confirmation for wrong symbol", attempt(typed="LIVE TSLA"), "refused")
-check("whitespace-padded confirmation OK", attempt(typed="  LIVE SPY  "),
+check("confirmation for wrong symbol", attempt(typed="LIVE TSLA SMA"),
+      "refused")
+check("whitespace-padded confirmation OK", attempt(typed="  LIVE SPY SMA  "),
       "armed")
+
+# ---------------------------------------------------------------------------
+print("[G1b] v3.24: the confirmation phrase now names the STRATEGY too, "
+     "not just the symbol — a --strategy typo or a stale saved command "
+     "must not silently arm the wrong strategy live")
+check("old phrase (symbol only, no strategy) now refuses",
+      attempt(typed="LIVE SPY"), "refused")
+check("correct symbol, MISSING strategy word entirely, still refuses",
+      attempt(typed="LIVE SPY "), "refused")
+check("correct symbol, WRONG strategy named, refuses -- this is the "
+     "exact mistake the banner exists to catch: arming with "
+     "--strategy vwap_bounce but confirming as if it were SMA",
+     attempt(strategy="vwap_bounce", typed="LIVE SPY SMA"), "refused")
+check("correct symbol AND correct (matching) strategy: armed",
+      attempt(strategy="vwap_bounce", typed="LIVE SPY VWAP_BOUNCE"),
+      "armed")
+check("strategy name in the confirmation is case-insensitive-safe the "
+     "same way the existing code upper()s it -- typed lowercase still "
+     "matches the upper()'d expected phrase",
+     attempt(strategy="ema", typed="LIVE SPY EMA"), "armed")
+
+import io, contextlib
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    attempt(strategy="vwap_bounce", typed="LIVE SPY VWAP_BOUNCE")
+banner = buf.getvalue()
+check("the banner ITSELF displays which strategy is about to trade "
+     "(not just the confirmation gate -- an operator reading before "
+     "typing anything should already see this)",
+     "VWAP_BOUNCE" in banner, True)
+check("the banner is explicit that only this one strategy trades",
+      "TRADES" in banner, True)
 
 print("[G2] paper credentials can never arm live")
 check("paper env vars alone refuse", attempt(env={
