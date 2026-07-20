@@ -504,3 +504,33 @@ unchanged, 71/71). New [G20] in test_order_manager.py: CLI wiring, the
 and an end-to-end replay against the emulator with a real-shaped
 synthetic trades file — all three engines verified, zero divergence.
 16 new checks; 713 total across the host suite, 0 failures.
+
+**v3.23** — VWAP can now be the LIVE trading strategy. New
+--strategy vwap_bounce trades the FABRIC-verified VWAP engine's
+signals (wire 0x85) for real, with SMA and EMA both scored in the
+background as peers — the same role EMA has always played alongside
+a live SMA, now with three strategies instead of two. This retired
+the special-case machinery VWAP-FPGA needed when it could only ever
+be scored (a per-symbol _vwap_fpga_card lazily created outside the
+normal labels/cards system, with dedicated branches in on_verified
+and route_to_shadow_cards) in favor of making vwap_bounce a genuine
+third peer sharing the exact same architecture SMA/EMA already used:
+one shared card (positions keyed by symbol internally, same as
+SMA/EMA), created unconditionally alongside them, live iff selected.
+Generalizing beat special-casing further. Also fixed a real latent
+bug this surfaced: the startup replay that restores scored strategies'
+trips/wins/net$ across a restart used a hardcoded "ema if sma else
+sma" binary swap for "the other strategy" — correct with exactly two
+peers, silently wrong with three (it would restore only ONE of the
+two non-live strategies, dropping the other's history every restart).
+Now generalized to restore every scored strategy, whichever is live.
+Clear separation preserved in the help text and the label itself
+between this (fabric-verified, tradeable) and the pre-existing
+--vwap-bounce flag (host-computed, always score-only, usable
+alongside any --strategy choice for comparison). New [G21] in
+test_order_manager.py: --strategy vwap_bounce end-to-end against the
+emulator (VWAP-FPGA [LIVE], SMA and EMA both present and NOT live,
+a real fill, zero divergence across all three), and a restart
+simulation confirming the generalized replay restores both non-live
+strategies by name, not just one. 9 new checks; 722 total across the
+host suite, 0 failures.

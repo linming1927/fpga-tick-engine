@@ -766,12 +766,13 @@ check("other symbols' trades don't cross-feed this card",
                 "price_e4": 3_000_000, "qty": 50}), "wrong symbol")
 check("card still at 1 tick", vcard._n, 1)
 
-# ---- v3.19: verified FABRIC vwap signals route without crashing -----
-# The on_verified/route_to_shadow_cards indexing (cards[strat]) had no
-# "vwap_bounce" key — the FIRST hardware VWAP signal would have been a
-# KeyError crash in the live session. Covered end to end: an emulator
-# that now emits 0x85, a bridge that verifies it, and an OM whose
-# routing must land it in a per-symbol VWAP-FPGA scored row.
+# ---- v3.19 (mechanism since generalized in v3.23 — see [G21]): verified
+# FABRIC vwap signals route without crashing. The on_verified/
+# route_to_shadow_cards indexing (cards[strat]) originally had no
+# "vwap_bounce" key at all — the FIRST hardware VWAP signal would have
+# been a KeyError crash in the live session. Covered end to end: an
+# emulator that emits 0x85, a bridge that verifies it, and an OM whose
+# routing must land it in the VWAP-FPGA scored row.
 print("[G18] verified fabric-VWAP signals route to a scored row "
      "(the cards['vwap_bounce'] KeyError path), ladder filters quotes")
 
@@ -806,8 +807,9 @@ check("the emulated fabric emitted at least one vwap signal on the "
 if g18_has_sig:
     check("it was VERIFIED against the host mirror",
           "verified: FPGA vwap" in r.stdout, True)
-    check("and it landed in the VWAP-FPGA scored row",
-          "VWAP-FPGA" in r.stdout, True)
+    check("and it landed in the VWAP-FPGA scored row (a full peer of "
+         "SMA/EMA since v3.23, not the old per-symbol special case)",
+         "VWAP-FPGA" in r.stdout, True)
 
 # ladder hook: now filters to TRADE echoes (structural check on the
 # actual wiring — the hook chain is built inside main(), so the test
@@ -988,6 +990,89 @@ emu20b.stop()
 check("multi-symbol historical replay aborts rather than silently "
      "replaying only one symbol",
      "single-symbol only" in r.stdout, True)
+
+# ---- v3.23: --strategy vwap_bounce -- the FABRIC-verified VWAP engine
+# becomes the LIVE trading strategy, with SMA and EMA both scored in
+# the background as peers (exactly like EMA has always been scored
+# alongside a live SMA). This retired the old special-case machinery
+# (per-symbol _vwap_fpga_card, always score-only) in favor of making
+# vwap_bounce a full THIRD peer strategy sharing the same labels/cards/
+# on_verified/route_to_shadow_cards path SMA and EMA already used --
+# generalizing, not special-casing further.
+print("[G21] --strategy vwap_bounce: VWAP live, SMA+EMA scored in "
+     "the background")
+
+g21_tmp = tempfile.mkdtemp()
+g21_trades_path = os.path.join(g21_tmp, "QQQ_test.trades.jsonl")
+g21_audit_path = os.path.join(g21_tmp, "audit.jsonl")
+with open(g21_trades_path, "w") as f:
+    price = 400.00
+    rng = random.Random(19)
+    for i in range(600):
+        price += rng.uniform(-0.3, 0.3)
+        f.write(_json.dumps({
+            "t": f"2026-07-17T{14 + i // 3600:02d}:{(i // 60) % 60:02d}:"
+                f"{i % 60:02d}.000000Z",
+            "p": round(price, 2), "s": rng.randint(1, 200)}) + "\n")
+
+check("vwap_bounce is a real --strategy choice",
+      "vwap_bounce" in subprocess.run(
+          [sys.executable, ORDER_MANAGER_PY, "--help"],
+          capture_output=True, text=True, timeout=30).stdout, True)
+
+emu21 = FPGAEmulator(symbol="QQQ", fast_n=8, slow_n=32)
+port21 = emu21.start()
+r = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port21, "--symbol", "QQQ",
+     "--fast", "8", "--slow", "32", "--source", "historical",
+     "--trades", g21_trades_path, "--replay-rate", "300",
+     "--broker", "mock", "--strategy", "vwap_bounce",
+     "--audit", g21_audit_path],
+    capture_output=True, text=True, timeout=90)
+emu21.stop()
+check("session exits cleanly", r.returncode, 0)
+check("VWAP-FPGA is tagged [LIVE]", "VWAP-FPGA [LIVE]" in r.stdout, True)
+check("SMA is scored (present, NOT tagged [LIVE])",
+      ("SMA 8/32" in r.stdout) and ("SMA 8/32 [LIVE]" not in r.stdout),
+      True)
+check("EMA is scored (present, NOT tagged [LIVE]) -- confirms this is "
+     "a real 3-way peer relationship, not just SMA swapped for VWAP",
+     ("EMA 1/" in r.stdout) and ("EMA 1/8:1/32 [LIVE]" not in r.stdout),
+     True)
+check("real fills actually happened (not just scored)",
+      "orders filled" in r.stdout
+      and "orders filled    0" not in r.stdout, True)
+g21_diverge_lines = [l for l in r.stdout.splitlines() if "diverged" in l]
+check("all three strategies verified with zero divergence",
+      len(g21_diverge_lines) == 3
+      and all(l.rstrip().endswith("/ 0") for l in g21_diverge_lines), True)
+
+# the shadow-card replay generalization: with 3 peers, restoring "the
+# other" scored strategies at startup must restore BOTH non-live ones,
+# not just one (the old hardcoded sma<->ema swap would silently drop
+# whichever strategy wasn't part of that binary pair). Direct check of
+# the actual restore message, which names every card it restored.
+# Fresh emulator instance (emu21's port died with emu21.stop() above);
+# same audit path, simulating a restart later the same day.
+emu21b = FPGAEmulator(symbol="QQQ", fast_n=8, slow_n=32)
+port21b = emu21b.start()
+r2 = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port21b, "--symbol", "QQQ",
+     "--fast", "8", "--slow", "32", "--source", "historical",
+     "--trades", g21_trades_path, "--replay-rate", "300",
+     "--broker", "mock", "--strategy", "vwap_bounce",
+     "--audit", g21_audit_path],
+    capture_output=True, text=True, timeout=90)
+emu21b.stop()
+restore_line = next((l for l in r2.stdout.splitlines()
+                    if "[compare] restored" in l), "")
+check("a second session against the SAME audit log (simulating a "
+     "restart) found prior scored signals to restore",
+     restore_line != "", True)
+check("the restore names BOTH non-live scored strategies -- not just "
+     "one, the way a leftover hardcoded sma<->ema swap would",
+     ("SMA" in restore_line and "EMA" in restore_line)
+     if restore_line else True, True)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

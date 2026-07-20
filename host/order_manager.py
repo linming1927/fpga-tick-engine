@@ -679,9 +679,17 @@ def main():
                          "this one must match the FABRIC bitstream's "
                          "build parameter or the hardware verifier "
                          "will report false divergences")
-    ap.add_argument("--strategy", choices=["sma", "ema"], default="sma",
-                    help="which engine's signals TRADE; the other is "
-                         "scored hypothetically for comparison")
+    ap.add_argument("--strategy", choices=["sma", "ema", "vwap_bounce"],
+                    default="sma",
+                    help="which engine's signals TRADE; the others are "
+                         "scored hypothetically for comparison. "
+                         "'vwap_bounce' here means the FABRIC-verified "
+                         "VWAP engine (wire 0x85, requires a v3.18+ "
+                         "bitstream) -- a DIFFERENT thing from the "
+                         "separate --vwap-bounce flag below, which adds "
+                         "an always-score-only HOST-computed VWAP row "
+                         "for comparison and can be used alongside "
+                         "--strategy vwap_bounce or any other choice")
     ap.add_argument("--ladder", action="store_true",
                     help="also score a weekly-anchored buy-the-dip ladder "
                          "(see ladder_strategy.py) — SCORE ONLY, never "
@@ -896,7 +904,15 @@ def main():
               "until a reset is acked")
 
     labels = {"sma": f"SMA {args.fast}/{args.slow}",
-              "ema": f"EMA 1/{1 << args.ema_kf}:1/{1 << args.ema_ks}"}
+              "ema": f"EMA 1/{1 << args.ema_kf}:1/{1 << args.ema_ks}",
+              # v3.23: VWAP-FPGA is now a full peer of SMA/EMA, not a
+              # special case — one shared card (positions keyed by
+              # symbol internally, same as SMA/EMA already do), always
+              # scored, live iff --strategy vwap_bounce. This REPLACES
+              # the old per-symbol _vwap_fpga_card mechanism (below,
+              # removed) that existed only because VWAP could never be
+              # live before this drop.
+              "vwap_bounce": "VWAP-FPGA"}
     cards = {}
     for name, label in labels.items():
         live = (name == args.strategy)
@@ -977,28 +993,6 @@ def main():
              f"start (tick-derived state can't replay from the audit "
              f"log — see --help)")
 
-    def _vwap_fpga_card(sym: str):
-        """The scored row for VERIFIED FABRIC VWAP signals (wire 0x85),
-        one per symbol, created on first use. Distinct from the
-        --vwap-bounce row on purpose: that one is the HOST-computed,
-        position-gated tick stream; this one is the engine-convention
-        event stream (position-independent edges, SELL dominant — see
-        rtl/vwap_engine.sv), gated through its own RiskPolicy clone,
-        which IS the "host layer applies position logic" half of the
-        hardware/host split. The two rows measuring the same strategy
-        through two different paths is the point, not duplication.
-        Lazy creation keeps the comparison table clean when the
-        board's bitstream predates the VWAP engines (no zero rows for
-        signals that can never arrive)."""
-        key = f"vwapfpga_{sym.lower()}"
-        if key not in cards:
-            from compare import StrategyScorecard
-            cards[key] = StrategyScorecard(
-                name=(f"VWAP-FPGA {sym}" if len(om.symbols) > 1
-                      else "VWAP-FPGA"),
-                live=False, policy=RiskPolicy(limits))
-        return cards[key]
-
     def route_to_shadow_cards(fr: dict, count: bool = True):
         """Feed a signal to whichever SCORED (non-live) cards should see
         it — the single routing rule used both for live signals
@@ -1007,13 +1001,7 @@ def main():
         one place means replay can never reach a different set of
         cards than live signals do."""
         strat = fr["strategy"]
-        if strat == "vwap_bounce":
-            # verified fabric VWAP signals: per-symbol scored row (the
-            # cards dict has no "vwap_bounce" key — this indexing gap
-            # would have been a KeyError crash on the first hardware
-            # VWAP signal, caught while wiring the routing, not live)
-            _vwap_fpga_card(fr["symbol"].strip()).on_signal(fr, count=count)
-        elif strat != args.strategy:
+        if strat != args.strategy:
             cards[strat].on_signal(fr, count=count)
         if profit_gated is not None and strat == "sma":
             profit_gated.on_signal(fr, count=count)
@@ -1032,9 +1020,11 @@ def main():
         # precisely the cards route_to_shadow_cards can reach — NOT a
         # blanket "every non-live card" filter, which would incorrectly
         # sweep in the ladder (it consumes raw ticks via br.on_echo, not
-        # verified signals, so this replay mechanism never touches it)
-        other_strat = "ema" if args.strategy == "sma" else "sma"
-        shadow_cards = [cards[other_strat]] if other_strat in cards else []
+        # verified signals, so this replay mechanism never touches it).
+        # v3.23: generalized from a hardcoded sma<->ema binary swap —
+        # with vwap_bounce now a full peer, there are always TWO other
+        # scored strategies to restore, not one, whichever is live.
+        shadow_cards = [cards[s] for s in labels if s != args.strategy]
         if profit_gated is not None:
             shadow_cards.append(profit_gated)
         # historical clock per gated card, so cooldown/daily-cap replay
@@ -1132,11 +1122,6 @@ def main():
             cards[strat].signals += 1     # real routing/gating/fills below
             outcome = om.on_signal(fr)
             sync_live_card(cards, args.strategy, om)  # keep dashboard fresh
-        elif strat == "vwap_bounce":
-            # verified FABRIC vwap signal — same per-symbol scored row
-            # route_to_shadow_cards uses (cards has no "vwap_bounce"
-            # key; the old cards[strat] here would have crashed)
-            outcome = _vwap_fpga_card(fr["symbol"].strip()).on_signal(fr)
         else:
             outcome = cards[strat].on_signal(fr)  # hypothetical, gated
         # profit_gated is ALWAYS score-only, regardless of --strategy —
@@ -1165,8 +1150,9 @@ def main():
 
     br.on_verified = on_verified          # survives slot reconfiguration:
     br.on_divergence = on_divergence      # _build_models re-attaches these
+    _others = ", ".join(s.upper() for s in labels if s != args.strategy)
     print(f"[om] trading strategy: {args.strategy.upper()} "
-          f"(the other is scored, gated identically, not traded)")
+          f"({_others} scored in parallel, gated identically, not traded)")
 
     try:
         if args.source == "sim":
