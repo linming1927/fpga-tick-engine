@@ -108,6 +108,29 @@ check("the banner ITSELF displays which strategy is about to trade "
 check("the banner is explicit that only this one strategy trades",
       "TRADES" in banner, True)
 
+# v3.27: the banner's new max-position line is conditional on the field
+# being set (None means disabled, same opt-in design as the underlying
+# RiskPolicy check) -- confirm both states render correctly
+buf2 = io.StringIO()
+with contextlib.redirect_stdout(buf2):
+    attempt()   # GOOD_LIMITS doesn't set max_position_notional_e4 -> None
+banner_no_cap = buf2.getvalue()
+check("no max-position line when the field isn't set (None, the "
+     "default) -- matches the underlying check being a true no-op",
+     "max position" in banner_no_cap, False)
+
+from dataclasses import replace
+limits_with_cap = replace(GOOD_LIMITS, max_position_notional_e4=10_000*10_000)
+buf3 = io.StringIO()
+with contextlib.redirect_stdout(buf3):
+    attempt(limits=limits_with_cap)
+banner_with_cap = buf3.getvalue()
+check("the max-position line DOES appear, with the right dollar "
+     "figure, when the field is set -- an operator arming live "
+     "should see their actual dollar exposure cap before confirming",
+     "max position      $10,000.00 total exposure" in banner_with_cap,
+     True)
+
 print("[G2] paper credentials can never arm live")
 check("paper env vars alone refuse", attempt(env={
       "ALPACA_KEY": "k", "ALPACA_SECRET": "s",

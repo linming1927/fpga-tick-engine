@@ -38,10 +38,15 @@ python3 host/order_manager.py --port /dev/pts/N --source sim --broker mock \
     --cooldown 0 --n 300 --rate 20 --dashboard 8000
 ```
 
-**Position sizing:** buys accumulate up to `--max-shares` (default 10)
-per symbol — a signal to buy while already holding is allowed as long
-as `current position + order_qty <= max_shares`, not refused outright.
-A single SELL always closes the *entire* accumulated position at once,
+**Position sizing (v3.27):** buys accumulate up to `--max-position-notional`
+(default $10,000 total exposure) per symbol — a signal to buy while already
+holding is allowed as long as the RESULTING position's dollar value stays
+under the cap, not refused outright. Sized by dollar exposure, not share
+count — the older share-count cap (`max_shares`) still exists underneath
+for `backtest.py` and the blend strategy's own per-sleeve allocation, but
+`order_manager.py`'s live/paper CLI no longer exposes or is meaningfully
+constrained by it. A single SELL always closes the *entire* accumulated
+position at once,
 correctly priced against the weighted-average cost basis across
 however many buys built it up. Cooldown and the daily order cap still
 gate every individual order regardless of position size, so this isn't
@@ -164,8 +169,13 @@ python3 host/backtest.py --trades historical_trades/SPY_2026-01-01_2026-07-01.tr
 ```
 
 `--max-shares` (10), `--max-notional` ($2,000), and `--max-orders-per-day`
-(1000) default to the exact same values as `order_manager.py`'s live
-CLI — a bare backtest with no risk-limit flags faithfully reproduces
+(1000) match what `order_manager.py`'s live CLI used before v3.27 — a bare
+backtest with no risk-limit flags reproduces that earlier position-sizing
+philosophy. `order_manager.py` itself moved to dollar-exposure sizing in
+v3.27 (`--max-position-notional`, no more `--max-shares`); `backtest.py`
+deliberately kept the share-count model, since offline analysis has no
+reason to inherit a live-trading-specific sizing preference — see the full
+CLI reference below for exactly what each tool's defaults are now.
 what a default live session would have done, not a separately-tuned
 set of backtest-only assumptions.
 
@@ -576,7 +586,7 @@ python3 host/order_manager.py --port /dev/ttyUSB1 --source sim --broker mock --c
 # the full loop — live IEX ticks, FPGA decisions, Alpaca PAPER orders:
 ALPACA_KEY=... ALPACA_SECRET=... \
 python3 host/order_manager.py --port /dev/ttyUSB1 --source alpaca \
-        --broker alpaca --symbol SPY --qty 1 --max-shares 5
+        --broker alpaca --symbol SPY --qty 1 --max-position-notional 500
 ```
 (For real-money live trading and replaying real historical data against
 the board, see "Live Trading Enablement" and "VWAP FPGA Engine & Live
@@ -655,9 +665,9 @@ fabric are just computing against different assumptions)
 | `--broker` | `mock` | `mock` (simulated fills) or `alpaca` (paper or live, depending on `--live`) |
 | `--live` | off | REAL MONEY. Requires `--broker alpaca` plus the full interlock chain — see "Live Trading Enablement" below |
 | `--max-daily-loss` | none | $ realized loss that halts the session; MANDATORY when `--live` |
-| `--qty` | `1` | Shares bought per entry |
-| `--max-shares` | `10` | Max total position size, in shares |
-| `--max-notional` | `2000.0` | Max dollar value ($) of any single buy order (`qty × price`) — independent of `--max-shares`, checked separately |
+| `--qty` | `5` | Shares bought per entry |
+| `--max-position-notional` | `10000.0` | Max dollar value ($) of the TOTAL position (existing holdings + this buy, at current price) — v3.27: replaces the old share-count `--max-shares` cap with a dollar-exposure cap. `RiskLimits.max_shares` still exists underneath for `backtest.py` and the blend strategy's own per-sleeve allocation, but this CLI no longer exposes or is constrained by it |
+| `--max-notional` | `3000.0` | Max dollar value ($) of any SINGLE buy order (`qty × price`) — independent of `--max-position-notional` above, which caps the total position, not one order |
 | `--max-orders-per-day` | `1000` | Daily order cap |
 | `--cooldown` | `60.0` | Minimum seconds between orders |
 | `--ignore-market-hours` | off | For mock/off-hours testing; has NO EFFECT when `--live` is set — `require_market_hours` is forced on unconditionally in live mode, silently overriding this flag rather than refusing it as an error |
@@ -745,7 +755,8 @@ export ALPACA_LIVE_KEY=... ALPACA_LIVE_SECRET=...
 export ALPACA_LIVE_ACK=I-UNDERSTAND-THIS-TRADES-REAL-MONEY
 python3 host/order_manager.py --port /dev/ttyUSB1 --source alpaca \
     --broker alpaca --live --symbol SPY --strategy vwap_bounce --qty 1 \
-    --max-shares 1 --max-daily-loss 50 --household-income 185000
+    --max-position-notional 1000 --max-daily-loss 50 \
+    --household-income 185000
 # banner shows: symbol SPY / strategy VWAP_BOUNCE <-- this one TRADES
 # ...then type: LIVE SPY VWAP_BOUNCE
 ```
@@ -754,7 +765,10 @@ now names the strategy, not just the symbol (`arm_live_trading()` takes it
 as a required argument). With three tradeable strategies possible, a typo'd
 `--strategy` or a stale saved command line could otherwise arm live trading
 against a different strategy than intended with nothing in the banner or
-confirmation to catch it.
+confirmation to catch it. `--qty`/`--max-position-notional`/`--max-notional`
+default to 5 shares/$10,000/$3,000 (v3.27) — shown overridden tighter here
+(`--qty 1 --max-position-notional 1000`) since this is a first real-money
+arming example, not a recommendation to start at the defaults.
 
 ## Final test census
 ```

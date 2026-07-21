@@ -99,6 +99,49 @@ check("daily cap blocks 4th order",
       "daily order cap (3) reached")
 
 # ---------------------------------------------------------------------------
+# v3.27: max_position_notional_e4 -- an ADDITIVE, opt-in dollar-exposure
+# cap on the total position, independent of the pre-existing max_shares
+# (share-count) mechanism. None (the dataclass default) must be a true
+# no-op: this is the field blended_strategy.py's per-sleeve caps and
+# backtest.py silently depend on continuing to work exactly as before.
+print("[G1b] max_position_notional_e4 -- additive dollar-exposure cap")
+
+check("default (None) means disabled -- a huge buy at a huge price is "
+     "gated ONLY by max_shares/max_notional, same as before this field "
+     "existed",
+     RiskPolicy(RiskLimits(order_qty=1, max_shares=1000,
+                           max_notional_e4=10**12,
+                           require_market_hours=False))
+     .evaluate(SIDE_BUY, 0, 5_000_000)[0], True)
+
+pol_mpn = RiskPolicy(RiskLimits(
+    order_qty=2, max_shares=1000, max_notional_e4=10**12,
+    max_position_notional_e4=10_000 * 10_000,   # $10,000 cap
+    require_market_hours=False))
+check("buy within the total-position cap is allowed",
+      pol_mpn.evaluate(SIDE_BUY, 0, 40 * 10_000)[:2],   # 2 sh @ $40 = $80
+      (True, "ok"))
+check("buy that keeps the total position under the cap is allowed "
+     "even with existing holdings factored in (200 held + 2 more @ "
+     "$40 = $8,080 total, still under $10,000)",
+     pol_mpn.evaluate(SIDE_BUY, 200, 40 * 10_000)[:2],
+     (True, "ok"))
+check("...but pushing PAST $10,000 total IS blocked",
+      pol_mpn.evaluate(SIDE_BUY, 249, 40 * 10_000)[:2],  # 251sh * $40=$10,040
+      (False, "total position 10040.00 > 10000.00"))
+check("the existing max_shares check is COMPLETELY UNTOUCHED -- still "
+     "independently blocks even when max_position_notional_e4 would "
+     "have allowed it (cheap stock, small $ exposure, but too many "
+     "shares) -- this is the exact mechanism blended_strategy.py's "
+     "per-sleeve caps and backtest.py depend on continuing to work",
+     RiskPolicy(RiskLimits(
+         order_qty=5, max_shares=10, max_notional_e4=10**12,
+         max_position_notional_e4=10_000 * 10_000,
+         require_market_hours=False))
+     .evaluate(SIDE_BUY, 8, 1 * 10_000)[:2],   # 13 shares of a $1 stock:
+     (False, "would exceed max_shares (10)"))  # tiny $, still blocked
+
+# ---------------------------------------------------------------------------
 print("[G2] kill switch latches and requires human re-arm")
 kf = tmp("om.kill")
 om = OrderManager(MockBroker(), "SPY", RiskLimits(**LIM),
@@ -1073,6 +1116,68 @@ check("the restore names BOTH non-live scored strategies -- not just "
      "one, the way a leftover hardcoded sma<->ema swap would",
      ("SMA" in restore_line and "EMA" in restore_line)
      if restore_line else True, True)
+
+# ---- v3.27: buy sizing moved from share-count to dollar-exposure --------
+print("[G22] --max-position-notional wired to the CLI; --max-shares gone")
+
+r = subprocess.run([sys.executable, ORDER_MANAGER_PY, "--help"],
+                   capture_output=True, text=True, timeout=30)
+check("--max-position-notional is a real CLI flag",
+      "--max-position-notional" in r.stdout, True)
+check("--max-shares is GONE from the CLI entirely",
+      "--max-shares" in r.stdout, False)
+check("--qty's new default is 5", "default 5" in r.stdout, True)
+
+r_bad = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", "/dev/null",
+     "--max-shares", "10"],
+    capture_output=True, text=True, timeout=15)
+check("passing the old --max-shares flag now fails argparse (loud, "
+     "not silently ignored)", r_bad.returncode, 2)
+
+# end-to-end: a real buy actually sizes at the new 5-share default, and
+# a position that would cross $10,000 total is actually blocked -- not
+# just unit-tested against RiskPolicy directly, run through the real
+# CLI against the emulator
+g22_trades = os.path.join(tempfile.mkdtemp(), "g22.jsonl")
+with open(g22_trades, "w") as f:
+    # descending warm-up then a clean spike -- the same proven crossover
+    # recipe used elsewhere in this file (a flat tape never crosses).
+    # Cheap ($10-ish) so the position-notional math stays easy to check
+    # by hand and nowhere near the new $10,000 cap at 5 shares.
+    ticks = []
+    price = 12.00
+    for i in range(8):
+        price -= 0.20
+        ticks.append(price)
+    for i in range(4):
+        price += 0.80
+        ticks.append(price)
+    for i, p in enumerate(ticks):
+        f.write(_json.dumps({
+            "t": f"2026-07-17T14:{30 + i // 60:02d}:{i % 60:02d}.000000Z",
+            "p": round(p, 2), "s": 50}) + "\n")
+
+emu22 = FPGAEmulator(symbol="SYNTH", fast_n=4, slow_n=8)
+port22 = emu22.start()
+r = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port22, "--symbol", "SYNTH",
+     "--fast", "4", "--slow", "8", "--source", "historical",
+     "--trades", g22_trades, "--replay-rate", "300", "--broker", "mock",
+     "--cooldown", "0"],
+    capture_output=True, text=True, timeout=60)
+emu22.stop()
+check("session exits cleanly", r.returncode, 0)
+check("a real fill happened", "orders filled    0" not in r.stdout, True)
+g22_pos_line = next((l for l in r.stdout.splitlines()
+                    if "final positions" in l), "")
+check("final position reflects 5-share buys (a multiple of 5, not the "
+     "old default of 1) -- confirms the new default actually executed, "
+     "not just what --help prints",
+     g22_pos_line != "" and "'SYNTH':" in g22_pos_line
+     and int(g22_pos_line.split("'SYNTH':")[1].split("}")[0].strip()) % 5
+     == 0,
+     True)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

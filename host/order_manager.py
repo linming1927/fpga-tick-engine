@@ -340,8 +340,10 @@ def arm_live_trading(symbol: str, limits: "RiskLimits", strategy: str,
     print(f"  strategy          {strat}   <-- this one TRADES; the "
          f"others are scored only")
     print(f"  shares per entry  {limits.order_qty}")
-    print(f"  max position      {limits.max_shares} shares")
-    print(f"  max notional      ${limits.max_notional_e4/10_000:,.2f} per order")
+    print(f"  max per order     ${limits.max_notional_e4/10_000:,.2f}")
+    if limits.max_position_notional_e4 is not None:
+        print(f"  max position      ${limits.max_position_notional_e4/10_000:,.2f} "
+             f"total exposure")
     print(f"  max orders/day    {limits.max_orders_per_day}")
     print(f"  cooldown          {limits.cooldown_s:.0f} s")
     print(f"  DAILY LOSS HALT   ${limits.max_daily_loss:,.2f} realized")
@@ -361,8 +363,21 @@ def arm_live_trading(symbol: str, limits: "RiskLimits", strategy: str,
 @dataclass
 class RiskLimits:
     order_qty: int = 1                    # shares per entry
-    max_shares: int = 10                  # position ceiling
+    max_shares: int = 10                  # position ceiling (share count)
     max_notional_e4: int = 2_000 * 10_000 # $2000 per order
+    max_position_notional_e4: int | None = None
+                                          # v3.27: total position dollar-value
+                                          # cap, an ALTERNATIVE to max_shares
+                                          # for callers who want to size a
+                                          # position by $ exposure rather than
+                                          # share count. None (default) means
+                                          # disabled — every EXISTING consumer
+                                          # of this shared dataclass (backtest.py,
+                                          # blended_strategy.py's per-sleeve
+                                          # share caps) is unaffected unless it
+                                          # explicitly opts in. order_manager.py
+                                          # is the one caller that does (see its
+                                          # --max-position-notional flag)
     max_orders_per_day: int = 1000
     cooldown_s: float = 60.0              # anti-whipsaw gap between orders
     require_market_hours: bool = True     # RTH gate (no holiday calendar)
@@ -417,6 +432,12 @@ class RiskPolicy:
             qty = lim.order_qty
             if position_qty + qty > lim.max_shares:
                 return False, f"would exceed max_shares ({lim.max_shares})", 0
+            if lim.max_position_notional_e4 is not None:
+                total_e4 = (position_qty + qty) * price_e4
+                if total_e4 > lim.max_position_notional_e4:
+                    return False, (f"total position "
+                                   f"{dollars(total_e4):.2f} > "
+                                   f"{dollars(lim.max_position_notional_e4):.2f}"), 0
             if qty * price_e4 > lim.max_notional_e4:
                 return False, (f"notional {dollars(qty*price_e4):.2f} > "
                                f"{dollars(lim.max_notional_e4):.2f}"), 0
@@ -777,13 +798,6 @@ def main():
                          "--trades against the board — the bring-up step "
                          "after --selftest passes, before any live "
                          "session trusts a fabric signal")
-    ap.add_argument("--relay-url", default=None,
-                    help="--source alpaca: connect to a local "
-                        "alpaca_relay.py instance instead of Alpaca "
-                        "directly, e.g. ws://localhost:8765 — use this "
-                        "when running alongside another project that "
-                        "also wants live prices at the same time (only "
-                        "one direct connection allowed per Alpaca login)")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--rate", type=float, default=10.0)
     ap.add_argument("--start-price", type=float, default=500.0)
@@ -812,9 +826,26 @@ def main():
     ap.add_argument("--max-daily-loss", type=float, default=None,
                     help="$ realized loss that halts the session "
                          "(MANDATORY in --live)")
-    ap.add_argument("--qty", type=int, default=1)
-    ap.add_argument("--max-shares", type=int, default=10)
-    ap.add_argument("--max-notional", type=float, default=2000.0)
+    ap.add_argument("--qty", type=int, default=5,
+                    help="shares bought per entry signal (default 5)")
+    ap.add_argument("--max-position-notional", type=float, default=10_000.0,
+                    help="$ cap on the TOTAL value of an open position "
+                         "(existing shares + this buy, at the current "
+                         "price) — default $10,000. v3.27: replaces the "
+                         "old share-count position cap with a dollar-"
+                         "EXPOSURE cap instead; sizing by dollar risk "
+                         "rather than share count. The underlying "
+                         "max_shares mechanism still exists in RiskLimits "
+                         "(backtest.py and the blend strategy's per-sleeve "
+                         "caps still use it for their own purposes) but "
+                         "order_manager.py no longer exposes it as a CLI "
+                         "flag or lets it meaningfully constrain a live/"
+                         "paper session — this dollar cap is what governs "
+                         "here now")
+    ap.add_argument("--max-notional", type=float, default=3000.0,
+                    help="$ cap on any SINGLE buy order (qty x price) — "
+                         "independent of --max-position-notional above, "
+                         "which caps the total position, not one order")
     ap.add_argument("--max-orders-per-day", type=int, default=1000)
     ap.add_argument("--cooldown", type=float, default=60.0)
     ap.add_argument("--ignore-market-hours", action="store_true",
@@ -865,8 +896,19 @@ def main():
     pg_max_hold = normalize_max_hold_days(args.pg_max_hold_days)
 
     limits = RiskLimits(order_qty=args.qty,
-                        max_shares=args.max_shares,
+                        # max_shares itself still exists on RiskLimits and
+                        # is still enforced by RiskPolicy.evaluate() (see
+                        # the dataclass's own comment — backtest.py and the
+                        # blend strategy's per-sleeve caps depend on it for
+                        # their own purposes) — but order_manager.py's live/
+                        # paper sessions are sized by dollar exposure now,
+                        # not share count, so this is set high enough to
+                        # never be the binding constraint here; the real
+                        # limit is max_position_notional_e4 below
+                        max_shares=10**9,
                         max_notional_e4=int(args.max_notional * 10_000),
+                        max_position_notional_e4=int(
+                            args.max_position_notional * 10_000),
                         max_orders_per_day=args.max_orders_per_day,
                         cooldown_s=args.cooldown,
                         require_market_hours=(args.live or
@@ -1185,7 +1227,7 @@ def main():
             cap = args.replay_max if args.replay_max > 0 else None
             run_historical(br, paths, rate=args.replay_rate, max_trades=cap)
         else:
-            run_alpaca(br, relay_url=args.relay_url)
+            run_alpaca(br)
     except KeyboardInterrupt:
         pass
     finally:

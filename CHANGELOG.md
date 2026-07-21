@@ -593,3 +593,42 @@ estimate flags work in any mode, it's specifically the resulting fee/
 tax figures that are real vs. hypothetical depending on paper or live,
 not the flags' applicability. Documentation only, no code changes —
 host suite unchanged at 729.
+
+**v3.27** — order_manager.py's buy sizing moved from share-count to
+dollar-exposure, per request: --qty default 1->5 shares per buy
+signal, --max-notional default $2,000->$3,000 (unchanged mechanism,
+still a per-order cap), and --max-shares REMOVED entirely from the
+CLI, replaced by --max-position-notional (default $10,000) — a cap
+on the TOTAL position's dollar value (existing holdings + this buy,
+at current price), not share count. Deliberately global (applies to
+whichever strategy is live — sma/ema/vwap_bounce — matching how
+every other risk limit already works, not special-cased to VWAP).
+Real landmine found and avoided before implementing: RiskLimits.
+max_shares is NOT order_manager.py's private field — blended_
+strategy.py's per-sleeve capital allocation (vwap_shares=6, pg_
+shares=4 from way back) and backtest.py's own --max-shares flag both
+depend on that exact mechanism continuing to work. A literal deletion
+would have silently broken the blend strategy's tuned sleeve
+allocation. Fix: the new max_position_notional_e4 field is ADDITIVE
+and opt-in (None by default, a true no-op) — every existing consumer
+of the shared dataclass is completely unaffected unless it explicitly
+sets the field, which only order_manager.py's own CLI now does; the
+old max_shares check in RiskPolicy.evaluate() is completely untouched
+and still independently enforced. From order_manager.py's CLI
+surface, --max-shares is fully gone (now fails argparse outright,
+loud not silent, if anyone passes it); underneath, nothing else
+broke. Verified at three levels: unit tests proving the new check
+blocks/allows correctly AND that the old max_shares mechanism still
+independently blocks even when the new dollar check would have
+allowed it; a CLI-level test confirming the old flag now errors;
+and an end-to-end run against the emulator confirming a real fill
+actually sizes at the new 5-share default. Fixed a test that was
+asserting backtest.py's and order_manager.py's CLI defaults stay
+identical — a premise now deliberately false for --max-shares/--max-
+notional specifically (backtest.py intentionally unchanged; offline
+analysis has no reason to inherit a live-trading-specific sizing
+preference) — replaced with explicit checks of each tool's own
+correct values instead of silently loosening the comparison. README
+updated: the CLI reference table, both live-trading examples, and
+the backtest-defaults-parity claim that this drop made false. 15 new
+checks; 744 total across the host suite, 0 failures.

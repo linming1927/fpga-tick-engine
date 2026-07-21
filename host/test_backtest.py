@@ -264,7 +264,7 @@ def cli_default(module_src, flag):
                  module_src)
     return float(m.group(1).replace("_", "")) if m else None
 
-for flag in ("--max-shares", "--max-notional", "--max-orders-per-day"):
+for flag in ("--max-orders-per-day",):
     check(f"{flag} default matches between backtest.py and order_manager.py",
           cli_default(bt_src, flag), cli_default(om_src, flag))
 check("max_orders_per_day default is specifically 1000 (per request), "
@@ -275,6 +275,25 @@ check("max_shares default is specifically 10, not the old value of 1",
 check("max_notional default is specifically $2,000, not the old "
      "effectively-unlimited $1,000,000",
      cli_default(bt_src, "--max-notional"), 2000.0)
+
+# v3.27: --max-shares and --max-notional's defaults deliberately DIVERGED
+# between the two tools — order_manager.py's live/paper position sizing
+# moved to a dollar-exposure model (--max-position-notional, $10,000
+# default) and dropped the share-count flag entirely; backtest.py is
+# unaffected on purpose (offline analysis has no reason to inherit a
+# live-trading-specific sizing preference). Confirmed explicitly, not
+# just left to silently pass by omission from the loop above.
+check("order_manager.py no longer has a --max-shares flag at all "
+     "(replaced by --max-position-notional; the underlying RiskLimits "
+     "field still exists for backtest.py/blended_strategy.py's own use)",
+     cli_default(om_src, "--max-shares"), None)
+check("order_manager.py's --max-notional default moved to $3,000 "
+     "(was $2,000, still matching backtest.py's) -- a deliberate, "
+     "live-trading-specific change; backtest.py's stays at $2,000",
+     cli_default(om_src, "--max-notional"), 3000.0)
+check("order_manager.py has the new --max-position-notional flag, "
+     "$10,000 default",
+     cli_default(om_src, "--max-position-notional"), 10_000.0)
 
 # ---- v3.7: --htf-ltf wired into backtest.py -------------------------------
 print("[G9] backtest.py can also score the HTF/LTF trend strategy")
