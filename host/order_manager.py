@@ -777,6 +777,13 @@ def main():
                          "--trades against the board — the bring-up step "
                          "after --selftest passes, before any live "
                          "session trusts a fabric signal")
+    ap.add_argument("--relay-url", default=None,
+                    help="--source alpaca: connect to a local "
+                        "alpaca_relay.py instance instead of Alpaca "
+                        "directly, e.g. ws://localhost:8765 — use this "
+                        "when running alongside another project that "
+                        "also wants live prices at the same time (only "
+                        "one direct connection allowed per Alpaca login)")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--rate", type=float, default=10.0)
     ap.add_argument("--start-price", type=float, default=500.0)
@@ -1178,7 +1185,7 @@ def main():
             cap = args.replay_max if args.replay_max > 0 else None
             run_historical(br, paths, rate=args.replay_rate, max_trades=cap)
         else:
-            run_alpaca(br)
+            run_alpaca(br, relay_url=args.relay_url)
     except KeyboardInterrupt:
         pass
     finally:

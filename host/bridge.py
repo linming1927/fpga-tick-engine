@@ -722,8 +722,18 @@ def run_selftest(br: Bridge):
         print("[selftest] FAIL — see DIAG lines above and the summary")
 
 
-def run_alpaca(br: Bridge, feed: str = "iex"):
-    """Live trades via Alpaca's v2 websocket. Lazy import + clear errors."""
+def run_alpaca(br: Bridge, feed: str = "iex", relay_url: str | None = None):
+    """Live trades via Alpaca's v2 websocket. Lazy import + clear errors.
+
+    relay_url: if set, connect here instead of to Alpaca directly —
+    point this at a running alpaca_relay.py (see the ladder-trader
+    project) when you want this AND another project both consuming
+    live prices at the same time. Alpaca only allows one direct
+    connection per login, even on paid data tiers, so running two
+    projects' direct connections concurrently isn't possible without
+    a relay in front of one real connection. Auth is still sent (the
+    relay ignores its contents) so nothing else here needs to change.
+    """
     try:
         import websocket                              # websocket-client
     except ImportError:
@@ -734,7 +744,7 @@ def run_alpaca(br: Bridge, feed: str = "iex"):
     if not (key and secret):
         sys.exit("set ALPACA_KEY and ALPACA_SECRET environment variables")
 
-    url = f"wss://stream.data.alpaca.markets/v2/{feed}"
+    url = relay_url or f"wss://stream.data.alpaca.markets/v2/{feed}"
     if not br.configure_symbols(br.symbols):
         sys.exit("[alpaca] aborting: FPGA slot configuration failed")
 
@@ -800,6 +810,13 @@ def main():
                     help="real SECONDS an unmatched FPGA/model signal may "
                          "wait before being flagged an orphan divergence "
                          "(NOT an echo count — see SignalVerifier)")
+    ap.add_argument("--relay-url", default=None,
+                    help="--source alpaca: connect to a local "
+                        "alpaca_relay.py instance instead of Alpaca "
+                        "directly, e.g. ws://localhost:8765 — use this "
+                        "when running alongside another project that "
+                        "also wants live prices at the same time (only "
+                        "one direct connection allowed per Alpaca login)")
     args = ap.parse_args()
 
     br = Bridge(args.port, args.symbols.split(","), args.fast, args.slow,
@@ -811,7 +828,7 @@ def main():
         elif args.source == "selftest":
             run_selftest(br)
         else:
-            run_alpaca(br)
+            run_alpaca(br, relay_url=args.relay_url)
     except KeyboardInterrupt:
         pass
     finally:
