@@ -142,6 +142,74 @@ check("the existing max_shares check is COMPLETELY UNTOUCHED -- still "
      (False, "would exceed max_shares (10)"))  # tiny $, still blocked
 
 # ---------------------------------------------------------------------------
+# v3.28: run_alpaca(relay_url=...) -- connect to a local relay instead of
+# Alpaca directly, for running alongside another project that needs the
+# same live price feed (Alpaca allows only one direct connection per
+# login). Verified by intercepting the actual WebSocketApp construction
+# call, not just checking the parameter exists -- proves the real URL
+# selection logic runs, with no real network I/O anywhere in the test.
+print("[G1c] run_alpaca(relay_url=...) actually changes the connection "
+     "target, not just accepts the parameter")
+
+import types
+captured_urls = []
+
+class _FakeWS:
+    def __init__(self, url, **kwargs):
+        captured_urls.append(url)
+    def run_forever(self):
+        pass          # never actually connects anywhere
+    def close(self):
+        pass
+
+fake_websocket_module = types.ModuleType("websocket")
+fake_websocket_module.WebSocketApp = _FakeWS
+old_ws_module = sys.modules.get("websocket")
+sys.modules["websocket"] = fake_websocket_module
+
+os.environ["ALPACA_KEY"] = "test_key"
+os.environ["ALPACA_SECRET"] = "test_secret"
+
+from fpga_emulator import FPGAEmulator as _FPGAEmulatorEarly
+from bridge import Bridge as _BridgeEarly
+emu_relay = _FPGAEmulatorEarly(symbol="SPY", fast_n=8, slow_n=32)
+port_relay = emu_relay.start()
+
+def _run_once(relay_url):
+    br_relay = _BridgeEarly(port_relay, "SPY", 8, 32)
+    real_pump = br_relay.pump          # bound method, before patching
+    call_count = [0]
+    def _pump_then_interrupt(timeout=0.0):
+        call_count[0] += 1
+        if call_count[0] <= 20:        # let configure_symbols's own
+            return real_pump(timeout=timeout)   # pump() calls complete
+        raise KeyboardInterrupt        # THEN interrupt the run_alpaca
+                                       # main loop, after ws is set up
+    br_relay.pump = _pump_then_interrupt
+    from bridge import run_alpaca
+    run_alpaca(br_relay, relay_url=relay_url)   # returns cleanly on the
+                                                # KeyboardInterrupt from pump
+    br_relay.close()
+
+captured_urls.clear()
+_run_once(relay_url="ws://localhost:8765")
+check("relay_url set -> WebSocketApp is constructed with THAT url, "
+     "not Alpaca's",
+     captured_urls, ["ws://localhost:8765"])
+
+captured_urls.clear()
+_run_once(relay_url=None)
+check("relay_url=None (the default) -> falls back to the real Alpaca "
+     "endpoint, unchanged from before this feature existed",
+     captured_urls, ["wss://stream.data.alpaca.markets/v2/iex"])
+
+emu_relay.stop()
+if old_ws_module is not None:
+    sys.modules["websocket"] = old_ws_module
+else:
+    del sys.modules["websocket"]
+
+# ---------------------------------------------------------------------------
 print("[G2] kill switch latches and requires human re-arm")
 kf = tmp("om.kill")
 om = OrderManager(MockBroker(), "SPY", RiskLimits(**LIM),

@@ -632,3 +632,28 @@ correct values instead of silently loosening the comparison. README
 updated: the CLI reference table, both live-trading examples, and
 the backtest-defaults-parity claim that this drop made false. 15 new
 checks; 744 total across the host suite, 0 failures.
+
+**v3.28** — --relay-url: connect through a local relay instead of
+directly to Alpaca, for running this project alongside another one
+(the separate ladder-trader project) that needs the same live price
+feed at the same time — Alpaca allows only one direct websocket
+connection per login, even on paid tiers. Point this at a running
+alpaca_relay.py (e.g. ws://localhost:8765) and everything else is
+unchanged; omit it and behavior is identical to before this existed.
+Delivered from two uploaded files (order_manager.py, bridge.py) that
+turned out to be based on a pre-v3.27 snapshot — applying them
+verbatim would have silently reverted the just-shipped position-
+sizing work (--max-position-notional, the $10k dollar-exposure cap,
+the qty/notional default changes). Diffed against the current tree
+first, isolated the one genuinely new capability (relay_url threading
+through run_alpaca, in both bridge.py's own small CLI and
+order_manager.py's primary one), and applied only that on top of the
+current, up-to-date codebase — v3.27 is untouched and confirmed
+intact (--max-position-notional still present, same defaults). New
+[G1c] in test_order_manager.py verifies the actual connection target
+by intercepting the real WebSocketApp construction (a fake websocket
+module swapped into sys.modules, zero real network I/O) rather than
+just checking the CLI flag exists: relay_url set routes to that URL
+exactly, relay_url unset (the default) still resolves to the real
+Alpaca endpoint unchanged. 2 new checks; 746 total across the host
+suite, 0 failures.
