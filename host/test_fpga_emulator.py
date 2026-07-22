@@ -96,6 +96,26 @@ def start_emulator(symlink_path, extra_args=()):
         time.sleep(0.05)
     return proc
 
+import stat as stat_module
+
+def _is_real_pty_target(path):
+    """v3.33: platform-agnostic check that `path` resolves to a real,
+    currently-open pty device. NOT a hardcoded path-prefix check --
+    Linux names pty slaves /dev/pts/N, macOS names them /dev/ttysNNN;
+    hardcoding either one (this function replaces two spots that
+    hardcoded /dev/pts/ specifically) IS the bug, found running this
+    exact test on a Mac for the first time. What's actually true on
+    BOTH platforms: it's a character-special device that lives under
+    /dev/ -- check that instead of any specific subdirectory naming."""
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return False
+    return stat_module.S_ISCHR(mode) and path.startswith("/dev/")
+
+
 tmp = tempfile.mkdtemp()
 
 for sig_name, sig in (("SIGINT", signal.SIGINT), ("SIGTERM", signal.SIGTERM)):
@@ -105,12 +125,20 @@ for sig_name, sig in (("SIGINT", signal.SIGINT), ("SIGTERM", signal.SIGTERM)):
 
     real_target = os.path.realpath(link) if os.path.islink(link) else None
     check(f"[{sig_name}] symlink points at a real pty",
-          bool(real_target and real_target.startswith("/dev/pts/")), True)
+          bool(real_target and _is_real_pty_target(real_target)), True)
 
     if real_target:
         import serial
         from tick_protocol import pack_symcfg
-        ser = serial.Serial(link, 921_600, timeout=2.0)
+        # v3.32: a standard rate, deliberately -- this connects to the
+        # pty directly (not through Bridge.__init__), so it doesn't
+        # get v3.30's non-standard-baud fallback. Found the hard way:
+        # this line originally hardcoded 921600 and hit the exact same
+        # macOS ENOTTY ioctl failure v3.30 fixed in bridge.py, just in
+        # this test's own raw connection instead. Baud is meaningless
+        # for a pty either way, so there was never a reason to use a
+        # non-standard rate here at all.
+        ser = serial.Serial(link, 115200, timeout=2.0)
         ser.write(pack_symcfg(0, "SPY", enable=True))
         resp = ser.read(32)
         ser.close()
@@ -139,7 +167,7 @@ os.symlink("/nonexistent/stale/target", link2)      # a dangling stale link
 proc = start_emulator(link2)
 check("stale dangling symlink replaced with a working one",
       os.path.islink(link2)
-      and os.path.realpath(link2).startswith("/dev/pts/"), True)
+      and _is_real_pty_target(os.path.realpath(link2)), True)
 proc.send_signal(signal.SIGTERM)
 proc.wait(timeout=5)
 
@@ -168,6 +196,57 @@ except subprocess.TimeoutExpired:
     out, _ = proc.communicate()
 check("no 'stable path' banner line when --port-symlink is disabled",
       "stable path" in out, False)
+
+print("[G6] v3.31: stop() actually confirms the reader thread exited "
+     "-- found via a real macOS hang: the ORIGINAL stop() only set a "
+     "flag and closed fds, trusting that close()-from-another-thread "
+     "would reliably interrupt a concurrently blocked os.read() in "
+     "the reader thread. That's platform-inconsistent (Linux mostly "
+     "does; macOS/BSD kernels are documented to sometimes leave the "
+     "read blocked in an uninterruptible state instead) -- the fix "
+     "uses a timeout-bounded select() so the reader checks its own "
+     "stop flag on a fixed schedule, never depending on an external "
+     "close() to wake it at all")
+
+emu6 = FPGAEmulator(symbol="SPY")
+emu6.start()
+check("reader thread is alive right after start",
+      emu6.thread.is_alive(), True)
+
+# let it sit genuinely idle in the blocking wait for longer than one
+# select() timeout cycle (0.2s) -- this is the actual condition that
+# hung on macOS: a reader with nothing to read, blocked, and asked to
+# stop while still waiting rather than mid-read
+time.sleep(0.5)
+check("still alive after sitting idle (confirms it was genuinely "
+     "blocked/waiting, not something that exited early for an "
+     "unrelated reason)", emu6.thread.is_alive(), True)
+
+t0 = time.monotonic()
+emu6.stop()
+elapsed = time.monotonic() - t0
+check("stop() returns promptly -- well under its own 2s join "
+     "timeout, and not meaningfully longer than one select() cycle",
+     elapsed < 1.0, True)
+check("the thread is CONFIRMED dead immediately after stop() returns "
+     "-- not 'probably will exit soon in the background', which is "
+     "exactly the gap that let the original bug hide: the old stop() "
+     "returned instantly regardless of whether the thread actually "
+     "exited, so nothing ever caught it not doing so",
+     emu6.thread.is_alive(), False)
+
+# a SECOND emulator, stopped almost immediately after starting (racing
+# stop() against the reader thread barely having begun its first
+# select() call at all) -- the other edge of the same race
+emu7 = FPGAEmulator(symbol="SPY")
+emu7.start()
+t1 = time.monotonic()
+emu7.stop()
+elapsed2 = time.monotonic() - t1
+check("stop() immediately after start() also returns promptly and "
+     "confirms the thread is dead (the race's OTHER edge: stopping "
+     "before the reader has settled into its wait)",
+     (elapsed2 < 1.0, emu7.thread.is_alive()), (True, False))
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
