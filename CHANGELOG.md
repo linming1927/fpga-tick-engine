@@ -657,3 +657,46 @@ just checking the CLI flag exists: relay_url set routes to that URL
 exactly, relay_url unset (the default) still resolves to the real
 Alpaca endpoint unchanged. 2 new checks; 746 total across the host
 suite, 0 failures.
+
+**v3.29** — this project can now run entirely without an FPGA board,
+per request (freeing the Arty for another project). fpga_emulator.py
+was already a pure-Python, bit-exact stand-in for the real board (it
+computes every signal through the same SMAMirror/EMAMirror/VWAPMirror
+classes every hardware signal is verified against) but had only ever
+been used as an internal test fixture — imported, run for a few
+hundred ticks, torn down. Made it a genuine, documented, first-class
+replacement for a real board instead of rearchitecting the signal
+path to bypass hardware verification (which would have meant giving
+up the entire verified-against-an-independent-model discipline this
+project is built on, for no reason — the emulator already IS that
+model). Extended: constructor and CLI gained --ema-kf/--ema-ks/
+--vwap-warmup/--vwap-k2-q8 for full parameter parity with
+order_manager.py's own bitstream-matching flags (previously hardcoded
+to defaults, no way to override); new --port-symlink (default
+/tmp/fpga-tick-emulator) maintains a STABLE path across restarts,
+since a bare pty's path changes every run — the same role a real
+board's /dev/ttyUSBx plays, without the USB enumeration quirks a real
+board has. Found and fixed a real gap while building this: cleanup
+(symlink removal) only ran on Ctrl-C/SIGINT; a bare `kill <pid>`
+(SIGTERM, the default signal, and the more likely one from a process
+manager or a closed terminal) didn't trigger it at all, leaving a
+stale dangling symlink. Added a SIGTERM handler routing through the
+same cleanup path. Verified at every level: unit tests that the new
+constructor params actually reach the VWAPMirror instances (not just
+accepted and dropped); a real subprocess test sending real serial
+traffic through the symlink path via pyserial (not the raw pty) and
+confirming a genuine 0x90 ack comes back; confirmed clean shutdown on
+BOTH signals; confirmed a stale symlink or an unrelated plain file
+already sitting at the target path gets replaced without erroring.
+Beyond the unit level: ran a full ~40-second, 6000-tick, 5-symbol
+session (SPY/QQQ/RKLB/TSLA/RIVN) through order_manager.py with
+--strategy vwap_bounce and --dashboard live, connected entirely
+through the symlink with zero real hardware anywhere — dashboard
+reachable mid-session with correct multi-symbol data, all three
+strategies verified with zero divergence throughout, real fills
+placed on the live VWAP strategy. New test_fpga_emulator.py (19
+checks) is the first dedicated coverage of the emulator's own
+standalone CLI, as opposed to its long-standing use as an imported
+test fixture. README: new "Running without an FPGA board" section
+documenting this as a first-class workflow, not a footnote. 19 new
+checks; 765 total across the host suite, 0 failures.

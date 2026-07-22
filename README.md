@@ -701,6 +701,57 @@ fabric are just computing against different assumptions)
 
 ---
 
+## Running without an FPGA board (v3.29)
+
+Everything above assumes a real board on `--port`. As of v3.29,
+`fpga_emulator.py` — previously an internal test fixture only — is a
+genuine, documented replacement for one, so this project can run as a
+pure-Python terminal tool with no board attached at all (freeing the
+Arty up for something else, or just for development away from the
+hardware).
+
+**This is not an approximation.** The emulator computes every signal
+through the exact same `SMAMirror`/`EMAMirror`/`VWAPMirror` classes
+that every hardware signal in this project has always been verified
+against — the same math the real board's RTL is checked against
+bit-for-bit. Running against the emulator doesn't lower the bar; it
+removes the silicon underneath math that was already proven correct.
+
+```bash
+# terminal 1: start the virtual board, leave it running
+python3 host/fpga_emulator.py --symbol SPY
+
+# terminal 2: point order_manager.py at the printed stable path exactly
+# like a real board -- everything else about the command is unchanged
+python3 host/order_manager.py --port /tmp/fpga-tick-emulator \
+    --symbols SPY,QQQ --strategy vwap_bounce \
+    --source alpaca --broker paper --dashboard 8000
+```
+
+The emulator prints a **stable symlink path** (`/tmp/fpga-tick-emulator`
+by default, override with `--port-symlink`) alongside the real,
+otherwise-different-every-run pty path — so your `order_manager.py`
+command line never has to change between restarts, the same way a
+real board's `/dev/ttyUSB0` stays put across sessions (modulo the USB
+enumeration quirks a real board can have, which the emulator has none
+of). The symlink is cleaned up automatically on shutdown, whether you
+stop it with Ctrl-C or a plain `kill <pid>`.
+
+Match parameters the same way you would with a real bitstream:
+`--fast`/`--slow`/`--ema-kf`/`--ema-ks`/`--vwap-warmup`/`--vwap-k2-q8`
+all exist on the emulator too, defaulting to the same values
+`order_manager.py` defaults to — so a bare `fpga_emulator.py` and a
+bare `order_manager.py` already agree with each other out of the box.
+
+Everything else is completely unaffected: `--selftest`, `--source
+historical`, `--strategy vwap_bounce`, the dashboard, the live-arming
+interlocks — all of it works identically, because none of it has ever
+cared whether the bytes on `--port` came from real silicon or from
+`fpga_emulator.py`. The only thing that changes is what's plugged into
+the USB port: nothing.
+
+---
+
 # Costs & Tax Estimation (sixth drop)
 
 | File | Purpose |

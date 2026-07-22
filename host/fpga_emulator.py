@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 import threading
 import time
@@ -49,8 +50,10 @@ from tick_protocol import (FrameParser, SMAMirror, EMAMirror, VWAPMirror,
 class FPGAEmulator:
     def __init__(self, symbol: str = "SPY", fast_n: int = 8,
                  slow_n: int = 32, ema_kf: int = 3, ema_ks: int = 5,
+                 vwap_warmup: int = 20, vwap_k2_q8: int = 256,
                  verbose: bool = False):
         self.params = (fast_n, slow_n, ema_kf, ema_ks)
+        self.vwap_params = (vwap_warmup, vwap_k2_q8)
         # slot register file, mirroring symcfg.sv: slot 0 seeded
         self.slots = {0: symbol.strip().upper()}
         self.models = {"sma": {}, "ema": {}, "vwap_bounce": {}}
@@ -82,12 +85,13 @@ class FPGAEmulator:
         that slot's engine state (symcfg.sv slot_wr -> engine state_rst),
         so host mirror models can rebuild in lockstep."""
         f, sl, kf, ks = self.params
+        vw, vk2 = self.vwap_params
         if fresh or sym not in self.models["sma"]:
             self.models["sma"][sym] = SMAMirror(fast_n=f, slow_n=sl)
             self.models["ema"][sym] = EMAMirror(k_fast=kf, k_slow=ks,
                                                 warmup_n=sl)
-            self.models["vwap_bounce"][sym] = VWAPMirror()   # RTL defaults:
-                                                 # WARMUP_N=20, K2_Q8=256
+            self.models["vwap_bounce"][sym] = VWAPMirror(
+                warmup_n=vw, k2_q8=vk2)
 
     # ---- the board ---------------------------------------------------------
     def _fpga_ts(self) -> int:
@@ -160,24 +164,94 @@ class FPGAEmulator:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Virtual Arty tick engine on a pty")
-    ap.add_argument("--symbol", default="SPY")
-    ap.add_argument("--fast", type=int, default=8)
-    ap.add_argument("--slow", type=int, default=32)
+    ap = argparse.ArgumentParser(
+        description="Virtual Arty tick engine on a pty — a pure-Python "
+                    "stand-in for the real board. Computes SMA/EMA/VWAP "
+                    "signals through the exact same mirror models "
+                    "(tick_protocol.SMAMirror/EMAMirror/VWAPMirror) "
+                    "that every hardware signal in this project is "
+                    "verified against — so a session run against this "
+                    "emulator isn't an approximation of the board, it's "
+                    "the same math, just without silicon underneath it.")
+    ap.add_argument("--symbol", default="SPY",
+                    help="initial symbol for slot 0 (order_manager.py's "
+                        "own --symbols will configure the real slots "
+                        "it needs once it connects — this is just a "
+                        "placeholder before that happens)")
+    ap.add_argument("--fast", type=int, default=8,
+                    help="SMA fast window, in ticks — must match "
+                        "order_manager.py's --fast")
+    ap.add_argument("--slow", type=int, default=32,
+                    help="SMA slow window, in ticks — must match "
+                        "order_manager.py's --slow")
+    ap.add_argument("--ema-kf", type=int, default=3,
+                    help="fast EMA shift — must match --ema-kf")
+    ap.add_argument("--ema-ks", type=int, default=5,
+                    help="slow EMA shift — must match --ema-ks")
+    ap.add_argument("--vwap-warmup", type=int, default=20,
+                    help="VWAP ticks-before-events threshold — must "
+                        "match --vwap-warmup")
+    ap.add_argument("--vwap-k2-q8", type=int, default=256,
+                    help="VWAP band width, k^2 in Q8 — must match "
+                        "--vwap-k2-q8")
+    ap.add_argument("--port-symlink", default="/tmp/fpga-tick-emulator",
+                    help="maintain a stable symlink to the pty's real "
+                        "(and otherwise different every run) path, so "
+                        "your order_manager.py command never needs to "
+                        "change between restarts. Pass '' to disable.")
     args = ap.parse_args()
 
-    emu = FPGAEmulator(args.symbol, args.fast, args.slow, verbose=True)
+    emu = FPGAEmulator(args.symbol, args.fast, args.slow,
+                       ema_kf=args.ema_kf, ema_ks=args.ema_ks,
+                       vwap_warmup=args.vwap_warmup,
+                       vwap_k2_q8=args.vwap_k2_q8, verbose=True)
     path = emu.start()
+
+    symlink = args.port_symlink.strip()
+    if symlink:
+        try:
+            if os.path.islink(symlink) or os.path.exists(symlink):
+                os.remove(symlink)
+            os.symlink(path, symlink)
+        except OSError as e:
+            print(f"[emu] WARNING: couldn't create --port-symlink "
+                 f"{symlink!r} ({e}) — use the real path below instead")
+            symlink = None
+
     print(f"virtual FPGA listening on: {path}")
-    print(f"  engines: SMA {args.fast}/{args.slow} + EMA, 8 runtime slots "
-          f"(slot 0 = '{emu.slots[0]}')")
-    print(f"  point bridge.py at it:  python3 bridge.py --port {path} "
-          f"--source sim --symbol {args.symbol.strip()}")
+    print(f"  engines: SMA {args.fast}/{args.slow}, EMA k={args.ema_kf}/"
+         f"{args.ema_ks}, VWAP warmup={args.vwap_warmup} "
+         f"k2_q8={args.vwap_k2_q8}, 8 runtime slots "
+         f"(slot 0 = '{emu.slots[0]}')")
+    if symlink:
+        print(f"  stable path (survives restarts): {symlink}")
+        print(f"  point order_manager.py at it:")
+        print(f"    python3 order_manager.py --port {symlink} "
+             f"--symbol {args.symbol.strip()} --fast {args.fast} "
+             f"--slow {args.slow} --source alpaca --broker mock ...")
+    print(f"  Ctrl-C to stop")
+
+    # cleanup (symlink removal, emulator.stop()) must run on ANY normal
+    # termination, not just Ctrl-C/SIGINT -- `kill <pid>` (SIGTERM, the
+    # default) doesn't raise KeyboardInterrupt on its own, and a process
+    # manager or a closed terminal is more likely to send SIGTERM than
+    # SIGINT. Route both through the same handler.
+    def _handle_sigterm(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
+        pass
+    finally:
         emu.stop()
+        if symlink and os.path.islink(symlink):
+            try:
+                os.remove(symlink)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
