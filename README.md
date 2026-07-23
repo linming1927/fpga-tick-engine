@@ -634,6 +634,14 @@ fabric are just computing against different assumptions)
 |---|---|---|
 | `--strategy` | `sma` | `sma`, `ema`, or `vwap_bounce` — this one's verified signals actually place orders; the other two are scored alongside for comparison, gated identically, never trading |
 
+**VWAP session control & risk management** (v3.38, `--strategy vwap_bounce` only)
+| Flag | Default | What it does |
+|---|---|---|
+| `--force-vwap-reset` | off | Reset the VWAP session even if one's already been recorded today. Normally the reset happens only on the FIRST startup of a new trading day (tracked via the audit log) — a same-day restart skips it, trusting a continuously-running board/emulator's own accumulated state, and rebuilds the host's own mirror from `--log` instead. Use this if the board/emulator itself was ALSO restarted since the day's earlier reset, not just `order_manager.py` |
+| `--stop-sigma-mult` | `0.0` | Stop-loss placed at this many standard deviations below session VWAP, fixed the moment a position opens (does not move afterward, even if the session VWAP moves hard against the position or more shares get added). Checked on every tick, independent of whether the fabric's own bounce/cross signal happens to fire — a stop fires the instant it's breached. **Default `0.0` disables the stop-loss and the anchored-VWAP gate below entirely** — this is real-money-affecting new behavior (v3.38), so it's explicit opt-in rather than silently active for `vwap_bounce` sessions already in use |
+| `--anchor-gate-tolerance` | `0.0` | How far BELOW a position's own anchored VWAP still counts as close enough to let an OLDER (opened on an earlier day) position exit — e.g. `0.01` allows exiting up to 1% below it. A same-day position is never gated by this at all; only a position that's survived across a day boundary is |
+| `--risk-per-trade` | `500.0` | Dollars at risk per NEW position — if the stop-loss is hit, this is roughly what that trade costs. Position size is `--risk-per-trade` divided by the distance to the stop, floored to a whole share, not a fixed share count. Still fully capped by `--max-shares`/`--max-notional`/`--max-position-notional` same as any buy — risk-sizing passes through those same checks rather than bypassing them |
+
 **Extra scored-only comparisons** (never trade, regardless of `--strategy`)
 | Flag | Default | What it does |
 |---|---|---|
@@ -652,6 +660,7 @@ fabric are just computing against different assumptions)
 | Flag | Default | What it does |
 |---|---|---|
 | `--source` | `sim` | `sim` (synthetic random walk), `alpaca` (live/paper market data), or `historical` (real recorded trades) |
+| `--relay-url` | none | `--source alpaca` only: connect to a local `alpaca_relay.py` instance (e.g. `ws://localhost:8765`) instead of Alpaca directly — for running alongside another project that also wants live prices at the same time. Alpaca allows only one direct connection per login |
 | `--n` | `200` | `--source sim` only: number of synthetic ticks |
 | `--rate` | `10.0` | `--source sim` only: ticks/sec |
 | `--start-price` | `500.0` | `--source sim` only: starting price for the random walk |
@@ -1063,9 +1072,53 @@ zero divergence, on recent real data for the symbol you intend to trade —
 *then* `--live` (see "Live Trading Enablement" above; the confirmation
 banner and retyped phrase now include the strategy name too).
 
+## VWAP risk management (v3.38)
+
+The mean-reversion strategy above has no concept of cost basis, a
+stop-loss, or how long a position's been held — it just watches price
+relative to the session VWAP. That's fine for same-day scalps, but a
+position that survives across a day boundary (a partial exit didn't
+fire, or shares got carried over between sessions) can end up getting
+swept out by a totally unrelated, same-day signal's exit — closing at
+whatever the CURRENT day's session VWAP happens to be, with no regard
+for whether that's actually a reasonable price for a position that's
+been open for days.
+
+```bash
+python3 host/order_manager.py --port /tmp/fpga-tick-emulator --symbol TSLA \
+    --strategy vwap_bounce --stop-sigma-mult 3.0 \
+    --anchor-gate-tolerance 0.01 --risk-per-trade 500 \
+    --source alpaca --broker paper --dashboard 8000
+```
+
+Three things, all opt-in (disabled by default — `--stop-sigma-mult 0`
+restores the exact pre-v3.38 behavior):
+
+- **An independent stop-loss** — N standard deviations below session
+  VWAP (the same sigma the entry band already computes, just a wider
+  multiple), fixed the moment a position opens. Checked every tick,
+  independent of whether the fabric's own bounce/cross condition
+  happens to align — a stop fires the instant it's breached.
+- **A position-anchored VWAP** — a separate running average that
+  starts when a position opens and keeps accumulating for the entire
+  holding period, unlike the session VWAP which resets daily and has
+  zero memory of anything before today.
+- **The gate** — a same-day position sells on the normal signal
+  unconditionally, exactly as before (this is the scalp behavior
+  that's supposed to keep working). An OLDER position needs price
+  also near/above its own anchored VWAP before that same signal is
+  allowed to close it — unless the stop-loss has been hit, which
+  always overrides the gate and exits regardless.
+
+Position sizing changes too when this is on: a fresh entry sizes at
+`--risk-per-trade` dollars divided by the distance to the stop,
+floored to a whole share — not the fixed share count `--qty` gives
+you otherwise. Still fully bounded by `--max-shares`/`--max-notional`/
+`--max-position-notional`, same as any buy.
+
 ## Final test census
 ```
 RTL:   850+1900+36+31+20+1236+22+22                = 4117
-Host:  71+29+56+49+50+40+155+30+50+28+154+17       =  729
-Total                                               = 4846 checks, 0 failures
+Host:  72+29+56+49+50+40+24+163+30+50+30+200+34+17  =  844
+Total                                               = 4961 checks, 0 failures
 ```
