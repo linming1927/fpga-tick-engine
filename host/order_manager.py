@@ -534,6 +534,27 @@ class OrderManager:
                     limits={k: v for k, v in vars(limits).items()})
         print(f"[om] reconciled positions from broker: {self.positions}")
 
+        # v3.37: found the hard way -- a position moved between machines
+        # (or an audit file lost/replaced) leaves the broker correctly
+        # reporting shares held while the cost tracker has NO record of
+        # how they were acquired. That's not a crash and not even a
+        # wrong number by itself -- self.costs._entries just starts at
+        # [0, 0] for that symbol, same as a symbol that's never traded
+        # at all -- so a sell against it silently prices the ENTIRE
+        # held quantity against whatever price happens to be recorded
+        # for a LATER, unrelated buy, understating (or overstating) the
+        # real P&L with no error or warning anywhere. Catch it loudly,
+        # before any trading happens, rather than let it surface only
+        # as a P&L number that's quietly wrong.
+        for sym, qty in self.positions.items():
+            if qty > 0 and self.costs._entries.get(sym, [0, 0])[0] == 0:
+                print(f"[om] ⚠️  WARNING: broker reports {qty} share(s) of "
+                     f"{sym} held, but {audit_path} has NO cost-basis "
+                     f"history for it — P&L on this position will be "
+                     f"WRONG until it's fully closed once, or you merge "
+                     f"in the audit log that actually recorded how these "
+                     f"shares were acquired (e.g. from another machine)")
+
     # ---- audit ---------------------------------------------------------------
     def _audit(self, event: str, **kw):
         self._audit_f.write(json.dumps({"t": now_us(), "event": event, **kw})

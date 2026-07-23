@@ -1303,6 +1303,78 @@ check("a normal successful session still exits 0, unaffected",
 check("no spurious 'session aborted early' message on a normal run",
       "session aborted early" in r2.stdout, False)
 
+# ---- v3.37: loud startup warning for a position with no cost-basis
+# history -- found from a real incident (a position moved between
+# machines without its audit log coming along)
+print("[G24] startup warns loudly when the broker reports shares held "
+     "but the audit log has zero cost-basis history for them")
+
+import io, contextlib
+
+g24_tmp = tempfile.mkdtemp()
+
+# case 1: broker says 25 shares of TSLA held, audit log is EMPTY --
+# exactly the real incident
+broker24a = MockBroker()
+broker24a.positions["TSLA"] = 25
+buf24a = io.StringIO()
+with contextlib.redirect_stdout(buf24a):
+    om24a = OrderManager(broker24a, ["TSLA"], RiskLimits(),
+                         audit_path=os.path.join(g24_tmp, "empty.jsonl"))
+out24a = buf24a.getvalue()
+check("warns when cost basis is genuinely missing for a held position",
+      "WARNING" in out24a and "TSLA" in out24a and "NO cost-basis" in out24a,
+      True)
+
+# case 2: broker says 0 shares held (flat) -- must NOT warn regardless
+# of anything else, since there's no position to have a wrong P&L on
+broker24b = MockBroker()
+buf24b = io.StringIO()
+with contextlib.redirect_stdout(buf24b):
+    om24b = OrderManager(broker24b, ["TSLA"], RiskLimits(),
+                         audit_path=os.path.join(g24_tmp, "empty2.jsonl"))
+check("does NOT warn when flat -- nothing to have missing cost basis on",
+      "WARNING" in buf24b.getvalue(), False)
+
+# case 3: broker says 25 shares held, AND the audit log correctly
+# records how they were acquired -- must NOT warn, this is the healthy
+# case the mechanism should leave alone
+audit24c = os.path.join(g24_tmp, "healthy.jsonl")
+with open(audit24c, "w") as f:
+    f.write(json.dumps({"t": 1000, "event": "order_filled", "symbol": "TSLA",
+                        "qty": 25, "side": "buy", "fill_price_e4": 3800000,
+                        "position_qty": 25}) + "\n")
+broker24c = MockBroker()
+broker24c.positions["TSLA"] = 25
+buf24c = io.StringIO()
+with contextlib.redirect_stdout(buf24c):
+    om24c = OrderManager(broker24c, ["TSLA"], RiskLimits(),
+                         audit_path=audit24c)
+check("does NOT warn when cost basis IS properly recorded for the "
+     "held quantity -- the healthy case the check must leave alone",
+     "WARNING" in buf24c.getvalue(), False)
+
+# case 4: multi-symbol -- the warning must name the SPECIFIC symbol
+# that's actually missing history, not every symbol in the session
+broker24d = MockBroker()
+broker24d.positions["TSLA"] = 10
+broker24d.positions["SPY"] = 5
+audit24d = os.path.join(g24_tmp, "partial.jsonl")
+with open(audit24d, "w") as f:
+    f.write(json.dumps({"t": 1000, "event": "order_filled", "symbol": "SPY",
+                        "qty": 5, "side": "buy", "fill_price_e4": 5000000,
+                        "position_qty": 5}) + "\n")
+buf24d = io.StringIO()
+with contextlib.redirect_stdout(buf24d):
+    om24d = OrderManager(broker24d, ["TSLA", "SPY"], RiskLimits(),
+                         audit_path=audit24d)
+out24d = buf24d.getvalue()
+check("warns specifically about TSLA (missing) but not SPY (has "
+     "history) in a mixed multi-symbol session",
+     ("TSLA" in out24d and "WARNING" in out24d)
+     and out24d.count("WARNING") == 1,
+     True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

@@ -848,3 +848,20 @@ the real reason now prints, the exit code is nonzero, and a normal
 successful session is completely unaffected (same exit-code logic,
 no spurious message). 6 new checks; 782 total across the host suite,
 0 failures.
+
+**v3.37** — the loud startup warning promised after the TSLA P&L
+incident: if the broker reports shares held for a symbol but the
+audit log has zero cost-basis history for it, order_manager.py now
+prints a clear warning right in the startup banner, before any
+trading happens. This is exactly the gap that let a position moved
+between machines (or an audit file lost/replaced) silently report a
+tiny, wrong P&L instead of the real one — the cost tracker's
+_entries dict just starts at [0, 0] for a symbol it's never seen a
+buy for, indistinguishable from a symbol that's genuinely never been
+traded, so nothing before this caught the difference. New [G24] in
+test_order_manager.py: confirms the warning fires exactly when cost
+basis is genuinely missing, stays silent when flat (nothing to warn
+about) or when cost basis IS properly recorded, and in a multi-symbol
+session names the SPECIFIC symbol that's actually missing history
+rather than warning about everything. 4 new checks; 788 total across
+the host suite, 0 failures.
