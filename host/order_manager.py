@@ -140,6 +140,69 @@ def _load_scored_signals_split_by_today(audit_path: str
     return prior, today_sigs
 
 
+def _load_last_sessrst_day(audit_path: str):
+    """v3.38: the date (ET) of the most recent successful VWAP session
+    reset, or None if none is on record. Used at startup to decide
+    whether THIS restart is the first one of a new trading day (reset
+    needed) or a same-day restart (skip resetting, so a continuously-
+    running board/emulator keeps its already-accumulated state instead
+    of losing it to a redundant reset)."""
+    if not os.path.exists(audit_path):
+        return None
+    last = None
+    with open(audit_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("event") == "sessrst_sent" and "t" in ev:
+                d = datetime.fromtimestamp(ev["t"] / 1_000_000, tz=ET).date()
+                if last is None or d > last:
+                    last = d
+    return last
+
+
+def _replay_vwap_from_log(br, log_path: str, today) -> int:
+    """v3.38: rebuild the HOST's own (otherwise empty on every process
+    restart, regardless of what the board does) VWAPMirror instances by
+    replaying today's raw trade ticks from --log. Returns the number
+    of ticks replayed. --log records EVERY echo type, not just trades
+    (quote echoes included), and both raw-tick lines and signal lines
+    (marked "signal": True) — filtered here to TYPE_ECHO_TRADE, no
+    "signal" key, and today's ET calendar day only, so a stale or
+    multi-day log doesn't feed anything but what actually belongs in
+    the CURRENT session."""
+    from tick_protocol import TYPE_ECHO_TRADE
+    if not os.path.exists(log_path):
+        return 0
+    n = 0
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (ev.get("type") != TYPE_ECHO_TRADE or ev.get("signal")
+                    or "t" not in ev):
+                continue
+            d = datetime.fromtimestamp(ev["t"] / 1_000_000, tz=ET).date()
+            if d != today:
+                continue
+            sym = ev.get("symbol", "").strip()
+            model = br.models.get("vwap_bounce", {}).get(sym)
+            if model is not None:
+                model.ingest(ev["price_e4"], ev.get("qty", 0))
+                n += 1
+    return n
+
+
 def _load_fills_split_by_today(audit_path: str) -> tuple[list[dict], list[dict]]:
     """Read audit_path (if it exists) and return (prior_fills, todays_fills)
     — every "order_filled" event ever logged, split by whether it's from
@@ -413,8 +476,20 @@ class RiskPolicy:
         self.last_order_t = 0.0
 
     def evaluate(self, side: int, position_qty: int,
-                 price_e4: int) -> tuple[bool, str, int]:
-        """Return (allowed, reason, qty). Pure; no side effects."""
+                 price_e4: int, qty_override: int | None = None
+                 ) -> tuple[bool, str, int]:
+        """Return (allowed, reason, qty). Pure; no side effects.
+
+        qty_override: v3.38 — use this quantity instead of
+        lim.order_qty for a BUY (e.g. risk-based position sizing from
+        position_risk.py). Deliberately NOT a bypass: every existing
+        safety check below (max_shares, max_position_notional,
+        max_notional) still runs against whatever quantity is actually
+        intended, override or not — the point of threading it through
+        evaluate() rather than substituting qty after the fact is that
+        a risk-sized quantity larger than the default order_qty must
+        still be caught by these same caps, not silently exceed them.
+        """
         lim = self.lim
         now = self._now_fn()
         today = now.date()
@@ -430,7 +505,7 @@ class RiskPolicy:
             return False, f"cooldown ({gap:.1f}s < {lim.cooldown_s}s)", 0
 
         if side == SIDE_BUY:
-            qty = lim.order_qty
+            qty = qty_override if qty_override is not None else lim.order_qty
             if position_qty + qty > lim.max_shares:
                 return False, f"would exceed max_shares ({lim.max_shares})", 0
             if lim.max_position_notional_e4 is not None:
@@ -464,7 +539,8 @@ class OrderManager:
 
     def __init__(self, broker, symbols, limits: RiskLimits,
                  audit_path: str = "om_audit.jsonl",
-                 killfile: str = "om.kill"):
+                 killfile: str = "om.kill",
+                 risk_overlay=None, vwap_models: dict | None = None):
         self.broker = broker
         if isinstance(symbols, str):
             symbols = [symbols]
@@ -479,6 +555,16 @@ class OrderManager:
         self.blocked = 0
         self.costs = CostTracker()
         self._audit_f = open(audit_path, "a")
+        # v3.38: opt-in host-side risk overlay (position_risk.py) --
+        # None (the default) means every existing caller/test is
+        # completely unaffected; main() wires this up explicitly only
+        # for --strategy vwap_bounce sessions. vwap_models is
+        # Bridge.models["vwap_bounce"] (set after Bridge exists, since
+        # OrderManager is constructed before it) -- needed to read the
+        # live, already-verified VWAPMirror's sigma at position-open
+        # time for stop placement and risk sizing.
+        self.risk_overlay = risk_overlay
+        self.vwap_models = vwap_models or {}
 
         # a previous kill must be acknowledged by a human before we run
         if os.path.exists(killfile):
@@ -611,9 +697,42 @@ class OrderManager:
                         symbol=sym, side=side, price_e4=price_e4)
             return f"blocked: halted: {self.halt_reason}"
 
-        allowed, reason, qty = self.policy.evaluate(side,
-                                                    self.positions[sym],
-                                                    price_e4)
+        # v3.38: the risk overlay only applies to the vwap_bounce
+        # strategy (stop/anchor concepts are inherently VWAP-based;
+        # SMA/EMA have no natural sigma the same way) and only when
+        # main() has actually wired one up -- self.risk_overlay is
+        # None for every existing caller/test, making all of this a
+        # pure no-op unless explicitly enabled.
+        overlay = (self.risk_overlay
+                  if self.risk_overlay is not None
+                  and fr.get("strategy") == "vwap_bounce" else None)
+        is_fresh_entry = self.positions[sym] == 0
+        qty_override = None
+
+        if overlay is not None and side == SIDE_SELL:
+            stopped = overlay.stop_triggered(sym, price_e4)
+            if not stopped and not overlay.sell_allowed(
+                    sym, price_e4, datetime.now(ET).date()):
+                self.blocked += 1
+                av = overlay.anchored_vwap_e4(sym)
+                reason = (f"held for an older position: price "
+                         f"{dollars(price_e4):.2f} still below its own "
+                         f"anchored VWAP {dollars(av):.2f}"
+                         if av is not None else
+                         "held for an older position (anchored VWAP "
+                         "not yet established)")
+                self._audit("blocked", reason=reason, symbol=sym,
+                            side=side, price_e4=price_e4,
+                            position_qty=self.positions[sym])
+                print(f"[om] blocked {sym} SELL: {reason}")
+                return f"blocked: {reason}"
+
+        if overlay is not None and side == SIDE_BUY and is_fresh_entry:
+            stop_e4 = overlay.peek_stop_price_e4(self.vwap_models.get(sym))
+            qty_override = overlay.risk_sized_qty(price_e4, stop_e4)
+
+        allowed, reason, qty = self.policy.evaluate(
+            side, self.positions[sym], price_e4, qty_override=qty_override)
         if not allowed:
             self.blocked += 1
             self._audit("blocked", reason=reason, symbol=sym, side=side,
@@ -651,6 +770,12 @@ class OrderManager:
         print(f"[om] FILLED {verb.upper()} {qty} {sym} @ "
               f"${dollars(fill['fill_price_e4']):.4f}  "
               f"-> position {self.positions[sym]}{fee_str}")
+        if overlay is not None:
+            if verb == "buy" and is_fresh_entry:
+                overlay.on_position_opened(sym, datetime.now(ET).date(),
+                                           self.vwap_models.get(sym))
+            elif verb == "sell" and self.positions[sym] == 0:
+                overlay.on_position_closed(sym)
         # daily loss halt: realized net P&L breaching the bound stops the
         # session — losses can only be REALIZED on sells, so this check
         # after each fill is sufficient for a long-only strategy
@@ -734,6 +859,44 @@ def main():
                          "this one must match the FABRIC bitstream's "
                          "build parameter or the hardware verifier "
                          "will report false divergences")
+    ap.add_argument("--force-vwap-reset", action="store_true",
+                    help="v3.38: reset the VWAP session even if one's "
+                         "already been recorded today — use this if "
+                         "the board/emulator itself was ALSO restarted "
+                         "since the day's earlier reset (not just "
+                         "order_manager.py), since in that case its "
+                         "real accumulated state is already gone and "
+                         "resetting both sides together again is "
+                         "correct, the same way every restart used to "
+                         "behave before this flag existed")
+    ap.add_argument("--stop-sigma-mult", type=float, default=0.0,
+                    help="v3.38: --strategy vwap_bounce only. Stop-loss "
+                         "placed at this many standard deviations below "
+                         "session VWAP, fixed at the moment a position "
+                         "opens (does not move afterward). Default 0 "
+                         "DISABLES the stop-loss and anchored-VWAP gate "
+                         "entirely -- this is new, real-money-affecting "
+                         "behavior, so it's explicit opt-in rather than "
+                         "silently active for every existing vwap_bounce "
+                         "session; pass e.g. 3.0 to enable it")
+    ap.add_argument("--anchor-gate-tolerance", type=float, default=0.0,
+                    help="v3.38: --strategy vwap_bounce only. How far "
+                         "BELOW a position's own anchored VWAP still "
+                         "counts as close enough to allow an OLDER "
+                         "(opened on an earlier day) position to exit "
+                         "— e.g. 0.01 allows exiting up to 1%% below "
+                         "it. Default 0.0 requires price at or above "
+                         "the anchored VWAP exactly. Same-day positions "
+                         "are never gated by this at all")
+    ap.add_argument("--risk-per-trade", type=float, default=500.0,
+                    help="v3.38: --strategy vwap_bounce only. Dollars "
+                         "at risk per NEW position (if the stop-loss "
+                         "is hit, this is roughly what that trade "
+                         "costs) — position size is computed from "
+                         "this divided by the distance to the stop, "
+                         "not a fixed share count. Still capped by "
+                         "--max-shares/--max-notional/"
+                         "--max-position-notional same as any buy")
     ap.add_argument("--strategy", choices=["sma", "ema", "vwap_bounce"],
                     default="sma",
                     help="which engine's signals TRADE; the others are "
@@ -977,21 +1140,56 @@ def main():
                 log_path=args.log, verify_grace_s=args.verify_grace_s,
                 vwap_warmup=args.vwap_warmup, vwap_k2_q8=args.vwap_k2_q8)
 
-    # v3.19: command the fabric VWAP session boundary at startup. Every
-    # process start IS a session start from the fabric's point of view —
-    # the board may hold yesterday's accumulators (it has no calendar; see
-    # rtl/sessctl.sv for why the HOST owns that), and the host mirrors
-    # start empty, so the two sides must be zeroed together before the
-    # first tick or the verifier would flag divergences that are really
-    # just mismatched session baselines. Safe against every board
-    # revision: a pre-v3.18 bitstream has no sessctl but still ECHOES the
-    # 0x11 frame as 0x91 (the echo path echoes every decoded frame, and
-    # tick_parser accepts any type byte), so the ack arrives either way —
-    # a timeout here means the link itself is in trouble.
-    if not br.send_sessrst():
-        print("[om] WARNING: VWAP session reset not acknowledged — the "
-              "link may be down; fabric VWAP state may span sessions "
-              "until a reset is acked")
+    # v3.19: command the fabric VWAP session boundary at startup.
+    # v3.38: NOT unconditionally anymore. The original reasoning was
+    # sound for what it was solving (host mirrors start empty every
+    # restart, so both sides must be zeroed together or the verifier
+    # would flag divergences that are really just mismatched session
+    # baselines) but it had a real cost: restarting order_manager.py
+    # mid-day for any reason (a crash, routine troubleshooting) wiped
+    # out the WHOLE day's VWAP and restarted it from that moment,
+    # rather than truly reflecting "since market open" the way a
+    # session VWAP is supposed to. Found from a real overnight session
+    # that needed several restarts before market open the next
+    # morning, unintentionally treating the eventual market-open
+    # restart as a brand new (very late) session start.
+    #
+    # Now: reset only on the FIRST startup of a new trading day (ET),
+    # tracked via the audit log, same persistence pattern already used
+    # for cost basis and order counts. A same-day restart skips the
+    # reset — trusting that the board/emulator (left running
+    # continuously, per the established two-terminal workflow) still
+    # has this morning's correctly-accumulating state — and instead
+    # rebuilds the HOST's own mirror (a fresh Python object every
+    # restart regardless) by replaying today's ticks from --log.
+    today_et = datetime.now(ET).date()
+    last_sessrst_day = _load_last_sessrst_day(args.audit)
+    if args.force_vwap_reset or last_sessrst_day != today_et:
+        if not br.send_sessrst():
+            print("[om] WARNING: VWAP session reset not acknowledged — "
+                 "the link may be down; fabric VWAP state may span "
+                 "sessions until a reset is acked")
+        else:
+            with open(args.audit, "a") as _af:
+                _af.write(json.dumps({"t": now_us(),
+                                      "event": "sessrst_sent"}) + "\n")
+    else:
+        print(f"[om] VWAP already reset today ({last_sessrst_day}) — "
+             f"skipping another reset so the board/emulator's "
+             f"already-accumulating state survives this restart "
+             f"(pass --force-vwap-reset to reset both sides anyway, "
+             f"e.g. if the board/emulator itself was also restarted)")
+        if args.log:
+            n_replayed = _replay_vwap_from_log(br, args.log, today_et)
+            print(f"[om] rebuilt host VWAP mirror(s) from {n_replayed} "
+                 f"tick(s) in {args.log} (today only)")
+        else:
+            print("[om] WARNING: no --log to replay from — host VWAP "
+                 "mirrors start empty this restart even though the "
+                 "board/emulator's own state should still be "
+                 "accumulating since this morning; expect DIVERGENCE "
+                 "until this naturally resolves, or pass "
+                 "--force-vwap-reset to reset both sides together")
 
     labels = {"sma": f"SMA {args.fast}/{args.slow}",
               "ema": f"EMA 1/{1 << args.ema_kf}:1/{1 << args.ema_ks}",
@@ -1205,6 +1403,45 @@ def main():
                 _card.on_tick(datetime.now(ET), fr["price_e4"],
                               fr["qty"])
         br.on_echo = _on_echo_with_vwap
+
+    # v3.38: host-side risk overlay -- stop-loss, position-anchored
+    # VWAP, and the same-day-vs-older sell gate. Only meaningful for
+    # --strategy vwap_bounce (stop/anchor concepts are inherently
+    # VWAP-based; SMA/EMA have no natural sigma the same way).
+    # --stop-sigma-mult 0 disables it entirely, leaving om.risk_overlay
+    # as None -- the exact same safe default as if this feature didn't
+    # exist at all.
+    if args.strategy == "vwap_bounce" and args.stop_sigma_mult > 0:
+        from position_risk import PositionRiskOverlay
+        om.risk_overlay = PositionRiskOverlay(
+            stop_sigma_mult=args.stop_sigma_mult,
+            anchor_gate_tolerance=args.anchor_gate_tolerance,
+            risk_dollars_per_trade=args.risk_per_trade)
+        om.vwap_models = br.models["vwap_bounce"]
+
+        # an independent stop-loss check on EVERY raw trade tick -- not
+        # gated on a verified fabric signal arriving at all, since a
+        # stop has to fire the moment it's breached, not wait for the
+        # next bounce/cross event. Also feeds the anchored VWAP
+        # accumulator (a no-op for any symbol without an open
+        # position). Same on_echo chaining pattern as the ladder/
+        # vwap_cards hooks above: adds to whatever's already
+        # listening, never replaces it.
+        from tick_protocol import TYPE_ECHO_TRADE as _TET_RISK
+        _prev_echo_risk = br.on_echo
+        def _on_echo_with_risk(fr):
+            if _prev_echo_risk:
+                _prev_echo_risk(fr)
+            if fr["type"] != _TET_RISK:
+                return
+            sym = fr["symbol"].strip()
+            price_e4 = fr["price_e4"]
+            om.risk_overlay.on_tick(sym, price_e4, fr["qty"])
+            if (om.positions.get(sym, 0) > 0
+                    and om.risk_overlay.stop_triggered(sym, price_e4)):
+                om.on_signal({"side": SIDE_SELL, "price_e4": price_e4,
+                             "symbol": sym, "strategy": "vwap_bounce"})
+        br.on_echo = _on_echo_with_risk
 
     def on_verified(fr):
         strat = fr["strategy"]

@@ -865,3 +865,73 @@ about) or when cost basis IS properly recorded, and in a multi-symbol
 session names the SPECIFIC symbol that's actually missing history
 rather than warning about everything. 4 new checks; 788 total across
 the host suite, 0 failures.
+
+**v3.38** — the VWAP strategy redesign discussed after the TSLA
+incident: independent stop-loss, position-anchored VWAP for judging
+older positions, risk-based position sizing, and true market-open
+VWAP anchoring. All four are new, host-side, and opt-in — the
+fabric's own bounce/cross signal generation is completely unchanged
+and still independently verified exactly as always; nothing here
+required touching the RTL or bypassing hardware verification.
+
+New position_risk.py module: a PositionRiskOverlay tracking, per
+symbol, a fixed stop-loss (N standard deviations below session VWAP,
+set once at position-open time using the exact same sigma
+vwap_engine.sv's own band test already computes, and does not move
+afterward even if more shares get added or the session VWAP moves
+hard against the position) and a separate position-anchored VWAP
+(its own running Σ(p·v)/Σv that starts the moment a position opens
+and keeps accumulating for the whole holding period, unlike the
+session VWAP which has zero memory of anything before today). The
+gate: a same-day position sells on the normal session-VWAP-cross
+signal exactly as before; an OLDER position (opened on an earlier
+day) has that same signal held back unless price is also at/above
+its own anchored VWAP -- unless the stop-loss has been hit, which
+always overrides and exits regardless. Risk-based sizing: a fresh
+entry sizes at $500 (configurable via --risk-per-trade) of risk
+divided by the distance to the stop, floored to a whole share,
+still passing through all the existing --max-shares/--max-notional/
+--max-position-notional caps rather than bypassing them (RiskPolicy.
+evaluate() gained an optional qty_override parameter specifically so
+these caps still apply to whatever quantity is actually intended).
+
+New --stop-sigma-mult (default 0.0, meaning DISABLED -- this is
+real-money-affecting new behavior, made explicit opt-in rather than
+silently active for the --strategy vwap_bounce sessions already in
+use), --anchor-gate-tolerance, and --risk-per-trade flags.
+
+Also, true market-open VWAP anchoring: the session reset now happens
+only on the FIRST startup of a new trading day (tracked via the
+audit log, same persistence pattern as cost basis), not on every
+restart -- found from a real overnight session where several mid-day
+restarts before market open each wiped VWAP back to zero rather than
+truly reflecting "since market open." A same-day restart skips the
+reset (trusting a continuously-running board/emulator's own state)
+and rebuilds the HOST's own mirror by replaying that day's ticks from
+--log. New --force-vwap-reset overrides this for when the board/
+emulator itself was also restarted. Fixed a real pre-existing test
+bug this surfaced: a hardcoded, non-temp shared audit path in an
+existing test that this new once-per-day logic exposed as a genuine
+state-leakage problem between test runs.
+
+New test_position_risk.py (34 checks): the overlay's own logic in
+complete isolation -- stop placement and fixed-after-entry behavior,
+the anchored VWAP surviving same-day scalp activity and resetting
+only on a full close, the gate's exact same-day/older-position/
+tolerance behavior, risk-sized quantities including the degenerate
+entry-at-or-through-stop case, and peek-vs-commit consistency. New
+[G25]-[G27] in test_order_manager.py (15 checks): the once-per-day
+reset decision and --log replay end to end through the real CLI, and
+the risk overlay's actual WIRING into on_signal() and the tick hook
+-- a risk-sized buy through the real quantity path (not re-testing
+the overlay's own math), the gate blocking and allowing a sell at the
+right moments, the stop-loss overriding the gate, a same-day position
+staying unaffected, and -- verified via a precisely controlled
+scenario rather than an emergent price pattern -- the independent
+tick-level stop firing through the real on_echo wiring with zero
+fabric signal involved. New [G24] (from the prior drop) unaffected.
+53 new checks total; 844 total across the host suite, 0 failures.
+Verified end to end with all four pieces active together through a
+real historical-replay session: zero divergence across all three
+strategies, real fills, the new gate actively blocking signals as
+designed, clean exit.

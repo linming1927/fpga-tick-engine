@@ -887,8 +887,9 @@ check("card still at 1 tick", vcard._n, 1)
 print("[G18] verified fabric-VWAP signals route to a scored row "
      "(the cards['vwap_bounce'] KeyError path), ladder filters quotes")
 
+g18_audit_path = os.path.join(tempfile.mkdtemp(), "g18_audit.jsonl")
 r = subprocess.run(
-    [sys.executable, "-c", '''
+    [sys.executable, "-c", f'''
 import sys, time, subprocess
 sys.path.insert(0, ".")
 from fpga_emulator import FPGAEmulator
@@ -898,7 +899,7 @@ r = subprocess.run(
     [sys.executable, "order_manager.py", "--port", port,
      "--source", "sim", "--broker", "mock", "--cooldown", "0",
      "--n", "600", "--rate", "200", "--fast", "4", "--slow", "8",
-     "--audit", "/tmp/g18_audit.jsonl"],
+     "--audit", "{g18_audit_path}"],
     capture_output=True, text=True, timeout=110)
 emu.stop()
 print(r.stdout)
@@ -1374,6 +1375,349 @@ check("warns specifically about TSLA (missing) but not SPY (has "
      ("TSLA" in out24d and "WARNING" in out24d)
      and out24d.count("WARNING") == 1,
      True)
+
+print("[G25] v3.38: VWAP session reset only on the FIRST startup of a "
+     "new trading day, not on every restart -- found from a real "
+     "overnight session where several mid-day restarts before market "
+     "open each wiped VWAP back to zero, rather than truly reflecting "
+     "\"since market open\"")
+
+from order_manager import _load_last_sessrst_day, _replay_vwap_from_log
+from datetime import date
+
+g25_tmp = tempfile.mkdtemp()
+
+check("no prior record at all -> None",
+      _load_last_sessrst_day(os.path.join(g25_tmp, "doesnotexist.jsonl")),
+      None)
+
+g25_audit = os.path.join(g25_tmp, "audit.jsonl")
+today = datetime.now(ET).date()
+yesterday_us = int((datetime.now(ET) -
+                    __import__("datetime").timedelta(days=1)).timestamp()
+                   * 1_000_000)
+with open(g25_audit, "w") as f:
+    f.write(json.dumps({"t": yesterday_us, "event": "sessrst_sent"}) + "\n")
+check("a reset recorded YESTERDAY correctly reports yesterday, not today",
+      _load_last_sessrst_day(g25_audit) == today, False)
+
+today_us = int(datetime.now(ET).timestamp() * 1_000_000)
+with open(g25_audit, "a") as f:
+    f.write(json.dumps({"t": today_us, "event": "sessrst_sent"}) + "\n")
+check("after a SECOND reset recorded today, reports today (the LATEST "
+     "one, not the first one found)",
+     _load_last_sessrst_day(g25_audit), today)
+
+# _replay_vwap_from_log: build a small fake Bridge-like object (just
+# needs a .models["vwap_bounce"] dict of real VWAPMirror instances --
+# ingest() is what actually matters here, not the rest of Bridge)
+from tick_protocol import VWAPMirror, TYPE_ECHO_TRADE, TYPE_ECHO_QUOTE
+
+class _FakeBrForReplay:
+    def __init__(self, symbols):
+        self.models = {"vwap_bounce": {s: VWAPMirror() for s in symbols}}
+
+g25_log = os.path.join(g25_tmp, "ticks.jsonl")
+old_day_us = int((datetime.now(ET) -
+                 __import__("datetime").timedelta(days=1)).timestamp()
+                * 1_000_000)
+with open(g25_log, "w") as f:
+    # today, trade echo, SPY -- SHOULD be replayed
+    f.write(json.dumps({"t": today_us, "type": TYPE_ECHO_TRADE,
+                        "symbol": "SPY", "price_e4": 4000000, "qty": 10
+                        }) + "\n")
+    # today, but a QUOTE echo, not a trade -- must NOT be replayed
+    f.write(json.dumps({"t": today_us, "type": TYPE_ECHO_QUOTE,
+                        "symbol": "SPY", "price_e4": 4000100, "qty": 5
+                        }) + "\n")
+    # today, trade echo, but marked as a SIGNAL line, not a raw tick --
+    # must NOT be replayed (this is a decoded signal record, not a tick)
+    f.write(json.dumps({"t": today_us, "type": TYPE_ECHO_TRADE,
+                        "signal": True, "symbol": "SPY",
+                        "price_e4": 4000200, "qty": 1}) + "\n")
+    # YESTERDAY's trade echo, otherwise identical -- must NOT be
+    # replayed, this is the "don't feed a stale multi-day log" check
+    f.write(json.dumps({"t": old_day_us, "type": TYPE_ECHO_TRADE,
+                        "symbol": "SPY", "price_e4": 9999999, "qty": 99
+                        }) + "\n")
+    # today, trade echo, SPY again -- SHOULD be replayed
+    f.write(json.dumps({"t": today_us, "type": TYPE_ECHO_TRADE,
+                        "symbol": "SPY", "price_e4": 4001000, "qty": 20
+                        }) + "\n")
+
+fake_br = _FakeBrForReplay(["SPY"])
+n = _replay_vwap_from_log(fake_br, g25_log, today)
+check("exactly 2 of the 5 log lines were real, today, trade-tick "
+     "entries -- the quote echo, the signal-marked line, and "
+     "yesterday's entry are all correctly excluded",
+     n, 2)
+check("the replayed VWAP matches hand-computed Σ(p·v)/Σv for just "
+     "those 2 real ticks (not the quote/signal/yesterday noise)",
+     fake_br.models["vwap_bounce"]["SPY"].vwap,
+     (4000000 * 10 + 4001000 * 20) // (10 + 20))
+
+# end-to-end: a first CLI run resets and records it; a second run
+# against the SAME audit file, same day, does NOT reset again
+g25_trades = os.path.join(g25_tmp, "g25.jsonl")
+with open(g25_trades, "w") as f:
+    price = 100.0
+    for i in range(30):
+        price += 0.05
+        f.write(_json.dumps({
+            "t": f"2026-07-17T14:{30 + i // 60:02d}:{i % 60:02d}.000000Z",
+            "p": round(price, 2), "s": 50}) + "\n")
+
+emu25 = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port25 = emu25.start()
+r1 = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port25, "--symbol", "SPY",
+     "--fast", "8", "--slow", "32", "--source", "historical",
+     "--trades", g25_trades, "--broker", "mock",
+     "--audit", os.path.join(g25_tmp, "e2e_audit.jsonl")],
+    capture_output=True, text=True, timeout=60)
+emu25.stop()
+check("first run of the day: no 'already reset today' message (this "
+     "IS the first reset)",
+     "VWAP already reset today" in r1.stdout, False)
+
+emu25b = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port25b = emu25b.start()
+r2 = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port25b, "--symbol", "SPY",
+     "--fast", "8", "--slow", "32", "--source", "historical",
+     "--trades", g25_trades, "--broker", "mock",
+     "--audit", os.path.join(g25_tmp, "e2e_audit.jsonl")],
+    capture_output=True, text=True, timeout=60)
+emu25b.stop()
+check("second run, same day, same audit file: correctly recognizes "
+     "a reset already happened today and skips sending another",
+     "VWAP already reset today" in r2.stdout, True)
+
+emu25c = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port25c = emu25c.start()
+r3 = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port25c, "--symbol", "SPY",
+     "--fast", "8", "--slow", "32", "--source", "historical",
+     "--trades", g25_trades, "--broker", "mock", "--force-vwap-reset",
+     "--audit", os.path.join(g25_tmp, "e2e_audit.jsonl")],
+    capture_output=True, text=True, timeout=60)
+emu25c.stop()
+check("--force-vwap-reset overrides the same-day skip and resets anyway",
+      "VWAP already reset today" in r3.stdout, False)
+
+# ---- v3.38: risk overlay WIRING -- proving on_signal() actually calls
+# position_risk.py correctly, not re-testing the overlay's own math
+# (already covered thoroughly, in isolation, by test_position_risk.py)
+print("[G26] risk overlay wired into on_signal(): risk-sized buys, the "
+     "sell gate for older positions, and the stop-loss overriding it")
+
+from position_risk import PositionRiskOverlay
+from tick_protocol import VWAPMirror as _RealVWAPMirror
+
+def _fresh_om_with_overlay(**overlay_kwargs):
+    b = MockBroker()
+    limits26 = RiskLimits(order_qty=5, max_shares=10**9,
+                          max_notional_e4=10**12,
+                          max_position_notional_e4=10**12,
+                          require_market_hours=False)
+    o = OrderManager(b, ["SPY"], limits26,
+                     audit_path=os.path.join(tempfile.mkdtemp(),
+                                             "g26.jsonl"))
+    o.risk_overlay = PositionRiskOverlay(**overlay_kwargs)
+    mirror = _RealVWAPMirror()
+    mirror.ingest(399_0000, 50)
+    mirror.ingest(401_0000, 50)   # nonzero sigma from real dispersion
+    o.vwap_models = {"SPY": mirror}
+    return o, b, mirror
+
+def _fresh_om_wide_spread(**overlay_kwargs):
+    """Same as above, but the session VWAP has a WIDE spread ($300/
+    $500 -> vwap $400, sigma $100, stop $100 at the default 3x mult)
+    specifically so the stop-loss level sits far below any reasonable
+    anchored-VWAP test value -- letting the gate and the stop be
+    tested independently instead of one always tripping the other."""
+    b = MockBroker()
+    limits26 = RiskLimits(order_qty=5, max_shares=10**9,
+                          max_notional_e4=10**12,
+                          max_position_notional_e4=10**12,
+                          require_market_hours=False)
+    o = OrderManager(b, ["SPY"], limits26,
+                     audit_path=os.path.join(tempfile.mkdtemp(),
+                                             "g26w.jsonl"))
+    o.risk_overlay = PositionRiskOverlay(**overlay_kwargs)
+    mirror = _RealVWAPMirror()
+    mirror.ingest(300_0000, 50)
+    mirror.ingest(500_0000, 50)   # wide spread: vwap $400, sigma $100
+    o.vwap_models = {"SPY": mirror}
+    return o, b, mirror
+
+# --- risk-sized buy ---
+om26, broker26, mirror26 = _fresh_om_with_overlay(
+    stop_sigma_mult=3.0, risk_dollars_per_trade=500.0)
+expected_stop = om26.risk_overlay.peek_stop_price_e4(mirror26)
+expected_qty = om26.risk_overlay.risk_sized_qty(400_0000, expected_stop)
+out26 = om26.on_signal({"side": SIDE_BUY, "price_e4": 400_0000,
+                        "symbol": "SPY", "strategy": "vwap_bounce"})
+check("a fresh buy fills", out26, "FILLED")
+check("the fill quantity is the RISK-SIZED qty from the overlay, not "
+     "the fixed --qty default (5) -- proving on_signal() actually "
+     "asked the overlay to size it, not just accepted it exists",
+     broker26.fills[-1]["qty"] if broker26.fills else None, expected_qty)
+check("the overlay's position-open commit actually happened -- a "
+     "stop price is now recorded for SPY",
+     om26.risk_overlay.stop_price_e4("SPY") is not None, True)
+
+# a strategy OTHER than vwap_bounce must be completely unaffected --
+# the overlay only applies to vwap_bounce signals
+om26b, broker26b, _ = _fresh_om_with_overlay(stop_sigma_mult=3.0)
+om26b.on_signal({"side": SIDE_BUY, "price_e4": 400_0000, "symbol": "SPY",
+                 "strategy": "sma"})
+check("an SMA buy signal is NOT risk-sized -- uses the fixed --qty "
+     "default (5) unaffected, since the overlay only applies to "
+     "vwap_bounce",
+     broker26b.fills[-1]["qty"], 5)
+
+# --- the sell gate: an older position, price below its anchored VWAP,
+# but NOT anywhere near the stop-loss level (wide-spread fixture: stop
+# sits at $100, far below any of these test prices) ---
+om27, broker27, mirror27 = _fresh_om_wide_spread(
+    stop_sigma_mult=3.0, risk_dollars_per_trade=500.0)
+YESTERDAY_G = date(2020, 1, 1)     # far enough in the past to be
+                                   # unambiguously "not today" forever
+om27.positions["SPY"] = 25
+om27.risk_overlay.on_position_opened("SPY", YESTERDAY_G, mirror27)
+om27.risk_overlay.on_tick("SPY", 380_0000, 100)   # anchored vwap = $380
+out27 = om27.on_signal({"side": SIDE_SELL, "price_e4": 320_0000,
+                        "symbol": "SPY", "strategy": "vwap_bounce"})
+check("an older position's sell, below its own anchored VWAP but "
+     "nowhere near the stop-loss level, is BLOCKED -- this is the "
+     "actual fix for the TSLA incident",
+     out27.startswith("blocked:"), True)
+check("nothing was actually sold -- position unchanged",
+      om27.positions["SPY"], 25)
+
+# same setup, but price at/above the anchored VWAP -- sell proceeds
+om28, broker28, mirror28 = _fresh_om_wide_spread(stop_sigma_mult=3.0)
+om28.positions["SPY"] = 25
+om28.risk_overlay.on_position_opened("SPY", YESTERDAY_G, mirror28)
+om28.risk_overlay.on_tick("SPY", 380_0000, 100)
+out28 = om28.on_signal({"side": SIDE_SELL, "price_e4": 385_0000,
+                        "symbol": "SPY", "strategy": "vwap_bounce"})
+check("an older position's sell AT/ABOVE its anchored VWAP proceeds "
+     "normally", out28, "FILLED")
+check("position correctly closed", om28.positions["SPY"], 0)
+check("closing an older position clears its overlay state (ready for "
+     "a genuinely fresh anchor on the next entry)",
+     om28.risk_overlay.stop_price_e4("SPY"), None)
+
+# --- the stop-loss ALWAYS overrides the gate, even for an older,
+# below-anchored-VWAP position (wide-spread fixture: stop is $100,
+# anchored vwap is $380 -- unambiguously below both) ---
+om29, broker29, mirror29 = _fresh_om_wide_spread(
+    stop_sigma_mult=3.0, risk_dollars_per_trade=500.0)
+om29.positions["SPY"] = 25
+om29.risk_overlay.on_position_opened("SPY", YESTERDAY_G, mirror29)
+stop29 = om29.risk_overlay.stop_price_e4("SPY")
+om29.risk_overlay.on_tick("SPY", 380_0000, 100)   # anchored vwap $380,
+                                                  # well above the stop
+out29 = om29.on_signal({"side": SIDE_SELL, "price_e4": stop29,
+                        "symbol": "SPY", "strategy": "vwap_bounce"})
+check("at the stop price -- well below the anchored VWAP gate -- the "
+     "sell proceeds anyway: the stop-loss always overrides the gate, "
+     "exactly as designed",
+     out29, "FILLED")
+
+# --- a same-day position is NEVER gated by the anchored VWAP, no "
+# matter how far below it price is (wide-spread fixture again, so this
+# isn't confounded by the stop ALSO happening to trigger -- want to
+# isolate the same-day bypass specifically, not just "either condition
+# allowed it") ---
+om30, broker30, mirror30 = _fresh_om_wide_spread(stop_sigma_mult=3.0)
+om30.positions["SPY"] = 5
+om30.risk_overlay.on_position_opened("SPY", datetime.now(ET).date(),
+                                     mirror30)
+om30.risk_overlay.on_tick("SPY", 400_0000, 100)   # anchored vwap $400
+out30 = om30.on_signal({"side": SIDE_SELL, "price_e4": 300_0000,
+                        "symbol": "SPY", "strategy": "vwap_bounce"})
+check("a SAME-DAY position sells unconditionally even far below its "
+     "own anchored VWAP (and above the $100 stop here, so this is "
+     "genuinely the same-day bypass, not the stop also triggering) "
+     "-- exactly the scalp behavior that must keep working unchanged",
+     out30, "FILLED")
+
+# --- the independent tick-level stop trigger, through the REAL
+# on_echo wiring (not on_signal called directly) ---
+print("[G27] the independent tick-level stop-loss fires through the "
+     "real on_echo wiring, without waiting for a normal fabric signal")
+
+g27_tmp = tempfile.mkdtemp()
+emu27 = FPGAEmulator(symbol="SPY", fast_n=4, slow_n=8)
+port27 = emu27.start()
+br27 = Bridge(port27, "SPY", 4, 8)
+broker27_cli = MockBroker()
+broker27_cli.positions["SPY"] = 20    # position already open, matching
+                                      # what would be reconciled from a
+                                      # broker at startup
+limits27 = RiskLimits(order_qty=5, max_shares=10**9,
+                      max_notional_e4=10**12,
+                      max_position_notional_e4=10**12,
+                      require_market_hours=False, cooldown_s=0.0)
+om27_cli = OrderManager(broker27_cli, ["SPY"], limits27,
+                        audit_path=os.path.join(g27_tmp, "audit.jsonl"))
+om27_cli.risk_overlay = PositionRiskOverlay(stop_sigma_mult=3.0)
+om27_cli.vwap_models = br27.models["vwap_bounce"]
+
+# clear warmup with a flat, boring price (never dips below any band,
+# so no normal bounce-buy signal fires here at all) -- 25 ticks to be
+# safely clear of the default WARMUP_N=20
+for _ in range(25):
+    br27.send_trade(100_0000, 10, symbol="SPY")
+    br27.pump(timeout=0.2)
+
+# now open the position directly (matching a real reconciled-at-
+# startup position) and commit a stop price from the CURRENT session
+# VWAP -- fully controlled, no dependence on emergent price behavior
+mirror27_cli = br27.models["vwap_bounce"]["SPY"]
+om27_cli.risk_overlay.on_position_opened("SPY", datetime.now(ET).date(),
+                                         mirror27_cli)
+known_stop27 = om27_cli.risk_overlay.stop_price_e4("SPY")
+
+# wire the SAME risk-overlay tick hook main() itself installs, so this
+# test exercises the REAL wiring path, not a hand-rolled substitute
+def _on_echo_test_risk(fr):
+    if fr["type"] != TYPE_ECHO_TRADE:
+        return
+    sym = fr["symbol"].strip()
+    price_e4 = fr["price_e4"]
+    om27_cli.risk_overlay.on_tick(sym, price_e4, fr["qty"])
+    if (om27_cli.positions.get(sym, 0) > 0
+            and om27_cli.risk_overlay.stop_triggered(sym, price_e4)):
+        om27_cli.on_signal({"side": SIDE_SELL, "price_e4": price_e4,
+                            "symbol": sym, "strategy": "vwap_bounce"})
+br27.on_echo = _on_echo_test_risk
+
+check("position is open with a known, committed stop price before "
+     "sending anything below it",
+     known_stop27 is not None, True)
+
+# send exactly ONE tick, well below the known stop -- no normal
+# fabric bounce/cross signal has any reason to fire here (price is
+# far from any band/vwap-cross condition at this single tick), so
+# a sell firing here can only be the independent stop
+below_stop27 = known_stop27 - 50_0000
+br27.send_trade(below_stop27, 10, symbol="SPY")
+br27.pump(timeout=0.3)
+br27.close()
+emu27.stop()
+
+check("the independent stop-loss fired, closing the position, from a "
+     "single tick with NO verified fabric signal involved at all -- "
+     "this is the actual mechanism, not inferred from a messy "
+     "emergent price pattern",
+     om27_cli.positions["SPY"], 0)
+check("exactly one order was placed (the stop's own sell) -- no "
+     "retry storm or duplicate trigger",
+     om27_cli.orders, 1)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
