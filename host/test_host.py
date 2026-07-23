@@ -633,6 +633,88 @@ check("zero divergences on the emulated path", vv.divergences, 0)
 br3.close(); emu3.stop()
 
 # ---------------------------------------------------------------------------
+print("[G11] v3.30: non-standard-baud fallback for non-hardware serial "
+     "connections (found on macOS, connecting order_manager.py to "
+     "fpga_emulator.py — a pty has no real UART, so macOS correctly "
+     "refuses the special ioctl a non-standard baud rate needs, "
+     "ENOTTY/errno 25)")
+
+import bridge as bridge_module
+
+class _FakeSerialENOTTY:
+    """Simulates pyserial's real macOS failure mode exactly: raises the
+    identical bare OSError(errno=25) on a non-standard baud, succeeds
+    immediately at 115200 — same as the real serialposix.py path this
+    mirrors (see bridge.py's v3.30 comment for the full mechanism)."""
+    calls = []
+    def __init__(self, port, baud, timeout=0.05):
+        _FakeSerialENOTTY.calls.append(baud)
+        if baud != 115200:
+            raise OSError(25, "Inappropriate ioctl for device")
+        self.port = port
+        self.baud = baud
+    def write(self, data): return len(data)
+    def read(self, n=1): return b""
+    def close(self): pass
+
+real_serial_Serial = bridge_module.serial.Serial
+bridge_module.serial.Serial = _FakeSerialENOTTY
+_FakeSerialENOTTY.calls.clear()
+try:
+    br_fallback = bridge_module.Bridge("/fake/pty", "SPY", 8, 32,
+                                       baud=921_600)
+    check("falls back and succeeds despite the non-standard baud "
+         "failing first",
+         isinstance(br_fallback.ser, _FakeSerialENOTTY), True)
+    check("tried the REQUESTED baud first, not silently skipping it",
+          _FakeSerialENOTTY.calls[0], 921_600)
+    check("fell back to exactly 115200, not some other guessed value",
+          _FakeSerialENOTTY.calls[1], 115200)
+    check("exactly two attempts -- no retry storm",
+          len(_FakeSerialENOTTY.calls), 2)
+finally:
+    bridge_module.serial.Serial = real_serial_Serial
+
+# regression: an OSError with a DIFFERENT errno (a real hardware/driver
+# problem, not the ENOTTY special-baud case) must NOT be silently
+# swallowed by this fallback -- it has to propagate normally
+class _FakeSerialOtherError:
+    def __init__(self, port, baud, timeout=0.05):
+        raise OSError(5, "Input/output error")   # a different errno
+
+bridge_module.serial.Serial = _FakeSerialOtherError
+try:
+    threw = False
+    try:
+        bridge_module.Bridge("/fake/pty", "SPY", 8, 32, baud=921_600)
+    except OSError as e:
+        threw = (e.errno == 5)
+    check("an unrelated OSError (different errno) is NOT swallowed -- "
+         "propagates normally, exactly as before this fix existed",
+         threw, True)
+finally:
+    bridge_module.serial.Serial = real_serial_Serial
+
+# regression: requesting 115200 itself and hitting errno 25 anyway
+# (a genuinely broken device, not the pty case) must not retry at the
+# exact same value that just failed -- propagates immediately
+class _FakeSerialAlways25:
+    def __init__(self, port, baud, timeout=0.05):
+        raise OSError(25, "Inappropriate ioctl for device")
+
+bridge_module.serial.Serial = _FakeSerialAlways25
+try:
+    threw = False
+    try:
+        bridge_module.Bridge("/fake/pty", "SPY", 8, 32, baud=115_200)
+    except OSError as e:
+        threw = (e.errno == 25)
+    check("baud=115200 hitting errno 25 doesn't retry at the same "
+         "value (would just fail identically) -- propagates instead",
+         threw, True)
+finally:
+    bridge_module.serial.Serial = real_serial_Serial
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

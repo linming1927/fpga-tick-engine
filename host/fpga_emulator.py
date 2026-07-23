@@ -17,8 +17,8 @@ Why this exists:
 
 Usage (standalone):
     python3 fpga_emulator.py --symbol "SPY " --fast 8 --slow 32
-It prints the pty slave path (e.g. /dev/pts/3); point bridge.py's --port
-at that path.
+It prints the pty slave path (e.g. /dev/pts/3 on Linux, /dev/ttys003
+on macOS); point bridge.py's --port at that path.
 
 Fidelity notes / deliberate simplifications:
   * fpga_ts is microseconds since emulator start (the real counter is
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
 import signal
 import sys
 import threading
@@ -79,6 +80,13 @@ class FPGAEmulator:
                 os.close(fd)
             except OSError:
                 pass
+        # v3.31: wait for _serve() to actually exit before returning,
+        # so callers know teardown is genuinely complete (matters most
+        # right after this fix -- confirms the select()-based loop
+        # really does notice _stop promptly, rather than trusting it
+        # silently). Bounded: this must never itself become a new way
+        # to hang if something unexpected keeps the thread alive.
+        self.thread.join(timeout=2.0)
 
     def _ensure_models(self, sym: str, fresh: bool = False):
         """fresh=True mirrors the v2 hardware rule: writing a slot RESETS
@@ -98,7 +106,27 @@ class FPGAEmulator:
         return (time.monotonic_ns() - self.t0) // 1000
 
     def _serve(self):
+        # v3.31: found on macOS, running order_manager.py's test suite
+        # for the first time -- the ORIGINAL version here was a bare
+        # blocking os.read(), relying entirely on stop()'s os.close()
+        # (called from the MAIN thread) to interrupt this thread's read
+        # and raise OSError. That race is platform-inconsistent: Linux
+        # reliably wakes the blocked reader when the fd closes
+        # elsewhere; macOS/BSD kernels are documented to sometimes
+        # leave it blocked in an UNINTERRUPTIBLE state instead (ps
+        # shows this thread's process as "U" — not even SIGKILL-able
+        # cleanly, let alone a normal signal). The fix doesn't try to
+        # make close() reliable across platforms — it sidesteps the
+        # race entirely: select() with a bounded timeout means this
+        # loop re-checks self._stop on its OWN schedule, never
+        # depending on an external close() to wake it up at all.
         while not self._stop.is_set():
+            try:
+                ready, _, _ = select.select([self.master_fd], [], [], 0.2)
+            except (OSError, ValueError):
+                return          # fd already closed elsewhere -- done
+            if not ready:
+                continue        # timeout: nothing to read, recheck _stop
             try:
                 data = os.read(self.master_fd, 256)
             except OSError:

@@ -216,7 +216,36 @@ class Bridge:
                                                  # params vs FAST_N/SLOW_N
         self.verify_grace_s = verify_grace_s     # real seconds, not an echo
                                                  # count — see SignalVerifier
-        self.ser = serial.Serial(port, baud, timeout=0.05)
+        try:
+            self.ser = serial.Serial(port, baud, timeout=0.05)
+        except OSError as e:
+            # v3.30: macOS-specific gap, found running fpga_emulator.py
+            # (a pty, not real hardware) on a Mac. Non-standard baud
+            # rates (921600, the CLI default, isn't one of the fixed
+            # POSIX rates) need a special ioctl on macOS (IOSSIOSPEED)
+            # that only real serial hardware supports — a pty has no
+            # actual UART underneath it and correctly refuses the call
+            # with ENOTTY ("Inappropriate ioctl for device"). Linux is
+            # more permissive here (accepts the request even though
+            # it's meaningless for a pty), which is why this never
+            # surfaced there. Baud rate has NO effect on a pty's actual
+            # behavior either way — no real hardware clock involved, so
+            # bytes move at whatever rate the reader consumes them
+            # regardless of the nominal setting — so falling back to a
+            # standard rate changes nothing observable, it just avoids
+            # a code path that only real hardware needs. If the retry
+            # ALSO fails, that's a genuine problem and propagates
+            # normally; this never silently swallows a real failure.
+            if getattr(e, "errno", None) == 25 and baud != 115200:
+                print(f"[bridge] baud {baud} isn't settable on this "
+                     f"device (errno 25, ENOTTY) — likely a pty "
+                     f"(fpga_emulator.py), not real hardware. Retrying "
+                     f"at a standard rate; this has no effect on a "
+                     f"pty's actual behavior, only real UART hardware "
+                     f"has a real baud rate to set")
+                self.ser = serial.Serial(port, 115200, timeout=0.05)
+            else:
+                raise
         # one mirror model + one verifier PER (strategy, symbol) — models
         # must match the bitstream's engine parameters, symbols must match
         # the slot register file (configure_symbols keeps them in lockstep)

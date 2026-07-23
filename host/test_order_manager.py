@@ -1247,6 +1247,62 @@ check("final position reflects 5-share buys (a multiple of 5, not the "
      == 0,
      True)
 
+# ---- v3.35: a SystemExit from deep inside run_sim/run_historical/
+# run_alpaca (missing credentials, missing dependency, a failed slot-
+# config handshake, etc.) was being SILENTLY SWALLOWED by the
+# finally block's own unconditional sys.exit() -- the real reason
+# never printed anywhere, and the resulting all-zero summary looked
+# exactly like a normal, empty, successful session. Reproduced with
+# the real, actual failure path (missing ALPACA_KEY/SECRET) through
+# the genuine CLI -- not a synthetic/mocked scenario.
+print("[G23] a sys.exit() deep inside run_alpaca() is surfaced, not "
+     "silently swallowed by the outer finally block")
+
+g23_tmp = tempfile.mkdtemp()
+g23_env = os.environ.copy()
+g23_env.pop("ALPACA_KEY", None)
+g23_env.pop("ALPACA_SECRET", None)
+
+emu23 = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port23 = emu23.start()
+r = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port23, "--symbol", "SPY",
+     "--fast", "8", "--slow", "32", "--source", "alpaca", "--broker", "mock",
+     "--audit", os.path.join(g23_tmp, "audit.jsonl")],
+    capture_output=True, text=True, timeout=30, env=g23_env)
+emu23.stop()
+check("the session exits with a NONZERO code -- an early abort was "
+     "never actually a successful, OK session, even though the "
+     "all-zero summary alone would look exactly like one",
+     r.returncode, 1)
+check("the REAL reason is printed, not silently discarded -- the "
+     "exact bug: this line simply did not exist anywhere in the "
+     "output before this fix",
+     "[om] session aborted early:" in r.stdout, True)
+check("the summary STILL prints afterward (useful context: confirms "
+     "nothing ran, rather than just an error and nothing else)",
+     "RESULT: OK" in r.stdout, True)
+check("ticks sent correctly shows 0 -- the abort happened before "
+     "anything could flow, consistent with the surfaced reason",
+     "ticks sent            0" in r.stdout, True)
+
+# regression: a NORMAL, successful --source sim session (no early
+# abort at all) must be completely unaffected -- same exit-code logic
+# as always (ok and not halted), no spurious "aborted early" message
+emu23b = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port23b = emu23b.start()
+r2 = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port23b, "--symbol", "SPY",
+     "--fast", "8", "--slow", "32", "--source", "sim", "--n", "50",
+     "--broker", "mock", "--cooldown", "0",
+     "--audit", os.path.join(g23_tmp, "audit2.jsonl")],
+    capture_output=True, text=True, timeout=30)
+emu23b.stop()
+check("a normal successful session still exits 0, unaffected",
+      r2.returncode, 0)
+check("no spurious 'session aborted early' message on a normal run",
+      "session aborted early" in r2.stdout, False)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

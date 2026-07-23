@@ -700,3 +700,151 @@ standalone CLI, as opposed to its long-standing use as an imported
 test fixture. README: new "Running without an FPGA board" section
 documenting this as a first-class workflow, not a footnote. 19 new
 checks; 765 total across the host suite, 0 failures.
+
+**v3.30** — fixed a real macOS-only bug found running order_manager.py
+against fpga_emulator.py on a Mac for the first time: connecting to
+the emulator's pty threw OSError: [Errno 25] Inappropriate ioctl for
+device inside pyserial's macOS backend. Root cause: order_manager.py's
+--baud defaults to 921600, a non-standard rate that macOS's termios
+module has no native constant for; pyserial falls through to a
+special IOSSIOSPEED ioctl to set it, which only real serial hardware
+supports — a pty has no actual UART underneath it, so macOS correctly
+refuses the ioctl with ENOTTY. Linux's pty implementation is more
+permissive (accepts the call even though it's meaningless for a pty),
+which is exactly why this never surfaced there. Baud rate has zero
+effect on a pty's actual behavior either way -- no real clock involved,
+bytes move at whatever rate the reader consumes them -- so bridge.py
+now catches this specific failure (errno 25, requested baud wasn't
+already 115200) and transparently retries at 115200, a rate every
+platform's termios supports natively. An unrelated OSError (different
+errno -- a genuine hardware/driver problem) is never swallowed by
+this and propagates normally, confirmed directly. Verified without a
+real Mac available to test on: mocked pyserial's exact macOS failure
+mode (a bare OSError(errno=25) on the first call) and confirmed the
+retry sequence tries the requested baud first, falls back to exactly
+115200 second, and stops there -- no retry storm, no silent
+swallowing of unrelated failures, no pointless retry-at-the-same-value
+when 115200 itself is what failed. 6 new checks; 771 total across the
+host suite, 0 failures.
+
+**v3.31** — fixed a real macOS-only hang, found running the test
+suite on a Mac for the first time: fpga_emulator.py's background
+reader thread could get stuck forever in an uninterruptible kernel
+wait, immune to Ctrl-C and requiring SIGKILL. Root cause: the
+original stop() only set a flag and closed the pty's file
+descriptors, entirely trusting that closing an fd from the main
+thread would reliably interrupt a bare blocking os.read() happening
+concurrently in the reader thread. That's platform-inconsistent --
+Linux's pty implementation mostly wakes the blocked reader when the
+fd closes elsewhere; macOS/BSD kernels are documented to sometimes
+leave it blocked instead, which is exactly what `ps` showed (state
+"U", uninterruptible -- not even a normal signal reaches a thread in
+that state, only the read completing or the process being killed
+outright). Fixed by removing the dependency on that race entirely
+rather than trying to make close() reliable: the reader loop now
+uses select() with a 0.2s timeout before each read, so it re-checks
+its own stop flag on a fixed schedule no matter what happens to the
+fd from another thread. stop() also now joins the thread (bounded at
+2s) instead of returning immediately regardless of whether the
+thread actually exited -- which is exactly the gap that let the
+original bug hide silently: the old stop() "succeeded" instantly
+every time on Linux specifically because Linux happened to make the
+race work out, with nothing to ever catch it not doing so elsewhere.
+New [G6] in test_fpga_emulator.py: confirms stop() is now genuinely
+synchronous (thread.is_alive() is False immediately after stop()
+returns, not just "probably soon"), tested against the reader
+sitting genuinely idle in its wait (the actual condition that hung)
+and against stopping immediately after start (the race's other
+edge). 5 new checks; 776 total across the host suite, 0 failures.
+
+**v3.32** — fixed a leftover instance of the exact bug v3.30 fixed,
+just in test infrastructure instead of production code: found running
+test_fpga_emulator.py on a Mac for the first time (v3.29 was written
+and only ever tested on Linux, before v3.30 discovered this class of
+bug at all). G3's real-serial-traffic check connects directly to the
+pty (deliberately bypassing Bridge.__init__, since it's testing the
+symlink itself) and had hardcoded baud=921600 -- the exact
+non-standard rate that needs macOS's special IOSSIOSPEED ioctl, which
+a pty can't satisfy (ENOTTY), and which this raw connection never
+goes through Bridge to get v3.30's fallback for. Fixed by using a
+standard rate (115200) directly -- baud is meaningless for a pty's
+actual behavior either way, so there was never a reason for this
+specific line to use a non-standard one. Grepped the entire codebase
+for every serial.Serial() call site to confirm this was the only
+remaining instance; bridge.py's two call sites were already correct.
+No new checks needed (this is a fix to an existing check's internal
+value, not new behavior to verify) -- 776 total across the host
+suite, 0 failures, unchanged.
+
+**v3.33** — fixed another Linux-specific assumption in test
+infrastructure, found running on a Mac: two checks in
+test_fpga_emulator.py asserted the emulator's pty path starts with
+"/dev/pts/" -- Linux's pty naming convention. macOS names pty slaves
+/dev/ttysNNN instead (visible in the user's own earlier session:
+"virtual FPGA listening on: /dev/ttys002"), so both checks failed on
+a real Mac despite the underlying mechanism working correctly (the
+symlink was pointing at a genuine, working pty the whole time -- only
+the assertion's hardcoded prefix was wrong). Replaced with a
+platform-agnostic check (_is_real_pty_target): verifies the target is
+an existing character-special device under /dev/, true on both
+platforms, rather than hardcoding either OS's specific subdirectory
+naming. Also fixed two documentation-only stale references found
+while in the area: fpga_emulator.py's docstring now mentions both
+platforms' pty path conventions instead of only Linux's, and
+order_manager.py's own module docstring had a genuinely stale
+--max-shares example (removed from this CLI entirely back in v3.27,
+replaced by --max-position-notional) that would have failed if
+copy-pasted -- fixed to the current flag. Grepped for every
+--max-shares reference across the whole codebase to confirm nothing
+else was missed; everything remaining is either backtest.py's own
+still-valid flag or test code correctly verifying its absence from
+order_manager.py. No new checks needed (existing checks fixed to
+verify correctly, not new behavior added) -- 776 total across the
+host suite, 0 failures, unchanged.
+
+**v3.34** — README's "Running without an FPGA board" section updated
+with everything learned actually running the two-terminal workflow
+day to day: the real working command (matching the flags actually
+used in practice: --baud, --source alpaca, --broker alpaca,
+--household-income, --log, --audit), an explicit macOS note about
+--baud 115200 (v3.30's fallback catches it automatically, but stating
+it avoids the warning), a correction that --source alpaca must be
+stated explicitly since --source defaults to sim not alpaca (the
+exact mistake made once already -- an omitted --source silently runs
+a fake session instead of connecting to real market data, with no
+error to catch it), a note that --symbol on the emulator is only a
+startup placeholder fully overwritten by order_manager.py's own
+--symbols on connect, what a healthy session's output actually looks
+like (verified.../RESULT: OK vs DIVERGENCE), and an explicit warning
+about the actual failure mode when terminal 1 isn't running (opens
+successfully, zero ticks, clean exit, no error -- easy to mistake for
+something else being wrong). Documentation only, no code changes --
+host suite unchanged at 776.
+
+**v3.35** — fixed the real bug behind "the session just ends itself":
+a SystemExit from deep inside run_sim/run_historical/run_alpaca
+(missing credentials, missing dependency, a failed slot-configuration
+handshake, etc.) was being silently swallowed by main()'s own finally
+block, which unconditionally calls its own sys.exit() at the very
+end -- overriding whatever exception was already propagating from the
+try block, real error message included. The result looked exactly
+like a normal, empty, successful session: a complete-looking summary,
+all-zero counters, RESULT: OK, exit code 0 -- with zero indication
+anywhere of what actually happened or why. Root cause found by tracing
+through a real user session line by line: confirmed configure_symbols()
+always prints one of exactly two messages on completion (never both
+silent), neither appeared, meaning run_alpaca() exited before even
+reaching that call -- pointing straight at one of its own early
+sys.exit() calls (missing ALPACA_KEY/SECRET, missing the
+websocket-client dependency) being swallowed. Fixed by catching
+SystemExit explicitly alongside the existing KeyboardInterrupt,
+printing the real reason ("[om] session aborted early: <message>")
+before the finally block's own summary/exit logic runs, and tracking
+that an early abort happened so the final exit code honestly reflects
+failure instead of reporting success for a session that never started.
+Verified against the real failure path end to end (missing Alpaca
+credentials through the actual CLI, not a synthetic mock) -- confirmed
+the real reason now prints, the exit code is nonzero, and a normal
+successful session is completely unaffected (same exit-code logic,
+no spurious message). 6 new checks; 782 total across the host suite,
+0 failures.

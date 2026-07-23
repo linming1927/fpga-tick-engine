@@ -720,13 +720,41 @@ removes the silicon underneath math that was already proven correct.
 ```bash
 # terminal 1: start the virtual board, leave it running
 python3 host/fpga_emulator.py --symbol SPY
+```
 
+`--symbol` here is only a startup placeholder for slot 0 — it gets fully
+overwritten the moment `order_manager.py` connects and configures its
+own real symbol list (`configure_symbols()` rewrites all 8 slots
+unconditionally). It doesn't matter what you put there; leaving it at
+the default is fine.
+
+```bash
 # terminal 2: point order_manager.py at the printed stable path exactly
 # like a real board -- everything else about the command is unchanged
 python3 host/order_manager.py --port /tmp/fpga-tick-emulator \
-    --symbols SPY,QQQ --strategy vwap_bounce \
-    --source alpaca --broker paper --dashboard 8000
+    --baud 115200 --source alpaca --broker alpaca \
+    --symbols SPY,QQQ,RKLB,TSLA,RIVN --strategy vwap_bounce \
+    --dashboard 8000 --household-income 185000 \
+    --log ticks.jsonl --audit audit.jsonl
 ```
+
+**On macOS, add `--baud 115200` explicitly** (as shown above) —
+`order_manager.py`'s default (`921600`) needs a special ioctl macOS
+only allows on real serial hardware, not a pty. `bridge.py` has a v3.30
+fallback that catches this automatically if you forget, but setting it
+explicitly avoids the one-time warning message and is one less thing to
+debug if something else goes wrong. `--source alpaca` must be stated
+explicitly — `--source` defaults to `sim` (a synthetic random walk),
+not `alpaca`, so omitting it silently runs a fake session instead of
+connecting to real market data. `--broker alpaca` without `--live` is
+paper trading against your real Alpaca account, using the
+`ALPACA_KEY`/`ALPACA_SECRET` environment variables, same as any other
+machine.
+
+A healthy session prints `verified: FPGA vwap N == model — hardware
+math confirmed` for each signal and ends with `RESULT: OK` — if you
+ever see `DIVERGENCE` instead, stop and investigate before trusting
+anything further from that session.
 
 The emulator prints a **stable symlink path** (`/tmp/fpga-tick-emulator`
 by default, override with `--port-symlink`) alongside the real,
@@ -736,6 +764,15 @@ real board's `/dev/ttyUSB0` stays put across sessions (modulo the USB
 enumeration quirks a real board can have, which the emulator has none
 of). The symlink is cleaned up automatically on shutdown, whether you
 stop it with Ctrl-C or a plain `kill <pid>`.
+
+**Keep terminal 1 running for the entire session.** If it's closed,
+killed, or crashes, terminal 2 will still *open* its connection
+successfully (the pty path still technically exists) but nothing will
+be listening on the other end — every tick will silently go nowhere,
+`ticks sent`/`echoes received` will both read 0, and the session ends
+almost immediately with no crash and no error, just an empty summary.
+If that happens, check terminal 1 is still alive and showing its normal
+output before assuming anything else is wrong.
 
 Match parameters the same way you would with a real bitstream:
 `--fast`/`--slow`/`--ema-kf`/`--ema-ks`/`--vwap-warmup`/`--vwap-k2-q8`

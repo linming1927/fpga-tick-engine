@@ -41,9 +41,10 @@ DESIGN RULES
   structurally refuses any base URL that isn't the paper endpoint.
 
 USAGE (integrated: builds a Bridge internally)
-    python3 order_manager.py --port /dev/pts/N --source sim --broker mock
+    python3 order_manager.py --port /tmp/fpga-tick-emulator --source sim \
+            --broker mock
     python3 order_manager.py --port /dev/ttyUSB1 --source alpaca \
-            --broker alpaca --qty 1 --max-shares 5
+            --broker alpaca --qty 1 --max-position-notional 500
 """
 
 from __future__ import annotations
@@ -1222,6 +1223,7 @@ def main():
     print(f"[om] trading strategy: {args.strategy.upper()} "
           f"({_others} scored in parallel, gated identically, not traded)")
 
+    early_abort = False
     try:
         if args.source == "sim":
             run_sim(br, args.n, args.rate, args.start_price)
@@ -1237,6 +1239,21 @@ def main():
             run_alpaca(br, relay_url=args.relay_url)
     except KeyboardInterrupt:
         pass
+    except SystemExit as e:
+        # v3.35: without this, a sys.exit() from deep inside run_sim/
+        # run_historical/run_alpaca (missing credentials, missing
+        # dependency, a failed slot-configuration handshake, etc.) was
+        # SILENTLY SWALLOWED by this function's own finally-block
+        # sys.exit() below -- the real reason never printed anywhere,
+        # and the resulting all-zero summary (nothing ever ran) looked
+        # exactly like a normal, empty, successful session. Surface
+        # the real reason, and remember an early abort happened so the
+        # final exit code below reflects it honestly -- silently
+        # reporting success for a session that never actually started
+        # would be worse than the missing message alone.
+        if e.code and not isinstance(e.code, int):
+            print(f"[om] session aborted early: {e.code}")
+        early_abort = True
     finally:
         ok = br.summary()
         sync_live_card(cards, args.strategy, om)  # final guarantee, even if
@@ -1246,7 +1263,7 @@ def main():
         om.summary(args.household_income, args.filing_status,
                    args.state_rate, args.gross)
         br.close()
-        sys.exit(0 if ok and not om.halted else 1)
+        sys.exit(0 if (ok and not om.halted and not early_abort) else 1)
 
 
 if __name__ == "__main__":
