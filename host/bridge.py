@@ -751,7 +751,10 @@ def run_selftest(br: Bridge):
         print("[selftest] FAIL — see DIAG lines above and the summary")
 
 
-def run_alpaca(br: Bridge, feed: str = "iex", relay_url: str | None = None):
+def run_alpaca(br: Bridge, feed: str = "iex", relay_url: str | None = None,
+               reconnect_backoff_s: float = 5.0,
+               reconnect_backoff_max_s: float = 60.0,
+               reconnect_healthy_threshold_s: float = 60.0):
     """Live trades via Alpaca's v2 websocket. Lazy import + clear errors.
 
     relay_url: if set, connect here instead of to Alpaca directly —
@@ -762,6 +765,17 @@ def run_alpaca(br: Bridge, feed: str = "iex", relay_url: str | None = None):
     projects' direct connections concurrently isn't possible without
     a relay in front of one real connection. Auth is still sent (the
     relay ignores its contents) so nothing else here needs to change.
+
+    v3.36: automatically reconnects on ANY disconnect (idle overnight
+    gaps, network blips, Alpaca-side resets) — found the hard way when
+    a session started the evening before market open never resumed
+    trading once it actually opened, with no error anywhere, because
+    the many-hour overnight idle gap had dropped the connection at
+    some point and nothing brought it back. reconnect_backoff_s/
+    reconnect_backoff_max_s/reconnect_healthy_threshold_s are exposed
+    mainly for fast, deterministic testing of the backoff logic itself
+    (see test_host.py) — the defaults (5s / 60s / 60s) are what any
+    real session should use.
     """
     try:
         import websocket                              # websocket-client
@@ -777,7 +791,27 @@ def run_alpaca(br: Bridge, feed: str = "iex", relay_url: str | None = None):
     if not br.configure_symbols(br.symbols):
         sys.exit("[alpaca] aborting: FPGA slot configuration failed")
 
+    # v3.36: the websocket connection can drop for any number of mundane
+    # reasons -- an idle overnight gap with no trades to keep it alive,
+    # a network blip, Alpaca-side maintenance -- and the ORIGINAL code
+    # here started run_forever() ONCE with no supervision at all: if it
+    # ever returned (any disconnect, for any reason), the feed just
+    # silently died and nothing brought it back. Found exactly this way:
+    # a session started the evening before market open never resumed
+    # trading once the market actually opened, with no error anywhere,
+    # because the overnight idle gap (many hours with zero trades) had
+    # dropped the connection at some point and nothing reconnected.
+    #
+    # ws_holder/connected_at are single-element lists (not bare
+    # variables) so the nested closures below always reach the CURRENT
+    # live connection's state, even after a reconnect replaces the
+    # WebSocketApp object entirely.
+    ws_holder = [None]
+    connected_at = [None]
+    stop_requested = threading.Event()
+
     def on_open(ws):
+        connected_at[0] = time.monotonic()
         ws.send(json.dumps({"action": "auth", "key": key, "secret": secret}))
         ws.send(json.dumps({"action": "subscribe",
                             "trades": list(br.symbols)}))
@@ -792,25 +826,74 @@ def run_alpaca(br: Bridge, feed: str = "iex", relay_url: str | None = None):
     def on_error(ws, err):
         print(f"[alpaca] websocket error: {err}")
 
+    def on_close(ws, *args):
+        # *args absorbs whatever (close_status_code, close_msg) shape
+        # this websocket-client version passes -- not load-bearing,
+        # just avoids a version-specific signature mismatch
+        if not stop_requested.is_set():
+            print(f"[alpaca] connection closed unexpectedly {args} -- "
+                 f"the supervisor below will reconnect")
+
     def resub(new_syms):
         # dashboard reconfigured the slots mid-session: follow on the feed
         try:
-            ws.send(json.dumps({"action": "subscribe",
-                                "trades": list(new_syms)}))
+            if ws_holder[0] is not None:
+                ws_holder[0].send(json.dumps({"action": "subscribe",
+                                              "trades": list(new_syms)}))
         except Exception as e:
             print(f"[alpaca] resubscribe failed: {e}")
     br.on_symbols_changed = resub
 
-    ws = websocket.WebSocketApp(url, on_open=on_open,
-                                on_message=on_message, on_error=on_error)
-    t = threading.Thread(target=ws.run_forever, daemon=True)
+    def supervisor():
+        """Runs in the background thread for the entire session. Each
+        pass through the loop is one connection's whole lifetime:
+        connect, run until it disconnects (run_forever() blocks the
+        whole time and only returns once that happens), then either
+        stop (if the user asked to) or reconnect after a backoff.
+        Backoff grows on REPEATED failures to connect at all (so a
+        persistent problem -- bad credentials, Alpaca down -- doesn't
+        hammer the endpoint for hours unattended) but resets after any
+        connection that stayed up a reasonable while, so a single
+        random disconnect during an otherwise-healthy session recovers
+        quickly rather than inheriting a stale, escalated delay.
+        """
+        backoff = reconnect_backoff_s
+        while not stop_requested.is_set():
+            connected_at[0] = None
+            ws = websocket.WebSocketApp(url, on_open=on_open,
+                                        on_message=on_message,
+                                        on_error=on_error,
+                                        on_close=on_close)
+            ws_holder[0] = ws
+            ws.run_forever()              # blocks for the connection's
+                                          # entire lifetime
+            if stop_requested.is_set():
+                break
+            if (connected_at[0] and
+                    (time.monotonic() - connected_at[0])
+                    > reconnect_healthy_threshold_s):
+                backoff = reconnect_backoff_s   # was healthy a while --
+                                          # the next attempt shouldn't
+                                          # pay for an old run of failures
+            else:
+                backoff = min(backoff * 2, reconnect_backoff_max_s)
+            print(f"[alpaca] reconnecting in {backoff:.0f}s...")
+            stop_requested.wait(backoff)  # interruptible: Ctrl-C during
+                                          # the wait exits immediately
+                                          # rather than blocking it out
+
+    t = threading.Thread(target=supervisor, daemon=True)
     t.start()
     print("[alpaca] running — Ctrl-C to stop")
     try:
         while True:
             br.pump(timeout=0.2)
     except KeyboardInterrupt:
-        ws.close()
+        stop_requested.set()              # tells the supervisor this
+                                          # close is intentional, not a
+                                          # disconnect to recover from
+        if ws_holder[0] is not None:
+            ws_holder[0].close()
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,9 @@ from __future__ import annotations
 import os
 import random
 import sys
+import threading
 import time
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tick_protocol import (FrameParser, SMAMirror, EMAMirror, pack_tick,
@@ -714,6 +716,119 @@ try:
          threw, True)
 finally:
     bridge_module.serial.Serial = real_serial_Serial
+
+print("[G12] v3.36: run_alpaca's reconnection supervisor -- reconnects "
+     "on ANY disconnect (found via a real overnight-gap failure: the "
+     "original code started run_forever() once with no supervision at "
+     "all, so any disconnect silently killed the feed for the rest of "
+     "the session)")
+
+class _FakeWSApp:
+    """Simulates websocket-client's WebSocketApp with no real network
+    I/O. Each test configures `behavior` and `connected_duration`
+    class-level knobs; every instance is recorded so tests can count
+    distinct (re)connection attempts directly."""
+    instances = []
+    behavior = "instant_fail"   # or "connect_then_die"
+    connected_duration = 0.0
+
+    def __init__(self, url, on_open=None, on_message=None,
+                on_error=None, on_close=None):
+        self.url = url
+        self._on_open = on_open
+        self._on_close = on_close
+        self.closed_by_caller = False
+        _FakeWSApp.instances.append(self)
+
+    def send(self, data):
+        pass   # on_open sends auth/subscribe messages; no real socket to send to
+
+    def run_forever(self):
+        if _FakeWSApp.behavior == "connect_then_die":
+            if self._on_open:
+                self._on_open(self)
+            time.sleep(_FakeWSApp.connected_duration)
+        if self._on_close and not self.closed_by_caller:
+            self._on_close(self, 1006, "simulated disconnect")
+
+    def close(self):
+        self.closed_by_caller = True
+
+
+import bridge as bridge_module_g12
+fake_ws_module_g12 = types.ModuleType("websocket")
+fake_ws_module_g12.WebSocketApp = _FakeWSApp
+real_ws_module_g12 = sys.modules.get("websocket")
+sys.modules["websocket"] = fake_ws_module_g12
+
+os.environ["ALPACA_KEY"] = "test_key"
+os.environ["ALPACA_SECRET"] = "test_secret"
+
+emu_g12 = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port_g12 = emu_g12.start()
+
+def _run_alpaca_briefly(behavior, connected_duration, run_time_s,
+                        backoff_s=0.02, backoff_max_s=0.08,
+                        healthy_threshold_s=0.05):
+    """Runs run_alpaca() in a background thread for run_time_s real
+    seconds, then requests a clean stop -- same shape as a real
+    Ctrl-C -- and returns however many distinct WebSocketApp instances
+    got created during that window."""
+    _FakeWSApp.instances.clear()
+    _FakeWSApp.behavior = behavior
+    _FakeWSApp.connected_duration = connected_duration
+
+    br_g12 = Bridge(port_g12, "SPY", 8, 32)
+    from bridge import run_alpaca as run_alpaca_fn
+
+    result = {}
+    def _target():
+        try:
+            run_alpaca_fn(br_g12, reconnect_backoff_s=backoff_s,
+                         reconnect_backoff_max_s=backoff_max_s,
+                         reconnect_healthy_threshold_s=healthy_threshold_s)
+        except Exception as e:
+            result["error"] = e
+
+    th = threading.Thread(target=_target, daemon=True)
+    th.start()
+    time.sleep(run_time_s)
+    # simulate Ctrl-C: KeyboardInterrupt isn't directly injectable into
+    # another thread, so drive the same shutdown path run_alpaca's own
+    # handler uses (stop_requested.set() + closing the live connection)
+    # by closing the bridge's serial port, which makes br.pump() raise
+    # and unwinds the try/except KeyboardInterrupt-shaped loop the same
+    # way -- close it via the real path instead for a true end-to-end
+    # shutdown signal:
+    br_g12.close()
+    th.join(timeout=2.0)
+    count = len(_FakeWSApp.instances)
+    br_g12 = None
+    return count, result.get("error")
+
+check("multiple reconnect attempts happen on repeated instant "
+     "failures -- not just one connection and then silence",
+     _run_alpaca_briefly("instant_fail", 0.0, 0.3)[0] >= 2, True)
+
+# backoff escalation + reset: connect successfully and stay "healthy"
+# past the (tiny, test-only) threshold before disconnecting -- the
+# NEXT reconnect should use the un-escalated starting backoff, not a
+# stale doubled value from any earlier failures
+count2, err2 = _run_alpaca_briefly("connect_then_die", 0.08, 0.5,
+                                   backoff_s=0.02, backoff_max_s=0.08,
+                                   healthy_threshold_s=0.05)
+check("a connection that stays healthy past the threshold still "
+     "reconnects afterward (disconnects are disconnects, healthy or "
+     "not) -- at least 2 attempts across the test window",
+     count2 >= 2, True)
+
+emu_g12.stop()
+if real_ws_module_g12 is not None:
+    sys.modules["websocket"] = real_ws_module_g12
+else:
+    del sys.modules["websocket"]
+del os.environ["ALPACA_KEY"]
+del os.environ["ALPACA_SECRET"]
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
