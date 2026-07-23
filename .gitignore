@@ -35,3 +35,4 @@ historical_trades/
 
 # saved backtest run outputs — regenerable via backtest.py, not source code
 backtest_results/
+host/audit.jsonl
