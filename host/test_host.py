@@ -21,8 +21,10 @@ Four groups:
 
 from __future__ import annotations
 
+import json
 import os
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -731,6 +733,7 @@ class _FakeWSApp:
     instances = []
     behavior = "instant_fail"   # or "connect_then_die"
     connected_duration = 0.0
+    last_ping_kwargs = None
 
     def __init__(self, url, on_open=None, on_message=None,
                 on_error=None, on_close=None):
@@ -743,7 +746,9 @@ class _FakeWSApp:
     def send(self, data):
         pass   # on_open sends auth/subscribe messages; no real socket to send to
 
-    def run_forever(self):
+    def run_forever(self, ping_interval=0, ping_timeout=None):
+        _FakeWSApp.last_ping_kwargs = {"ping_interval": ping_interval,
+                                       "ping_timeout": ping_timeout}
         if _FakeWSApp.behavior == "connect_then_die":
             if self._on_open:
                 self._on_open(self)
@@ -769,41 +774,64 @@ port_g12 = emu_g12.start()
 
 def _run_alpaca_briefly(behavior, connected_duration, run_time_s,
                         backoff_s=0.02, backoff_max_s=0.08,
-                        healthy_threshold_s=0.05):
+                        healthy_threshold_s=0.05,
+                        ping_interval_s=20.0, ping_timeout_s=10.0):
     """Runs run_alpaca() in a background thread for run_time_s real
-    seconds, then requests a clean stop -- same shape as a real
-    Ctrl-C -- and returns however many distinct WebSocketApp instances
-    got created during that window."""
+    seconds, then requests a clean stop, and returns however many
+    distinct WebSocketApp instances got created during that window.
+
+    v3.40 fix: previously used br.close() to signal shutdown, but
+    that never actually interrupted run_alpaca()'s own "while True:
+    br.pump(...)" loop -- pump() reads from an internal queue and
+    just returns empty repeatedly rather than raising when the
+    underlying port is closed, so the loop harmlessly spun forever
+    instead of exiting. That left every PREVIOUS call's background
+    thread (and its own spawned supervisor sub-thread) running
+    indefinitely afterward, contaminating LATER calls' shared
+    _FakeWSApp state with stray run_forever() calls from threads that
+    were supposed to have stopped. Patch pump() to genuinely raise
+    KeyboardInterrupt once the window elapses instead -- the same
+    real interrupt path an actual Ctrl-C takes."""
     _FakeWSApp.instances.clear()
+    _FakeWSApp.last_ping_kwargs = None
     _FakeWSApp.behavior = behavior
     _FakeWSApp.connected_duration = connected_duration
 
     br_g12 = Bridge(port_g12, "SPY", 8, 32)
     from bridge import run_alpaca as run_alpaca_fn
 
+    stop_after = time.monotonic() + run_time_s
+    real_pump = br_g12.pump
+    call_count = [0]
+    def _pump_then_interrupt(timeout=0.0):
+        call_count[0] += 1
+        if call_count[0] <= 100:       # let configure_symbols()'s own
+            return real_pump(timeout=timeout)   # startup pump() calls
+                                                # complete first
+        if time.monotonic() >= stop_after:
+            raise KeyboardInterrupt
+        return real_pump(timeout=timeout)
+    br_g12.pump = _pump_then_interrupt
+
     result = {}
     def _target():
         try:
             run_alpaca_fn(br_g12, reconnect_backoff_s=backoff_s,
                          reconnect_backoff_max_s=backoff_max_s,
-                         reconnect_healthy_threshold_s=healthy_threshold_s)
+                         reconnect_healthy_threshold_s=healthy_threshold_s,
+                         ping_interval_s=ping_interval_s,
+                         ping_timeout_s=ping_timeout_s)
         except Exception as e:
             result["error"] = e
 
     th = threading.Thread(target=_target, daemon=True)
     th.start()
-    time.sleep(run_time_s)
-    # simulate Ctrl-C: KeyboardInterrupt isn't directly injectable into
-    # another thread, so drive the same shutdown path run_alpaca's own
-    # handler uses (stop_requested.set() + closing the live connection)
-    # by closing the bridge's serial port, which makes br.pump() raise
-    # and unwinds the try/except KeyboardInterrupt-shaped loop the same
-    # way -- close it via the real path instead for a true end-to-end
-    # shutdown signal:
-    br_g12.close()
-    th.join(timeout=2.0)
+    th.join(timeout=run_time_s + 2.0)
     count = len(_FakeWSApp.instances)
-    br_g12 = None
+    br_g12.close()          # release this call's serial connection --
+                            # without this, multiple calls' connections
+                            # pile up open simultaneously on the SAME
+                            # shared emulator port and cross-talk
     return count, result.get("error")
 
 check("multiple reconnect attempts happen on repeated instant "
@@ -821,6 +849,101 @@ check("a connection that stays healthy past the threshold still "
      "reconnects afterward (disconnects are disconnects, healthy or "
      "not) -- at least 2 attempts across the test window",
      count2 >= 2, True)
+
+print("[G13] v3.40: ping/timeout heartbeat actually reaches "
+     "run_forever() -- found from a real VPN-toggle incident where "
+     "reconnection never engaged at all: websocket-client's own "
+     "ping_interval defaults to 0 (disabled), so a SILENTLY "
+     "black-holed connection (no FIN, no RST -- exactly what a VPN "
+     "route change can cause) has nothing telling the socket the far "
+     "end is gone. run_forever() then never returns, and the whole "
+     "v3.36 reconnection supervisor never gets a chance to run at all "
+     "-- this isn't about the backoff/retry logic being wrong, it's "
+     "that nothing ever notices there's a problem in the first place. "
+     "Run as an isolated subprocess (same pattern as G18 above) rather "
+     "than sharing this file's process with G12's tests -- their "
+     "background reconnect threads don't reliably stop between calls "
+     "(a separate, pre-existing test-infra issue), and contaminated "
+     "this check's shared state when run in-process")
+
+def _ping_kwargs_subprocess(ping_interval_arg):
+    script = f'''
+import sys, types, threading, time, json
+sys.path.insert(0, ".")
+from fpga_emulator import FPGAEmulator
+from bridge import Bridge
+
+class _FakeWSApp:
+    def __init__(self, url, on_open=None, on_message=None,
+                on_error=None, on_close=None):
+        self._on_open = on_open
+        self._on_close = on_close
+        self.closed_by_caller = False
+    def send(self, data):
+        pass
+    def run_forever(self, ping_interval=0, ping_timeout=None):
+        print("RESULT:" + json.dumps(
+            {{"ping_interval": ping_interval, "ping_timeout": ping_timeout}}))
+        if self._on_open:
+            self._on_open(self)
+        time.sleep(0.05)
+    def close(self):
+        self.closed_by_caller = True
+
+fake_mod = types.ModuleType("websocket")
+fake_mod.WebSocketApp = _FakeWSApp
+sys.modules["websocket"] = fake_mod
+import os
+os.environ["ALPACA_KEY"] = "test_key"
+os.environ["ALPACA_SECRET"] = "test_secret"
+
+emu = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port = emu.start()
+br = Bridge(port, "SPY", 8, 32)
+from bridge import run_alpaca
+
+stop_after = time.monotonic() + 1.0
+real_pump = br.pump
+call_count = [0]
+def _pump_then_interrupt(timeout=0.0):
+    call_count[0] += 1
+    if call_count[0] <= 100:
+        return real_pump(timeout=timeout)
+    if time.monotonic() >= stop_after:
+        raise KeyboardInterrupt
+    return real_pump(timeout=timeout)
+br.pump = _pump_then_interrupt
+
+kwargs = {ping_interval_arg}
+th = threading.Thread(target=lambda: run_alpaca(br, **kwargs), daemon=True)
+th.start()
+th.join(timeout=5.0)
+emu.stop()
+'''
+    r = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=20)
+    for line in r.stdout.splitlines():
+        if line.startswith("RESULT:"):
+            return json.loads(line[len("RESULT:"):])
+    return None
+
+got_custom = _ping_kwargs_subprocess(
+    "{'ping_interval_s': 7.0, 'ping_timeout_s': 3.0}")
+check("a custom ping_interval_s is actually passed through to the "
+     "real run_forever() call, not silently dropped",
+     got_custom["ping_interval"] if got_custom else None, 7.0)
+check("a custom ping_timeout_s is actually passed through too",
+      got_custom["ping_timeout"] if got_custom else None, 3.0)
+
+got_default = _ping_kwargs_subprocess("{}")
+check("the real production defaults (20s/10s) are what actually get "
+     "used when the caller doesn't override them -- these are NOT "
+     "websocket-client's own defaults (0/None, meaning disabled), "
+     "confirming run_alpaca() itself supplies real values rather "
+     "than relying on the library's own no-heartbeat default",
+     (got_default["ping_interval"], got_default["ping_timeout"])
+     if got_default else None,
+     (20.0, 10.0))
 
 emu_g12.stop()
 if real_ws_module_g12 is not None:

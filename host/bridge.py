@@ -754,7 +754,9 @@ def run_selftest(br: Bridge):
 def run_alpaca(br: Bridge, feed: str = "iex", relay_url: str | None = None,
                reconnect_backoff_s: float = 5.0,
                reconnect_backoff_max_s: float = 60.0,
-               reconnect_healthy_threshold_s: float = 60.0):
+               reconnect_healthy_threshold_s: float = 60.0,
+               ping_interval_s: float = 20.0,
+               ping_timeout_s: float = 10.0):
     """Live trades via Alpaca's v2 websocket. Lazy import + clear errors.
 
     relay_url: if set, connect here instead of to Alpaca directly —
@@ -776,6 +778,23 @@ def run_alpaca(br: Bridge, feed: str = "iex", relay_url: str | None = None,
     mainly for fast, deterministic testing of the backoff logic itself
     (see test_host.py) — the defaults (5s / 60s / 60s) are what any
     real session should use.
+
+    v3.40: ping_interval_s/ping_timeout_s enable a websocket heartbeat
+    — found from a real VPN-toggle incident where the reconnection
+    logic above never engaged at all. The v3.36 supervisor only
+    reconnects once run_forever() RETURNS, which requires the
+    underlying socket to actually notice something went wrong (an
+    error, a clean close). A VPN changing network routes can silently
+    black-hole a connection instead — no FIN, no RST, packets just
+    stop arriving — and with no heartbeat, the socket has nothing
+    telling it the far end is gone; it just blocks in recv() forever,
+    run_forever() never returns, and the reconnection supervisor never
+    gets a chance to run. websocket-client's own ping_interval defaults
+    to 0 (disabled) — nothing here was asking for a heartbeat at all.
+    Now sends a ping every ping_interval_s and requires a pong within
+    ping_timeout_s or the library closes the connection itself,
+    which DOES make run_forever() return — handing control back to
+    the exact same reconnection supervisor, unchanged.
     """
     try:
         import websocket                              # websocket-client
@@ -865,8 +884,15 @@ def run_alpaca(br: Bridge, feed: str = "iex", relay_url: str | None = None,
                                         on_error=on_error,
                                         on_close=on_close)
             ws_holder[0] = ws
-            ws.run_forever()              # blocks for the connection's
-                                          # entire lifetime
+            ws.run_forever(ping_interval=ping_interval_s,
+                          ping_timeout=ping_timeout_s)
+                                          # blocks for the connection's
+                                          # entire lifetime; the ping/
+                                          # pong heartbeat is what lets
+                                          # this actually RETURN if the
+                                          # connection goes silently
+                                          # dead rather than cleanly
+                                          # closed (see docstring)
             if stop_requested.is_set():
                 break
             if (connected_at[0] and
