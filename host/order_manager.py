@@ -1130,6 +1130,16 @@ def main():
     ap.add_argument("--ignore-market-hours", action="store_true",
                     help="for mock/off-hours testing")
     ap.add_argument("--audit", default="om_audit.jsonl")
+    ap.add_argument("--killfile", default="om.kill",
+                    help="v3.42: path to the kill-switch marker file. "
+                        "Was previously hardcoded to 'om.kill' in the "
+                        "current directory with NO way to override it "
+                        "from the CLI at all -- meaning every session "
+                        "run from the same directory (a real trading "
+                        "session, a test run, a second strategy) shared "
+                        "the exact same kill-switch state, with no way "
+                        "to isolate them. Same default as before, for "
+                        "backward compatibility -- just now overridable")
     ap.add_argument("--household-income", type=float, default=None,
                     help="taxable household income for the tax estimate "
                          "(use --gross if you're giving gross income)")
@@ -1231,7 +1241,8 @@ def main():
     check_stale_open_orders(broker, args.cancel_stale_orders)
 
     symbols = [t for t in args.symbols.split(",") if t.strip()]
-    om = OrderManager(broker, symbols, limits, audit_path=args.audit)
+    om = OrderManager(broker, symbols, limits, audit_path=args.audit,
+                      killfile=args.killfile)
 
     from compare import StrategyScorecard, comparison_report
     br = Bridge(args.port, symbols, args.fast, args.slow,

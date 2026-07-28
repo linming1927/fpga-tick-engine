@@ -157,7 +157,7 @@ captured_urls = []
 class _FakeWS:
     def __init__(self, url, **kwargs):
         captured_urls.append(url)
-    def run_forever(self):
+    def run_forever(self, ping_interval=0, ping_timeout=None):
         pass          # never actually connects anywhere
     def close(self):
         pass
@@ -638,6 +638,7 @@ def run_session(n_ticks):
          "--source", "sim", "--broker", "mock", "--cooldown", "0",
          "--n", str(n_ticks), "--rate", "50", "--fast", "4", "--slow", "8",
          "--ema-kf", "1", "--ema-ks", "3", "--profit-gate",
+         "--killfile", os.path.join(d14, "om.kill"),
          "--no-timestamps",   # v3.41: this test parses fixed-column
                               # positions from the output (trips_win_net
                               # below) -- a timestamp prefix would shift
@@ -1051,7 +1052,8 @@ check("with a clear reason, not a stack trace",
 # --source historical with no --trades errors clearly
 r = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", "/dev/null",
-     "--source", "historical"],
+     "--source", "historical",
+     "--killfile", os.path.join(tempfile.mkdtemp(), "om.kill")],
     capture_output=True, text=True, timeout=15)
 check("--source historical without --trades is refused",
       r.returncode != 0, True)
@@ -1077,7 +1079,8 @@ r = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", port20,
      "--symbol", "SYNTH", "--fast", "8", "--slow", "32",
      "--source", "historical", "--trades", g20_trades_path,
-     "--replay-rate", "300", "--broker", "mock"],
+     "--replay-rate", "300", "--broker", "mock",
+     "--killfile", os.path.join(tempfile.mkdtemp(), "om.kill")],
     capture_output=True, text=True, timeout=60)
 emu20.stop()
 check("historical replay exits cleanly", r.returncode, 0)
@@ -1101,7 +1104,8 @@ port20b = emu20b.start()
 r = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", port20b,
      "--symbol", "SYNTH,QQQ", "--source", "historical",
-     "--trades", g20_trades_path, "--broker", "mock"],
+     "--trades", g20_trades_path, "--broker", "mock",
+     "--killfile", os.path.join(tempfile.mkdtemp(), "om.kill")],
     capture_output=True, text=True, timeout=30)
 emu20b.stop()
 check("multi-symbol historical replay aborts rather than silently "
@@ -1144,7 +1148,8 @@ r = subprocess.run(
      "--fast", "8", "--slow", "32", "--source", "historical",
      "--trades", g21_trades_path, "--replay-rate", "300",
      "--broker", "mock", "--strategy", "vwap_bounce",
-     "--audit", g21_audit_path],
+     "--audit", g21_audit_path,
+     "--killfile", os.path.join(g21_tmp, "om.kill")],
     capture_output=True, text=True, timeout=90)
 emu21.stop()
 check("session exits cleanly", r.returncode, 0)
@@ -1178,7 +1183,8 @@ r2 = subprocess.run(
      "--fast", "8", "--slow", "32", "--source", "historical",
      "--trades", g21_trades_path, "--replay-rate", "300",
      "--broker", "mock", "--strategy", "vwap_bounce",
-     "--audit", g21_audit_path],
+     "--audit", g21_audit_path,
+     "--killfile", os.path.join(g21_tmp, "om.kill")],
     capture_output=True, text=True, timeout=90)
 emu21b.stop()
 restore_line = next((l for l in r2.stdout.splitlines()
@@ -1238,7 +1244,8 @@ r = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", port22, "--symbol", "SYNTH",
      "--fast", "4", "--slow", "8", "--source", "historical",
      "--trades", g22_trades, "--replay-rate", "300", "--broker", "mock",
-     "--cooldown", "0"],
+     "--cooldown", "0",
+     "--killfile", os.path.join(tempfile.mkdtemp(), "om.kill")],
     capture_output=True, text=True, timeout=60)
 emu22.stop()
 check("session exits cleanly", r.returncode, 0)
@@ -1274,7 +1281,8 @@ port23 = emu23.start()
 r = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", port23, "--symbol", "SPY",
      "--fast", "8", "--slow", "32", "--source", "alpaca", "--broker", "mock",
-     "--audit", os.path.join(g23_tmp, "audit.jsonl")],
+     "--audit", os.path.join(g23_tmp, "audit.jsonl"),
+     "--killfile", os.path.join(g23_tmp, "om.kill")],
     capture_output=True, text=True, timeout=30, env=g23_env)
 emu23.stop()
 check("the session exits with a NONZERO code -- an early abort was "
@@ -1301,7 +1309,8 @@ r2 = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", port23b, "--symbol", "SPY",
      "--fast", "8", "--slow", "32", "--source", "sim", "--n", "50",
      "--broker", "mock", "--cooldown", "0",
-     "--audit", os.path.join(g23_tmp, "audit2.jsonl")],
+     "--audit", os.path.join(g23_tmp, "audit2.jsonl"),
+     "--killfile", os.path.join(g23_tmp, "om2.kill")],
     capture_output=True, text=True, timeout=30)
 emu23b.stop()
 check("a normal successful session still exits 0, unaffected",
@@ -1478,7 +1487,8 @@ r1 = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", port25, "--symbol", "SPY",
      "--fast", "8", "--slow", "32", "--source", "historical",
      "--trades", g25_trades, "--broker", "mock",
-     "--audit", os.path.join(g25_tmp, "e2e_audit.jsonl")],
+     "--audit", os.path.join(g25_tmp, "e2e_audit.jsonl"),
+     "--killfile", os.path.join(g25_tmp, "om.kill")],
     capture_output=True, text=True, timeout=60)
 emu25.stop()
 check("first run of the day: no 'already reset today' message (this "
@@ -1491,7 +1501,8 @@ r2 = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", port25b, "--symbol", "SPY",
      "--fast", "8", "--slow", "32", "--source", "historical",
      "--trades", g25_trades, "--broker", "mock",
-     "--audit", os.path.join(g25_tmp, "e2e_audit.jsonl")],
+     "--audit", os.path.join(g25_tmp, "e2e_audit.jsonl"),
+     "--killfile", os.path.join(g25_tmp, "om.kill")],
     capture_output=True, text=True, timeout=60)
 emu25b.stop()
 check("second run, same day, same audit file: correctly recognizes "
@@ -1504,7 +1515,8 @@ r3 = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", port25c, "--symbol", "SPY",
      "--fast", "8", "--slow", "32", "--source", "historical",
      "--trades", g25_trades, "--broker", "mock", "--force-vwap-reset",
-     "--audit", os.path.join(g25_tmp, "e2e_audit.jsonl")],
+     "--audit", os.path.join(g25_tmp, "e2e_audit.jsonl"),
+     "--killfile", os.path.join(g25_tmp, "om.kill")],
     capture_output=True, text=True, timeout=60)
 emu25c.stop()
 check("--force-vwap-reset overrides the same-day skip and resets anyway",
@@ -1830,7 +1842,8 @@ r28 = subprocess.run(
     [sys.executable, ORDER_MANAGER_PY, "--port", port28, "--symbol", "SPY",
      "--fast", "8", "--slow", "32", "--source", "sim", "--n", "20",
      "--broker", "mock", "--cooldown", "0",
-     "--audit", os.path.join(tempfile.mkdtemp(), "g28.jsonl")],
+     "--audit", os.path.join(tempfile.mkdtemp(), "g28.jsonl"),
+     "--killfile", os.path.join(tempfile.mkdtemp(), "om.kill")],
     capture_output=True, text=True, timeout=30)
 emu28.stop()
 check("a real session (MockBroker) reaches and passes this call "
@@ -1838,6 +1851,63 @@ check("a real session (MockBroker) reaches and passes this call "
      "runs, which is exactly what would have happened before this "
      "function was actually defined",
      r28.returncode, 0)
+
+print("[G29] v3.42: --killfile as a real CLI flag -- found from a real "
+     "incident: this whole test file was silently sharing the exact "
+     "same hardcoded 'om.kill' path (relative to the current "
+     "directory) with the user's own real trading sessions run from "
+     "the same host/ folder. Tripping the kill switch during real "
+     "trading (as actually happened, from wash-trade rejections) left "
+     "a marker file that then made EVERY SUBSEQUENT TEST RUN refuse to "
+     "start -- there was no CLI flag anywhere to override this, in "
+     "tests or in production")
+
+check("--killfile is a real CLI flag",
+      "--killfile" in subprocess.run(
+          [sys.executable, ORDER_MANAGER_PY, "--help"],
+          capture_output=True, text=True, timeout=30).stdout, True)
+
+g29_tmp = tempfile.mkdtemp()
+g29_kill_a = os.path.join(g29_tmp, "a.kill")
+g29_kill_b = os.path.join(g29_tmp, "b.kill")
+with open(g29_kill_a, "w") as f:
+    f.write("halted: pre-existing marker for this test\n")
+
+emu29a = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port29a = emu29a.start()
+r29a = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port29a, "--symbol", "SPY",
+     "--fast", "8", "--slow", "32", "--source", "sim", "--n", "10",
+     "--broker", "mock", "--killfile", g29_kill_a,
+     "--audit", os.path.join(g29_tmp, "audit_a.jsonl")],
+    capture_output=True, text=True, timeout=30)
+emu29a.stop()
+check("a session pointed at a killfile path that already has a "
+     "marker refuses to start -- the --killfile value is genuinely "
+     "used for the check, not just accepted and ignored",
+     "kill marker" in r29a.stdout or "kill marker" in r29a.stderr, True)
+
+emu29b = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port29b = emu29b.start()
+r29b = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port29b, "--symbol", "SPY",
+     "--fast", "8", "--slow", "32", "--source", "sim", "--n", "10",
+     "--broker", "mock", "--killfile", g29_kill_b,
+     "--audit", os.path.join(g29_tmp, "audit_b.jsonl")],
+    capture_output=True, text=True, timeout=30)
+emu29b.stop()
+check("a DIFFERENT session using a DIFFERENT --killfile path is "
+     "completely unaffected by the first one's marker -- this is the "
+     "actual fix: two sessions (or a real session and a test run) "
+     "from the same directory no longer share kill-switch state "
+     "unless they explicitly point at the same file",
+     r29b.returncode, 0)
+
+check("this test file's OWN --killfile default did not leak a stray "
+     "marker into the shared host/ directory -- the exact scenario "
+     "that broke every subsequent run before this fix",
+     os.path.exists(os.path.join(
+         os.path.dirname(os.path.abspath(__file__)), "om.kill")), False)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

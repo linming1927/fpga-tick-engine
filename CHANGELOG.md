@@ -935,3 +935,40 @@ Verified end to end with all four pieces active together through a
 real historical-replay session: zero divergence across all three
 strategies, real fills, the new gate actively blocking signals as
 designed, clean exit.
+
+**v3.42** — found while investigating a test failure you reported:
+two real, separate bugs, one of them affecting production, not just
+tests.
+
+First: test_order_manager.py's own separate fake WebSocketApp class
+(built for the v3.28 relay-url test, distinct from test_host.py's own
+fake -- which WAS updated) still had the pre-v3.40 run_forever()
+signature with no ping_interval/ping_timeout parameters, so it raised
+a TypeError the moment the v3.40 heartbeat fix tried to call it --
+exactly the crash you saw. Fixed to accept the same parameters real
+websocket-client does.
+
+Second, and more significant: this entire test file was silently
+sharing the exact same hardcoded "om.kill" path (relative to the
+current directory) with real trading sessions run from the same
+host/ folder -- and there was no CLI flag anywhere to override this,
+in tests OR in production. Tripping the kill switch during real
+trading (as actually happened, from the wash-trade rejections) left
+a marker file that then made every subsequent test run refuse to
+start with an unrelated, confusing IndexError three frames away from
+the real cause. Added --killfile as a genuine, new CLI flag (default
+"om.kill", unchanged, for backward compatibility) so any session --
+real or test -- can point its kill-switch marker somewhere isolated.
+Fixed all 16 real subprocess call sites across the test file that
+were missing it (2 were already safe: --selftest exits before
+OrderManager is ever constructed, and the --live+--source-historical
+refusal exits even earlier). New [G29]: confirms --killfile is a
+real flag, that a session pointed at a path with an existing marker
+correctly refuses to start, that a DIFFERENT session using a
+DIFFERENT path is completely unaffected, and that this test file no
+longer leaves any stray marker in the shared host/ directory --
+the exact scenario that broke every subsequent run before this fix.
+
+4 new checks; 868 total across the host suite, 0 failures, confirmed
+stable across three consecutive full runs with no stray files left
+behind.
