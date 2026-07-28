@@ -45,7 +45,8 @@ from tick_protocol import (FrameParser, SMAMirror, EMAMirror, VWAPMirror,
                            TICK_SOF, TICK_EOF, TICK_LEN, TYPE_TRADE,
                            TYPE_SYMCFG, TYPE_SESSRST,
                            TYPE_SIGNAL_SMA, TYPE_SIGNAL_EMA,
-                           TYPE_SIGNAL_VWAP, SYM_LEN, dollars)
+                           TYPE_SIGNAL_VWAP, SYM_LEN, dollars,
+                           install_local_timestamps)
 
 
 class FPGAEmulator:
@@ -227,7 +228,12 @@ def main():
                         "(and otherwise different every run) path, so "
                         "your order_manager.py command never needs to "
                         "change between restarts. Pass '' to disable.")
+    ap.add_argument("--no-timestamps", action="store_true",
+                    help="v3.41: disable the local HH:MM:SS timestamp "
+                        "prefix normally added to every printed line")
     args = ap.parse_args()
+    if not args.no_timestamps:
+        install_local_timestamps()
 
     emu = FPGAEmulator(args.symbol, args.fast, args.slow,
                        ema_kf=args.ema_kf, ema_ks=args.ema_ks,

@@ -309,6 +309,23 @@ class _AlpacaREST:
                 return 0
             raise
 
+    def list_open_orders(self) -> list[dict]:
+        """v3.41: GET /v2/orders?status=open -- raw Alpaca order
+        objects. Used at startup to catch orders left open from a
+        PRIOR session (e.g. a fill that never confirmed before a
+        disconnect) before they cause "wash trade" rejections against
+        a NEW order on the same symbol."""
+        result = self._req("GET", "/v2/orders?status=open")
+        return result if isinstance(result, list) else []
+
+    def cancel_all_open_orders(self) -> list[dict]:
+        """v3.41: DELETE /v2/orders -- cancels EVERY open order on the
+        account, regardless of what placed it (this tool, a prior
+        crashed session, a manual trade, anything else). Returns
+        Alpaca's own per-order result list ([{id, status}, ...])."""
+        result = self._req("DELETE", "/v2/orders")
+        return result if isinstance(result, list) else []
+
     def submit_market_order(self, symbol: str, qty: int, side: str,
                             ref_price_e4: int) -> dict:
         order = self._req("POST", "/v2/orders", {
@@ -830,12 +847,67 @@ def sync_live_card(cards: dict, strategy: str, om: "OrderManager"):
     live.positions = dict(om.positions)
 
 
+def check_stale_open_orders(broker, cancel: bool):
+    """v3.41: see the call site's comment for the full incident this
+    fixes (a stale open order surviving between sessions caused three
+    straight 'wash trade' rejections, which tripped the kill switch).
+
+    MockBroker has no open-orders concept at all -- everything fills
+    instantly -- so this checks for the method rather than the broker
+    TYPE, making it a clean no-op for MockBroker (and any future
+    broker that doesn't carry the concept) without needing a broker-
+    type check that would need updating every time a new broker class
+    is added.
+    """
+    if not hasattr(broker, "list_open_orders"):
+        return
+    try:
+        open_orders = broker.list_open_orders()
+    except BrokerError as e:
+        print(f"[om] WARNING: couldn't check for stale open orders: {e}")
+        return
+    if not open_orders:
+        return
+
+    by_symbol: dict[str, int] = {}
+    for o in open_orders:
+        sym = o.get("symbol", "?")
+        by_symbol[sym] = by_symbol.get(sym, 0) + 1
+    summary = ", ".join(f"{sym} x{n}" for sym, n in sorted(by_symbol.items()))
+
+    if cancel:
+        print(f"[om] {len(open_orders)} stale open order(s) found "
+             f"({summary}) — cancelling before trading begins "
+             f"(--cancel-stale-orders)")
+        try:
+            results = broker.cancel_all_open_orders()
+            print(f"[om] cancelled {len(results)} order(s)")
+        except BrokerError as e:
+            print(f"[om] WARNING: failed to cancel stale open orders: "
+                 f"{e} — they may still cause 'wash trade' rejections")
+    else:
+        print(f"[om] WARNING: {len(open_orders)} stale open order(s) "
+             f"found on the account ({summary}) — possibly left over "
+             f"from a prior session (e.g. a disconnect before a fill "
+             f"confirmed). They may cause 'wash trade' rejections the "
+             f"moment this session trades the same symbol. Pass "
+             f"--cancel-stale-orders to clear them automatically at "
+             f"startup, or cancel manually via Alpaca's dashboard/API "
+             f"first")
+
+
 def main():
     from bridge import Bridge, run_sim, run_alpaca, run_historical   # reuse everything
+    from tick_protocol import install_local_timestamps
 
     ap = argparse.ArgumentParser(
         description="FPGA signal -> risk-checked paper order")
     ap.add_argument("--port", required=True)
+    ap.add_argument("--no-timestamps", action="store_true",
+                    help="v3.41: disable the local HH:MM:SS timestamp "
+                        "prefix normally added to every printed line "
+                        "-- e.g. if you're piping output somewhere "
+                        "that already timestamps for you")
     ap.add_argument("--symbol", "--symbols", dest="symbols", default="SPY",
                     help="comma-separated, up to 8 (e.g. SPY,QQQ,AAPL)")
     ap.add_argument("--fast", type=int, default=8)
@@ -1012,6 +1084,21 @@ def main():
                          "trades; 0 or negative means no cap — use with "
                          "real caution, could run for many hours)")
     ap.add_argument("--broker", choices=["mock", "alpaca"], default="mock")
+    ap.add_argument("--cancel-stale-orders", action="store_true",
+                    help="v3.41: --broker alpaca only. At startup, if "
+                        "any open orders are already sitting on the "
+                        "account (e.g. left over from a prior session "
+                        "that disconnected before a fill confirmed), "
+                        "cancel all of them automatically before "
+                        "trading begins. Without this flag, stale open "
+                        "orders are only WARNED about, not touched -- "
+                        "they'll likely cause 'wash trade' rejections "
+                        "the moment this session tries to trade the "
+                        "same symbol, since Alpaca refuses an order "
+                        "when an opposite-side order already exists. "
+                        "Off by default since cancelling is a "
+                        "destructive action on orders this specific "
+                        "session didn't necessarily place itself")
     ap.add_argument("--live", action="store_true",
                     help="REAL MONEY. Requires --broker alpaca plus the full "
                          "interlock chain (see arm_live_trading)")
@@ -1066,6 +1153,8 @@ def main():
                          "Run this FIRST after any bitstream change, "
                          "before a live or historical-replay session.")
     args = ap.parse_args()
+    if not args.no_timestamps:
+        install_local_timestamps()
 
     if args.selftest:
         # hardware acceptance test — real board, no broker, no
@@ -1131,6 +1220,16 @@ def main():
     else:
         broker = MockBroker()
         print("[om] broker: mock (no orders leave this machine)")
+
+    # v3.41: catch orders left open from a PRIOR session (e.g. a fill
+    # that never confirmed before a disconnect, or a real crash) before
+    # they cause "wash trade" rejections -- found from a real incident:
+    # a stale open order sat on the account, and three straight
+    # rejections against it tripped the kill switch on an otherwise-
+    # healthy session. MockBroker has no concept of open orders at all
+    # (fills instantly), so this only applies to a real Alpaca broker.
+    check_stale_open_orders(broker, args.cancel_stale_orders)
+
     symbols = [t for t in args.symbols.split(",") if t.strip()]
     om = OrderManager(broker, symbols, limits, audit_path=args.audit)
 

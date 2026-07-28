@@ -953,6 +953,63 @@ else:
 del os.environ["ALPACA_KEY"]
 del os.environ["ALPACA_SECRET"]
 
+print("[G14] v3.41: install_local_timestamps -- every printed line "
+     "gets a local HH:MM:SS prefix without touching every print() "
+     "call site across the project. Includes a direct regression "
+     "test for a real bug found while completing this: the wrapper "
+     "class was originally defined INSIDE the function, making it a "
+     "distinct class object every call, so the idempotent guard's "
+     "isinstance() check could never recognize an already-installed "
+     "wrapper from an earlier call -- silently double-wrapping "
+     "stdout (and double-timestamping every line) on any second call")
+
+from tick_protocol import install_local_timestamps
+import io as _io_g14
+
+_real_stdout_g14 = sys.stdout
+try:
+    buf_g14 = _io_g14.StringIO()
+    sys.stdout = buf_g14
+    install_local_timestamps()
+
+    print("hello world")
+    print("multiple", "args", "here")
+    print()
+    print("after a blank line")
+
+    out = buf_g14.getvalue()
+    lines = out.split("\n")
+    check("a basic line gets a timestamp prefix",
+          lines[0].startswith("[") and "] hello world" in lines[0], True)
+    check("multiple print() arguments get exactly ONE timestamp, not "
+         "one per argument (print() makes several write() calls "
+         "internally for a single statement)",
+         lines[1].count("[") == 1 and "] multiple args here" in lines[1],
+         True)
+    check("a genuinely blank line (bare print()) stays blank, not "
+         "'[HH:MM:SS] ' with nothing after it",
+         lines[2], "")
+    check("output resumes getting timestamped normally after a "
+         "blank line", "] after a blank line" in lines[3], True)
+
+    # the actual regression: calling install_local_timestamps() AGAIN
+    # must be a true no-op, not a second wrap
+    buf_g14.truncate(0)
+    buf_g14.seek(0)
+    install_local_timestamps()          # 2nd call
+    install_local_timestamps()          # 3rd call, for good measure
+    print("after repeated install calls")
+    out2 = buf_g14.getvalue()
+    check("repeated install_local_timestamps() calls do NOT "
+         "double-wrap stdout -- exactly one timestamp prefix per "
+         "line, not two or three",
+         out2.count("[") == 1, True)
+finally:
+    sys.stdout = _real_stdout_g14   # always restore, even on failure --
+                                    # a leaked wrapper here would
+                                    # silently timestamp every
+                                    # subsequent test's output too
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

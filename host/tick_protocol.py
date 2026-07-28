@@ -30,8 +30,55 @@ from __future__ import annotations
 
 import json
 import struct
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
+
+
+class _TimestampedStdout:
+    """Module-level (not nested inside install_local_timestamps) so
+    isinstance() below can actually recognize an already-installed
+    wrapper across multiple calls -- a class defined INSIDE a
+    function is a distinct class object every time that function
+    runs, so isinstance() against it could never match a wrapper
+    installed by an earlier call, silently defeating the idempotent
+    guard and double-wrapping stdout (and therefore double-
+    timestamping every line) on any second call."""
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+        self._at_line_start = True
+
+    def write(self, s):
+        if not s:
+            return 0
+        out = []
+        for part in s.splitlines(keepends=True):
+            if self._at_line_start and part.strip():
+                out.append(f"[{datetime.now().strftime('%H:%M:%S')}] ")
+            out.append(part)
+            self._at_line_start = part.endswith("\n")
+        text = "".join(out)
+        self._wrapped.write(text)
+        return len(s)
+
+    def flush(self):
+        self._wrapped.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
+def install_local_timestamps():
+    """v3.41: wraps sys.stdout so every printed line gets a local
+    HH:MM:SS timestamp prefix, without needing every print() call
+    site across the whole project to add one manually. Call once, as
+    early as possible in a real CLI entry point's main() -- NOT at
+    module import time, so importing this module for tests or from
+    another script doesn't silently start timestamping unrelated
+    output. Idempotent: calling it more than once (e.g. if some
+    future code path does) is a no-op after the first call."""
+    if not isinstance(sys.stdout, _TimestampedStdout):
+        sys.stdout = _TimestampedStdout(sys.stdout)
 
 
 # ---------------------------------------------------------------------------

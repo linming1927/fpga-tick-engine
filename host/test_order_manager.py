@@ -638,6 +638,11 @@ def run_session(n_ticks):
          "--source", "sim", "--broker", "mock", "--cooldown", "0",
          "--n", str(n_ticks), "--rate", "50", "--fast", "4", "--slow", "8",
          "--ema-kf", "1", "--ema-ks", "3", "--profit-gate",
+         "--no-timestamps",   # v3.41: this test parses fixed-column
+                              # positions from the output (trips_win_net
+                              # below) -- a timestamp prefix would shift
+                              # those and corrupt the parse, unrelated
+                              # to what this test actually verifies
          "--audit", audit14],
         capture_output=True, text=True, timeout=90)
     emu.stop()
@@ -1718,6 +1723,121 @@ check("the independent stop-loss fired, closing the position, from a "
 check("exactly one order was placed (the stop's own sell) -- no "
      "retry storm or duplicate trigger",
      om27_cli.orders, 1)
+
+print("[G28] v3.41: check_stale_open_orders -- the function that was "
+     "called at startup but never actually defined (a genuine gap "
+     "found while completing this feature: the call site and the "
+     "underlying broker methods existed, but main() would have "
+     "crashed with NameError the moment it ran)")
+
+from order_manager import check_stale_open_orders, BrokerError
+
+class _FakeOrdersBroker:
+    """Exposes just the two methods check_stale_open_orders actually
+    calls -- no real Alpaca HTTP involved, since only the DECISION
+    logic (warn vs cancel, summary formatting, error handling) needs
+    verifying here, not the REST plumbing underneath it."""
+    def __init__(self, open_orders=None, list_error=None, cancel_error=None):
+        self._open_orders = open_orders or []
+        self._list_error = list_error
+        self._cancel_error = cancel_error
+        self.cancel_called = False
+
+    def list_open_orders(self):
+        if self._list_error:
+            raise self._list_error
+        return self._open_orders
+
+    def cancel_all_open_orders(self):
+        self.cancel_called = True
+        if self._cancel_error:
+            raise self._cancel_error
+        return [{"id": o.get("id", "?"), "status": "canceled"}
+               for o in self._open_orders]
+
+buf28a = io.StringIO()
+with contextlib.redirect_stdout(buf28a):
+    check_stale_open_orders(MockBroker(), cancel=False)
+check("MockBroker (no list_open_orders method at all) is a clean "
+     "no-op -- no crash, nothing printed",
+     buf28a.getvalue(), "")
+
+buf28b = io.StringIO()
+with contextlib.redirect_stdout(buf28b):
+    check_stale_open_orders(_FakeOrdersBroker(open_orders=[]), cancel=False)
+check("zero open orders found: silent, nothing printed either way",
+      buf28b.getvalue(), "")
+
+broker28c = _FakeOrdersBroker(open_orders=[
+    {"id": "abc", "symbol": "TSLA"}, {"id": "def", "symbol": "SPY"}])
+buf28c = io.StringIO()
+with contextlib.redirect_stdout(buf28c):
+    check_stale_open_orders(broker28c, cancel=False)
+out28c = buf28c.getvalue()
+check("open orders found, cancel=False: warns clearly",
+      "WARNING" in out28c and "2 stale open order" in out28c, True)
+check("the warning names the specific symbols involved",
+      "TSLA" in out28c and "SPY" in out28c, True)
+check("cancel=False never actually calls cancel_all_open_orders -- "
+     "warn-only means genuinely untouched, not touched-but-quiet",
+     broker28c.cancel_called, False)
+
+broker28d = _FakeOrdersBroker(open_orders=[
+    {"id": "abc", "symbol": "TSLA"}, {"id": "def", "symbol": "TSLA"},
+    {"id": "ghi", "symbol": "RIVN"}])
+buf28d = io.StringIO()
+with contextlib.redirect_stdout(buf28d):
+    check_stale_open_orders(broker28d, cancel=True)
+out28d = buf28d.getvalue()
+check("cancel=True actually calls cancel_all_open_orders",
+      broker28d.cancel_called, True)
+check("prints confirmation of how many got cancelled",
+      "cancelled 3 order" in out28d, True)
+check("multiple orders on the SAME symbol are correctly counted "
+     "together in the summary (TSLA x2), not just listed twice",
+     "TSLA x2" in out28d, True)
+
+buf28e = io.StringIO()
+with contextlib.redirect_stdout(buf28e):
+    check_stale_open_orders(
+        _FakeOrdersBroker(list_error=BrokerError("HTTP 500")),
+        cancel=False)
+check("a broker error while CHECKING for open orders is caught and "
+     "warned about, not left to crash startup entirely",
+     "WARNING" in buf28e.getvalue() and "HTTP 500" in buf28e.getvalue(),
+     True)
+
+buf28f = io.StringIO()
+with contextlib.redirect_stdout(buf28f):
+    check_stale_open_orders(
+        _FakeOrdersBroker(open_orders=[{"id": "x", "symbol": "SPY"}],
+                          cancel_error=BrokerError("HTTP 500")),
+        cancel=True)
+check("a broker error while CANCELLING is also caught and warned "
+     "about, not left to crash",
+     "WARNING" in buf28f.getvalue(), True)
+
+check("--cancel-stale-orders is a real CLI flag",
+      "--cancel-stale-orders" in subprocess.run(
+          [sys.executable, ORDER_MANAGER_PY, "--help"],
+          capture_output=True, text=True, timeout=30).stdout, True)
+
+# end-to-end: confirm main() itself doesn't crash reaching this call
+# (the actual incident: NameError the moment this line executed)
+emu28 = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port28 = emu28.start()
+r28 = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port28, "--symbol", "SPY",
+     "--fast", "8", "--slow", "32", "--source", "sim", "--n", "20",
+     "--broker", "mock", "--cooldown", "0",
+     "--audit", os.path.join(tempfile.mkdtemp(), "g28.jsonl")],
+    capture_output=True, text=True, timeout=30)
+emu28.stop()
+check("a real session (MockBroker) reaches and passes this call "
+     "cleanly -- confirms main() doesn't NameError the moment it "
+     "runs, which is exactly what would have happened before this "
+     "function was actually defined",
+     r28.returncode, 0)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
