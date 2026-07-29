@@ -1566,6 +1566,36 @@ def main():
             risk_dollars_per_trade=args.risk_per_trade)
         om.vwap_models = br.models["vwap_bounce"]
 
+        # v3.44: a REAL bug, found via a direct comparison against a
+        # from-scratch backtest.py rewrite that was supposed to match
+        # this exactly and didn't. configure_symbols()'s own docstring
+        # says it plainly: "Also rebuilds the mirror models" -- it
+        # replaces self.models["vwap_bounce"] with brand-new VWAPMirror
+        # objects, every time it's called. And EVERY run_* function
+        # (run_sim/run_historical/run_alpaca) calls configure_symbols()
+        # AGAIN, internally, right here, AFTER the assignment above --
+        # orphaning the dict this just captured. From that point on,
+        # every stop-loss and every risk-sized entry was silently
+        # computed against a permanently empty mirror (sigma reads as
+        # 0), which degenerates the stop to exactly session VWAP --
+        # for a bounce-buy (entry below VWAP by definition) that's a
+        # negative risk-per-share, hitting the fallback that always
+        # sizes to exactly 1 share. --risk-per-trade was never actually
+        # being honored in ANY real session (live, sim, or historical)
+        # since this feature shipped at v3.38 -- always silently 1
+        # share regardless of the configured budget.
+        #
+        # Fixed by re-syncing through the same on_symbols_changed hook
+        # configure_symbols() already calls whenever it rebuilds the
+        # models -- this also covers any FUTURE reconfiguration (e.g.
+        # a dynamic symbol change mid-session), not just startup.
+        _prev_on_symbols_changed_risk = br.on_symbols_changed
+        def _resync_vwap_models(new_symbols):
+            if _prev_on_symbols_changed_risk:
+                _prev_on_symbols_changed_risk(new_symbols)
+            om.vwap_models = br.models["vwap_bounce"]
+        br.on_symbols_changed = _resync_vwap_models
+
         # an independent stop-loss check on EVERY raw trade tick -- not
         # gated on a verified fabric signal arriving at all, since a
         # stop has to fire the moment it's breached, not wait for the

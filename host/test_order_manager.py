@@ -1971,6 +1971,95 @@ check("an add with no committed overlay stop on record falls back to "
      "against an unknown/undefined stop",
      broker30q.fills[-1]["qty"] if broker30q.fills else None, 5)
 
+print("[G31] v3.44: order_manager.py and backtest.py produce IDENTICAL "
+     "risk-sizing decisions on the same data -- the actual regression "
+     "test for a critical bug found while rebuilding backtest.py: "
+     "configure_symbols() rebuilds self.models (including every VWAP "
+     "mirror) from scratch every time it's called, and EVERY run_* "
+     "function (run_sim/run_historical/run_alpaca) calls it again "
+     "internally, AFTER main() already pointed om.vwap_models at the "
+     "original dict -- orphaning that reference completely. From that "
+     "point on, every stop-loss and every risk-sized entry was "
+     "silently computed against a permanently empty mirror (sigma "
+     "reads as 0), collapsing the stop to exactly session VWAP -- for "
+     "a bounce-buy (always below VWAP by definition) that's a negative "
+     "risk distance, hitting the degenerate fallback of EXACTLY 1 "
+     "share, regardless of --risk-per-trade. This affected every real "
+     "session (live, sim, historical) since the risk overlay shipped "
+     "at v3.38. My existing G26-G30 tests never caught this because "
+     "they construct OrderManager directly and hand-populate "
+     "om.vwap_models themselves, bypassing the real main() wiring "
+     "entirely -- only a true end-to-end CLI test through main() "
+     "itself can catch a bug in the wiring PATH, not the logic")
+
+import random as _random_g31
+g31_tmp = tempfile.mkdtemp()
+g31_trades = os.path.join(g31_tmp, "t.jsonl")
+with open(g31_trades, "w") as f:
+    price = 400.00
+    rng = _random_g31.Random(19)   # same proven seed used throughout
+                                   # this project for reliable signals
+    for i in range(2000):
+        price += rng.uniform(-0.3, 0.3)
+        f.write(_json.dumps({
+            "t": f"2026-07-17T{14 + i // 3600:02d}:{(i // 60) % 60:02d}:"
+                f"{i % 60:02d}.000000Z",
+            "p": round(price, 2), "s": rng.randint(1, 200)}) + "\n")
+
+_RISK_ARGS_G31 = ["--strategy", "vwap_bounce", "--stop-sigma-mult", "3.0",
+                 "--anchor-gate-tolerance", "0.01", "--risk-per-trade",
+                 "500", "--max-position-notional", "50000",
+                 "--cooldown", "60"]
+
+emu31 = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
+port31 = emu31.start()
+r_om31 = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--port", port31, "--symbol", "SPY",
+     "--fast", "8", "--slow", "32", "--source", "historical",
+     "--trades", g31_trades, "--broker", "mock"] + _RISK_ARGS_G31 +
+    ["--killfile", os.path.join(g31_tmp, "om.kill"),
+     "--audit", os.path.join(g31_tmp, "om_audit.jsonl"),
+     "--no-timestamps"],
+    capture_output=True, text=True, timeout=90)
+emu31.stop()
+
+r_bt31 = subprocess.run(
+    [sys.executable, os.path.join(os.path.dirname(ORDER_MANAGER_PY),
+                                 "backtest.py"),
+     "--trades", g31_trades, "--symbol", "SPY"] + _RISK_ARGS_G31 +
+    ["--max-shares", "1000000",   # backtest.py retains this as a
+                                  # SEPARATE cap order_manager.py has
+                                  # no equivalent flag for at all (see
+                                  # test_backtest.py's [G8]) -- raised
+                                  # here so it can't interfere with
+                                  # isolating the actual comparison to
+                                  # the shared risk-overlay logic
+     "--killfile", os.path.join(g31_tmp, "bt.kill"),
+     "--audit", os.path.join(g31_tmp, "bt_audit.jsonl"), "--no-save"],
+    capture_output=True, text=True, timeout=90)
+
+def _block_reasons_g31(stdout):
+    from collections import Counter
+    lines = [l for l in stdout.splitlines() if "blocked SPY" in l]
+    return Counter(l.split("blocked SPY ")[1] for l in lines)
+
+check("order_manager.py's session completes cleanly", r_om31.returncode, 0)
+check("backtest.py's run completes cleanly", r_bt31.returncode, 0)
+reasons_om31 = _block_reasons_g31(r_om31.stdout)
+reasons_bt31 = _block_reasons_g31(r_bt31.stdout)
+check("the two tools produce IDENTICAL block reasons (same counts, "
+     "same specific dollar values) on the same data with the risk "
+     "overlay active -- this is the actual proof the vwap_models "
+     "wiring is correct: before the fix, order_manager.py always "
+     "showed a completely different set of blocks (or none at all) "
+     "because it was silently sizing every entry to 1 share",
+     reasons_om31, reasons_bt31)
+check("neither tool degenerated to the 1-share-only fallback -- at "
+     "least one real 'total position' block with a genuine, non-tiny "
+     "dollar figure shows the risk-sizing actually used a real, "
+     "non-empty sigma, not the degenerate empty-mirror case",
+     any("total position" in r for r in reasons_om31), True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

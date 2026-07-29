@@ -1016,3 +1016,73 @@ end to end, with real fills updating CostTracker's blended average
 between steps, plus the no-committed-stop fallback. 11 new checks;
 881 total across the host suite, 0 failures. Verified end to end
 through a real historical-replay session with the full flag set active.
+
+**v3.44** — two things, shipped together because the second was found
+while validating the first, and the best regression test for the
+first needs the second to exist as an independent comparison oracle.
+
+**CRITICAL FIX (order_manager.py): the risk overlay's stop-loss and
+risk-based sizing have never actually worked correctly in any real
+session.** Found while rebuilding backtest.py to validate against
+order_manager.py directly. Root cause: configure_symbols() rebuilds
+self.models (including every VWAP mirror) from scratch every time
+it's called -- its own docstring says so -- and EVERY run_* function
+(run_sim/run_historical/run_alpaca) calls it again internally, AFTER
+main() had already pointed om.vwap_models at the original dict.  That
+orphaned the reference completely: from that point on, every stop-
+loss and every risk-sized entry was silently computed against a
+permanently empty mirror (sigma always read as 0), which collapses
+the stop to exactly session VWAP. For a bounce-buy (always below VWAP
+by definition) that's a negative risk-per-share, which hits the
+degenerate fallback of exactly 1 share -- regardless of what
+--risk-per-trade was actually set to. This affected every live, sim,
+and historical session that has ever used --stop-sigma-mult since the
+feature shipped at v3.38. Fixed by re-syncing om.vwap_models through
+the existing on_symbols_changed hook, which already fires exactly
+when configure_symbols() rebuilds the models -- covers any future
+reconfiguration too, not just startup. New [G31] in
+test_order_manager.py: runs the SAME historical data through both
+order_manager.py's real CLI and backtest.py's real CLI with the risk
+overlay active, and asserts bit-for-bit identical block reasons and
+dollar figures -- the actual proof the wiring is correct, and exactly
+the test that would have caught this (my existing G26-G30 tests never
+did, because they construct OrderManager directly and hand-populate
+om.vwap_models themselves, bypassing the real main() wiring entirely).
+
+**backtest.py: full rebuild to run through the real, unmodified
+OrderManager** -- not a parallel reimplementation. This was the actual
+goal: any future change to on_signal()'s trading logic, the risk
+overlay, or cost tracking now applies to backtests automatically, with
+zero duplicated code to keep in sync, and no wire protocol / emulator
+round-trip means this is dramatically faster than order_manager.py
+--source historical for pure strategy evaluation (that round-trip
+exists specifically to validate hardware correctness, which a backtest
+has no need for). --strategy now accepts vwap_bounce as a real, live-
+traded choice alongside sma/ema, with the full risk overlay
+(--stop-sigma-mult/--anchor-gate-tolerance/--risk-per-trade, same
+defaults, same module) available. New --audit/--killfile flags (real
+OrderManager needs them now). Corrected real, silent default drift
+from v3.27 that nothing had caught since: backtest.py's own --qty
+(renamed from --order-qty) and --max-notional had drifted out of sync
+with order_manager.py's actual current live defaults, and
+--max-position-notional didn't exist in backtest.py at all. Built
+_route_live_signal(), a helper that backfills the StrategyScorecard-
+internal bookkeeping (.opens, .block_reasons, .trip_log) the real
+OrderManager has no concept of, so entry prices, specific block
+reasons, and --monthly's per-trip attribution all keep working
+identically for the live row. Fixed a systematic, real bug in
+test_backtest.py this surfaced: all 17 real CLI/direct-call test sites
+were silently sharing the same default --audit/--killfile paths (the
+old backtest.py never had a real OrderManager to need them), causing
+real cross-test contamination -- fixed all 17, plus rewrote a test
+group that had been asserting a NOW-obsolete deliberate divergence
+between the two tools' defaults (the entire point of this rebuild is
+that they match).
+
+New [G31] in test_order_manager.py (4 checks) plus corrected/
+extended coverage across test_backtest.py's own suite (74 checks
+total there now, all real end-to-end CLI and direct-call tests, no
+longer contaminated by shared default paths); 887 total across the
+host suite, 0 failures, stable across repeated runs. Verified end to
+end: order_manager.py and backtest.py now produce bit-for-bit
+identical trading decisions on the same historical data.
