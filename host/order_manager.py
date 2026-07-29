@@ -934,12 +934,26 @@ def check_stale_open_orders(broker, cancel: bool):
 
 
 def main():
-    from bridge import Bridge, run_sim, run_alpaca, run_historical   # reuse everything
+    # v3.46: feeds come from feeds.py now, and Bridge is imported
+    # LAZILY, only if --port is actually passed. bridge.py hard-exits
+    # at import time when pyserial is missing, so deferring it means
+    # the default (no-hardware) path has no serial dependency at all.
+    from feeds import run_sim, run_alpaca, run_historical
     from tick_protocol import install_local_timestamps
 
     ap = argparse.ArgumentParser(
         description="FPGA signal -> risk-checked paper order")
-    ap.add_argument("--port", required=True)
+    ap.add_argument("--port", default=None,
+                    help="v3.46: NO LONGER REQUIRED. Omit it (the new "
+                        "default) to run the direct in-process engine "
+                        "-- ticks go straight into the same SMA/EMA/"
+                        "VWAP mirror models, no serial port, no pty, "
+                        "no wire protocol, no emulator process, one "
+                        "terminal. Pass a port to drive real hardware "
+                        "(or fpga_emulator.py) over UART through "
+                        "bridge.py exactly as before, including the "
+                        "fabric-vs-mirror signal verification, which "
+                        "is only meaningful against real silicon")
     ap.add_argument("--no-timestamps", action="store_true",
                     help="v3.41: disable the local HH:MM:SS timestamp "
                         "prefix normally added to every printed line "
@@ -1211,11 +1225,19 @@ def main():
         # a --live selftest should never arm live trading at all).
         # run_selftest() prints its own PASS/DIAG/FAIL lines.
         symbols = [t for t in args.symbols.split(",") if t.strip()]
+        if not args.port:
+            print("[om] --selftest needs --port: it exists to verify a "
+                  "real device's signals against the host mirror models, "
+                  "which is only meaningful when something independent is "
+                  "actually computing them. The default direct engine IS "
+                  "the mirror models, so there is nothing to compare it "
+                  "against.")
+            sys.exit(2)
+        from bridge import Bridge, run_selftest   # hardware-only path
         br = Bridge(args.port, symbols, args.fast, args.slow,
                     ema_kf=args.ema_kf, ema_ks=args.ema_ks,
                     baud=args.baud, vwap_warmup=args.vwap_warmup,
                     vwap_k2_q8=args.vwap_k2_q8)
-        from bridge import run_selftest
         run_selftest(br)
         br.close()
         return
@@ -1282,10 +1304,27 @@ def main():
                       killfile=args.killfile)
 
     from compare import StrategyScorecard, comparison_report
-    br = Bridge(args.port, symbols, args.fast, args.slow,
-                ema_kf=args.ema_kf, ema_ks=args.ema_ks, baud=args.baud,
-                log_path=args.log, verify_grace_s=args.verify_grace_s,
-                vwap_warmup=args.vwap_warmup, vwap_k2_q8=args.vwap_k2_q8)
+    # v3.46: two interchangeable engines behind one duck-typed
+    # interface. Without --port, the direct in-process TickEngine --
+    # no serial, no pty, no framing, no emulator, no second terminal.
+    # With --port, the original Bridge over UART, unchanged, for real
+    # hardware. Everything downstream (callbacks, feeds, dashboard)
+    # treats them identically.
+    if args.port:
+        from bridge import Bridge
+        br = Bridge(args.port, symbols, args.fast, args.slow,
+                    ema_kf=args.ema_kf, ema_ks=args.ema_ks, baud=args.baud,
+                    log_path=args.log, verify_grace_s=args.verify_grace_s,
+                    vwap_warmup=args.vwap_warmup, vwap_k2_q8=args.vwap_k2_q8)
+    else:
+        from tick_engine import TickEngine
+        _eng_log = open(args.log, "a") if args.log else None
+        br = TickEngine(symbols, args.fast, args.slow,
+                        k_fast=args.ema_kf, k_slow=args.ema_ks,
+                        vwap_warmup=args.vwap_warmup,
+                        vwap_k2_q8=args.vwap_k2_q8, log=_eng_log)
+        print("[om] direct engine (no --port): ticks go straight into "
+              "the mirror models")
 
     # v3.19: command the fabric VWAP session boundary at startup.
     # v3.38: NOT unconditionally anymore. The original reasoning was

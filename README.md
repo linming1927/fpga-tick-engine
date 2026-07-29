@@ -613,7 +613,7 @@ current for the wire-format/parameter versions elsewhere in this file.
 **Connection**
 | Flag | Default | What it does |
 |---|---|---|
-| `--port` | *required* | Serial device (e.g. `/dev/ttyUSB1`, or a pty from `fpga_emulator.py`) |
+| `--port` | *(none)* | v3.46: omit for the direct in-process engine (default, one terminal, no serial). Pass a device (e.g. `/dev/ttyUSB1`, or a pty from `fpga_emulator.py`) for the hardware path |
 | `--symbol`, `--symbols` | `SPY` | Comma-separated, up to 8 (e.g. `SPY,QQQ,AAPL`) |
 | `--baud` | `921600` | Must match the bitstream's `BAUD` parameter — 115200 for anything built before that change |
 
@@ -710,42 +710,73 @@ fabric are just computing against different assumptions)
 
 ---
 
-## Running without an FPGA board (v3.29)
+## Running without an FPGA board (v3.46)
 
-Everything above assumes a real board on `--port`. As of v3.29,
-`fpga_emulator.py` — previously an internal test fixture only — is a
-genuine, documented replacement for one, so this project can run as a
-pure-Python terminal tool with no board attached at all (freeing the
-Arty up for something else, or just for development away from the
-hardware).
-
-**This is not an approximation.** The emulator computes every signal
-through the exact same `SMAMirror`/`EMAMirror`/`VWAPMirror` classes
-that every hardware signal in this project has always been verified
-against — the same math the real board's RTL is checked against
-bit-for-bit. Running against the emulator doesn't lower the bar; it
-removes the silicon underneath math that was already proven correct.
+As of v3.46 this is the **default**. Omit `--port` and
+`order_manager.py` runs the direct in-process engine
+(`tick_engine.py`): ticks go straight into the same
+`SMAMirror`/`EMAMirror`/`VWAPMirror` models every strategy already
+runs on, and signals come straight back. No serial port, no pty, no
+wire protocol, no emulator process, no second terminal — and no
+pyserial dependency, since `bridge.py` is only imported when you
+actually pass `--port`.
 
 ```bash
-# terminal 1: start the virtual board, leave it running
-python3 host/fpga_emulator.py --symbol SPY
-```
-
-`--symbol` here is only a startup placeholder for slot 0 — it gets fully
-overwritten the moment `order_manager.py` connects and configures its
-own real symbol list (`configure_symbols()` rewrites all 8 slots
-unconditionally). It doesn't matter what you put there; leaving it at
-the default is fine.
-
-```bash
-# terminal 2: point order_manager.py at the printed stable path exactly
-# like a real board -- everything else about the command is unchanged
-python3 host/order_manager.py --port /tmp/fpga-tick-emulator \
-    --baud 115200 --source alpaca --broker alpaca \
+python3 host/order_manager.py \
+    --source alpaca --broker alpaca \
     --symbols SPY,QQQ,RKLB,TSLA,RIVN --strategy vwap_bounce \
+    --stop-sigma-mult 3.0 --anchor-gate-tolerance 0.01 \
+    --risk-per-trade 500 --cancel-stale-orders \
     --dashboard 8000 --household-income 185000 \
     --log ticks.jsonl --audit audit.jsonl
 ```
+
+That's the whole session — one command, one terminal.
+
+### Why the emulator stopped being verification
+
+v3.29 through v3.45 ran this workload through `fpga_emulator.py` over
+a pty, and the README claimed that wasn't an approximation because the
+emulator used the same verified mirror models. That part was true —
+but it also meant the "verification" was **circular**:
+`fpga_emulator.py` imports the *same* `SMAMirror`/`EMAMirror`/
+`VWAPMirror` classes the host checks against, so the comparison was
+`VWAPMirror` versus `VWAPMirror`. It could never catch a math error,
+only framing or transport corruption in a transport that existed
+purely to emulate a cable that was no longer plugged into anything.
+
+Against **real silicon** the verification is genuine and valuable —
+the RTL and the Python mirrors are truly independent implementations,
+so a disagreement means a real bug in one of them. That path is fully
+intact; see below.
+
+Meanwhile the emulated transport kept costing real bugs: the macOS
+baud/ENOTTY failure (v3.30), pty zombie processes (v3.31), a
+hardcoded baud in a test (v3.32), a `/dev/pts` naming assumption
+(v3.33), and — most seriously — two model-ownership bugs that
+silently broke live risk management (v3.44 and v3.46, both below).
+
+### Running against real hardware (or the emulator) — unchanged
+
+Pass `--port` and everything works exactly as before, including the
+fabric-vs-mirror signal verification:
+
+```bash
+# terminal 1: the real board, or the emulator standing in for one
+python3 host/fpga_emulator.py --symbol SPY
+
+# terminal 2
+python3 host/order_manager.py --port /tmp/fpga-tick-emulator \
+    --baud 115200 --source alpaca --broker alpaca \
+    --symbols SPY,QQQ,RKLB,TSLA,RIVN --strategy vwap_bounce \
+    --dashboard 8000 --log ticks.jsonl --audit audit.jsonl
+```
+
+`--symbol` on the emulator is only a startup placeholder for slot 0 —
+`order_manager.py` rewrites all 8 slots the moment it connects.
+`--selftest` requires `--port`, since it exists to check a device's
+signals against the host models and the direct engine *is* those
+models.
 
 **On macOS, add `--baud 115200` explicitly** (as shown above) —
 `order_manager.py`'s default (`921600`) needs a special ioctl macOS
