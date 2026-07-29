@@ -259,7 +259,7 @@ check("CLI run succeeded", r.returncode, 0)
 check("CLI output includes the profit-gated row",
       "SMA profit-gated" in r.stdout, True)
 
-# ---- v3.6/v3.44: default risk limits must match order_manager.py
+# ---- v3.6/v3.44/v3.45: default risk limits must match order_manager.py
 # exactly, so a bare backtest.py run (no risk-limit flags) faithfully
 # reproduces what a default LIVE session would have done. v3.6 found
 # a real divergence (backtest.py's own max_shares/$1, max_notional/$1M
@@ -268,12 +268,17 @@ check("CLI output includes the profit-gated row",
 # (dollar-exposure sizing, --max-notional $2000->$3000) without
 # updating backtest.py to match -- REINTRODUCING the exact same class
 # of drift this test group exists to catch, silently, for years.
-# v3.44's full rebuild is specifically about backtest.py acting the
-# SAME as order_manager.py in every way that matters, so the old
-# "deliberately diverged, offline analysis has no reason to inherit a
-# live-trading preference" reasoning this test group used to encode is
-# now wrong on purpose, not just stale by accident -- updated to
-# assert they MATCH, which is the actual point of this rebuild. -----
+# v3.44's full rebuild was specifically about backtest.py acting the
+# SAME as order_manager.py in every way that matters; v3.45 finished
+# the job by removing --max-shares from backtest.py's own CLI
+# entirely (it had been the one remaining asymmetry -- retained "for
+# its own SMA/EMA scoring use", which on inspection was never actually
+# scoped to SMA/EMA at all: it's just a RiskLimits field applied
+# uniformly to whichever strategy is live, vwap_bounce included, and
+# real testing had already shown it silently blocking real trades in
+# exactly that case). Both tools now set max_shares=10**9 internally
+# (effectively disabled, matching order_manager.py's own established
+# pattern) and rely entirely on the dollar-based caps instead. -----
 print("[G8] backtest.py's CLI defaults match order_manager.py's exactly")
 import re
 
@@ -292,17 +297,16 @@ for flag in ("--max-orders-per-day", "--max-notional",
     check(f"{flag} default matches between backtest.py and order_manager.py "
          f"-- the entire point of this rebuild is that they act the same",
          cli_default(bt_src, flag), cli_default(om_src, flag))
-check("order_manager.py has no --max-shares CLI flag at all (removed at "
-     "v3.27, replaced by --max-position-notional for live trading) -- "
-     "backtest.py retains it separately, for its own SMA/EMA scoring "
-     "use, so this one does NOT match by design, unlike every other "
-     "risk-limit default above",
-     cli_default(om_src, "--max-shares"), None)
+check("neither tool has a --max-shares CLI flag at all now -- removed "
+     "from order_manager.py at v3.27, and from backtest.py at v3.45 "
+     "once it turned out to apply to EVERY strategy (including "
+     "vwap_bounce), not just the SMA/EMA scoring it was originally "
+     "described as being for -- both now set max_shares=10**9 "
+     "internally instead, relying entirely on the dollar-based caps",
+     cli_default(bt_src, "--max-shares"), cli_default(om_src, "--max-shares"))
 check("max_orders_per_day default is specifically 1000 (per request), "
      "not the old value of 10",
      cli_default(bt_src, "--max-orders-per-day"), 1000.0)
-check("max_shares default is specifically 10, not the old value of 1",
-      cli_default(bt_src, "--max-shares"), 10.0)
 check("max_notional default is specifically $3,000, matching "
      "order_manager.py's own live default since v3.27 -- corrected "
      "from backtest.py's own stale $2,000 default, which had silently "

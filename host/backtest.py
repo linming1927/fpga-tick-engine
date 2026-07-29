@@ -404,7 +404,6 @@ def main():
                         "Ignored for vwap_bounce as the live strategy "
                         "when --stop-sigma-mult is set: risk-based "
                         "sizing overrides it then, same as live")
-    ap.add_argument("--max-shares", type=int, default=10)
     ap.add_argument("--max-notional", type=float, default=3_000.0,
                     help="v3.44: corrected 2000 -> 3000 to match "
                         "order_manager.py's actual current live default "
@@ -546,7 +545,18 @@ def main():
     args = ap.parse_args()
 
     limits = RiskLimits(
-        order_qty=args.qty, max_shares=args.max_shares,
+        order_qty=args.qty,
+        # v3.45: max_shares itself still exists on RiskLimits (the
+        # blend strategy's own per-sleeve caps below depend on it for
+        # their own, separate purpose) but this main CLI path no
+        # longer exposes it at all -- matching order_manager.py's own
+        # RiskLimits construction exactly, which sets this to 10**9
+        # for the identical reason: this project's real sessions are
+        # sized by dollar exposure now, not share count, so this is
+        # set high enough to never be the binding constraint here
+        # either; the real limits are max_notional_e4/
+        # max_position_notional_e4 below
+        max_shares=10**9,
         max_notional_e4=to_e4(args.max_notional),
         max_position_notional_e4=(to_e4(args.max_position_notional)
                                   if args.max_position_notional > 0
@@ -599,7 +609,7 @@ def main():
             "traded_strategy": args.strategy,
             "fast": args.fast, "slow": args.slow,
             "ema_kf": args.ema_kf, "ema_ks": args.ema_ks,
-            "qty": args.qty, "max_shares": args.max_shares,
+            "qty": args.qty,
             "max_notional": args.max_notional,
             "max_position_notional": args.max_position_notional,
             "stop_sigma_mult": args.stop_sigma_mult,

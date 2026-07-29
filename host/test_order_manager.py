@@ -2027,14 +2027,7 @@ r_bt31 = subprocess.run(
     [sys.executable, os.path.join(os.path.dirname(ORDER_MANAGER_PY),
                                  "backtest.py"),
      "--trades", g31_trades, "--symbol", "SPY"] + _RISK_ARGS_G31 +
-    ["--max-shares", "1000000",   # backtest.py retains this as a
-                                  # SEPARATE cap order_manager.py has
-                                  # no equivalent flag for at all (see
-                                  # test_backtest.py's [G8]) -- raised
-                                  # here so it can't interfere with
-                                  # isolating the actual comparison to
-                                  # the shared risk-overlay logic
-     "--killfile", os.path.join(g31_tmp, "bt.kill"),
+    ["--killfile", os.path.join(g31_tmp, "bt.kill"),
      "--audit", os.path.join(g31_tmp, "bt_audit.jsonl"), "--no-save"],
     capture_output=True, text=True, timeout=90)
 

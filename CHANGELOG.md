@@ -1086,3 +1086,31 @@ longer contaminated by shared default paths); 887 total across the
 host suite, 0 failures, stable across repeated runs. Verified end to
 end: order_manager.py and backtest.py now produce bit-for-bit
 identical trading decisions on the same historical data.
+
+**v3.45** — removed --max-shares from backtest.py's CLI entirely,
+finishing the job v3.44's rebuild started. This was the one remaining
+asymmetry between the two tools' risk management, and on inspection
+the earlier justification for keeping it ("for backtest.py's own
+SMA/EMA scoring use") turned out to be wrong: max_shares is just a
+RiskLimits field, shared by whichever strategy is actually live --
+including vwap_bounce, which we'd already seen it silently blocking
+in real testing just a few exchanges earlier. Now both tools set
+max_shares=10**9 internally (effectively disabled) and rely entirely
+on the dollar-based caps (--max-notional, --max-position-notional),
+exactly matching order_manager.py's own long-established pattern for
+the identical reason: real sessions are sized by dollar exposure, not
+share count.
+
+Updated test_backtest.py's [G8] to assert neither tool has a
+--max-shares CLI flag at all now, rather than asserting they
+deliberately diverge (that reasoning no longer applied). Fixed a
+reference in test_order_manager.py's [G31] that explicitly passed
+--max-shares to backtest.py as a now-obsolete workaround -- the
+comparison is simpler now and needs no special-casing at all, since
+both tools' risk management is identical.
+
+886 total across the host suite, 0 failures. Verified directly: the
+same historical data that previously hit "would exceed max_shares
+(10)" now correctly shows only the dollar-based "total position"
+blocks, matching order_manager.py's own behavior on identical data
+exactly.
