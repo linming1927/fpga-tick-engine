@@ -166,21 +166,64 @@ class PositionRiskOverlay:
                             # block on an undefined comparison
         return price_e4 >= av * (1.0 - self.anchor_gate_tolerance)
 
-    def risk_sized_qty(self, entry_price_e4: int, stop_price_e4: int
+    def risk_sized_qty(self, entry_price_e4: int, stop_price_e4: int,
+                       held_qty: int = 0, held_avg_cost_e4: int = 0
                        ) -> int:
-        """shares = risk_dollars_per_trade / (entry - stop), floored to
-        a whole share, minimum 1. A signal that fires but risk-sizes to
-        zero shares would be a silent no-op indistinguishable from a
-        bug — always size at least 1 share rather than skip trading
-        the signal entirely."""
+        """v3.43: two genuinely different situations share this method,
+        distinguished by held_qty.
+
+        held_qty == 0 (a FRESH entry, position was flat): the original
+        behavior, unchanged — shares = risk_dollars_per_trade /
+        (entry - stop), floored, minimum 1. A signal that fires but
+        risk-sizes to zero shares would be a silent no-op
+        indistinguishable from a bug, so a fresh entry always sizes at
+        least 1 share.
+
+        held_qty > 0 (a PYRAMIDING ADD onto an already-open position):
+        found and fixed a real gap here -- naively applying the SAME
+        formula to every add would let each one independently target
+        a full NEW $500 of risk, so total risk-if-stopped could grow
+        without bound across repeated adds (exactly the scenario in a
+        sustained decline where this strategy keeps buying). Instead,
+        this caps the risk of the WHOLE resulting position — existing
+        shares' blended average cost (held_avg_cost_e4, from
+        CostTracker's own running average) against the SAME fixed
+        stop, plus the new shares — at risk_dollars_per_trade total,
+        not per add. As the position accumulates, less budget remains
+        for further adds; minimum 0 in this case (not 1) — "no room
+        left in the budget" is a legitimate, expected outcome for an
+        add, not a bug to paper over the way a fresh entry sizing to
+        zero would be. The caller should treat 0 as "block this add,"
+        the same way an unmet anchored-VWAP gate blocks a sell.
+
+        held_avg_cost_e4 is read directly from CostTracker's own
+        _entries, not recomputed here — this method stays a pure
+        function of its inputs, with no dependency on CostTracker
+        itself.
+        """
         risk_per_share_e4 = entry_price_e4 - stop_price_e4
         if risk_per_share_e4 <= 0:
-            return 1        # entry already at/through the stop --
-                            # degenerate case; size minimally instead
-                            # of dividing by zero or going negative
-        shares = int((self.risk_dollars_per_trade * 10_000)
-                    // risk_per_share_e4)
-        return max(1, shares)
+            return 1 if held_qty == 0 else 0
+                            # entry already at/through the stop --
+                            # degenerate case; a fresh entry still
+                            # sizes minimally rather than dividing by
+                            # zero, but an add has nothing sensible
+                            # left to size into and should just block
+
+        if held_qty == 0:
+            shares = int((self.risk_dollars_per_trade * 10_000)
+                        // risk_per_share_e4)
+            return max(1, shares)
+
+        already_used_e4 = held_qty * (held_avg_cost_e4 - stop_price_e4)
+        remaining_budget_e4 = (int(self.risk_dollars_per_trade * 10_000)
+                              - already_used_e4)
+        if remaining_budget_e4 <= 0:
+            return 0        # already at or over the risk budget --
+                            # block the add entirely, don't shrink to
+                            # some arbitrary small leftover size
+        shares = remaining_budget_e4 // risk_per_share_e4
+        return max(0, int(shares))
 
     def peek_stop_price_e4(self, vwap_mirror) -> int:
         """Like on_position_opened's stop computation, but WITHOUT

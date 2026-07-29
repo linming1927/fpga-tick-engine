@@ -744,9 +744,46 @@ class OrderManager:
                 print(f"[om] blocked {sym} SELL: {reason}")
                 return f"blocked: {reason}"
 
-        if overlay is not None and side == SIDE_BUY and is_fresh_entry:
-            stop_e4 = overlay.peek_stop_price_e4(self.vwap_models.get(sym))
-            qty_override = overlay.risk_sized_qty(price_e4, stop_e4)
+        if overlay is not None and side == SIDE_BUY:
+            if is_fresh_entry:
+                stop_e4 = overlay.peek_stop_price_e4(self.vwap_models.get(sym))
+                qty_override = overlay.risk_sized_qty(price_e4, stop_e4)
+            else:
+                # v3.43: a pyramiding add onto an ALREADY-open position.
+                # Deliberately uses the ORIGINAL, fixed stop already
+                # committed at the first entry (stop_price_e4 --
+                # never peek_stop_price_e4 here, which would recompute
+                # from the CURRENT session VWAP and let the stop drift
+                # with a declining market, exactly what a fixed stop is
+                # supposed to avoid). held_qty/held_avg_cost_e4 come
+                # straight from CostTracker's own blended average for
+                # this symbol -- the risk overlay stays a pure function
+                # of its inputs, no direct CostTracker dependency.
+                existing_stop_e4 = overlay.stop_price_e4(sym)
+                if existing_stop_e4 is not None:
+                    held_qty, held_avg_cost_e4 = self.costs._entries.get(
+                        sym, [0, 0])
+                    qty_override = overlay.risk_sized_qty(
+                        price_e4, existing_stop_e4,
+                        held_qty=held_qty,
+                        held_avg_cost_e4=held_avg_cost_e4)
+                    if qty_override == 0:
+                        self.blocked += 1
+                        reason = ("position already at its risk budget "
+                                 "-- no room to add more without "
+                                 "exceeding the intended risk-if-"
+                                 "stopped for this position")
+                        self._audit("blocked", reason=reason, symbol=sym,
+                                    side=side, price_e4=price_e4,
+                                    position_qty=self.positions[sym])
+                        print(f"[om] blocked {sym} BUY: {reason}")
+                        return f"blocked: {reason}"
+                # else: no committed stop on record for this symbol
+                # (e.g. a position reconciled from the broker at
+                # startup rather than opened through this session) --
+                # qty_override stays None, falling back to the fixed
+                # --qty default rather than risk-sizing against an
+                # unknown stop
 
         allowed, reason, qty = self.policy.evaluate(
             side, self.positions[sym], price_e4, qty_override=qty_override)

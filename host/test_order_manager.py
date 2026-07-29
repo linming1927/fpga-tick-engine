@@ -1909,6 +1909,68 @@ check("this test file's OWN --killfile default did not leak a stray "
      os.path.exists(os.path.join(
          os.path.dirname(os.path.abspath(__file__)), "om.kill")), False)
 
+print("[G30] v3.43: on_signal() correctly risk-sizes a PYRAMIDING ADD "
+     "(not just the fresh entry) using CostTracker's own blended "
+     "average cost, and blocks further adds once the risk budget is "
+     "used up -- integration proof that the fix from test_position_"
+     "risk.py's G6 is actually wired into real trading decisions, not "
+     "just correct in isolation")
+
+om30p, broker30p, mirror30p = _fresh_om_wide_spread(
+    stop_sigma_mult=3.0, risk_dollars_per_trade=500.0)
+om30p.policy.lim.cooldown_s = 0.0   # this test deliberately fires
+                                    # several buy signals in quick
+                                    # succession -- the shared
+                                    # helper's default 60s cooldown
+                                    # would otherwise block every
+                                    # signal after the first,
+                                    # regardless of risk sizing
+# wide-spread fixture: vwap $400, sigma $100 -> stop = $400-3*100=$100,
+# matching test_position_risk.py's G6 scenario exactly so the same
+# hand-verified numbers apply here too
+
+out30a = om30p.on_signal({"side": SIDE_BUY, "price_e4": 433_0000,
+                          "symbol": "SPY", "strategy": "vwap_bounce"})
+check("fresh entry fills", out30a, "FILLED")
+shares_after_1 = om30p.positions["SPY"]
+check("fresh entry sizes to 1 share, matching the hand-verified math "
+     "(risk-per-share $333, floor(500/333)=1)",
+     shares_after_1, 1)
+
+out30b = om30p.on_signal({"side": SIDE_BUY, "price_e4": 150_0000,
+                          "symbol": "SPY", "strategy": "vwap_bounce"})
+check("the pyramiding add ALSO fills (not blocked -- there was real "
+     "remaining budget)", out30b, "FILLED")
+check("the add sizes to 3 shares (1+3=4 total), using the REMAINING "
+     "~$167 budget after the first entry, not a fresh $500 -- a naive "
+     "per-add sizing would have given 10 shares here instead",
+     om30p.positions["SPY"], 4)
+
+out30c = om30p.on_signal({"side": SIDE_BUY, "price_e4": 130_0000,
+                          "symbol": "SPY", "strategy": "vwap_bounce"})
+check("a THIRD add, once the risk budget is essentially exhausted by "
+     "the first two, is BLOCKED through the real on_signal() path -- "
+     "not silently filled at some arbitrary small size",
+     out30c.startswith("blocked:"), True)
+check("position unchanged after the blocked add -- nothing partial "
+     "was filled", om30p.positions["SPY"], 4)
+check("the block reason explains it's a risk-budget block specifically",
+      "risk budget" in out30c, True)
+
+# regression: a position with NO recorded overlay stop (e.g. reconciled
+# from the broker at startup, never opened through on_signal itself)
+# falls back to the fixed --qty default for an add, rather than
+# crashing or misbehaving with an unknown stop
+om30q, broker30q, mirror30q = _fresh_om_wide_spread(stop_sigma_mult=3.0)
+om30q.positions["SPY"] = 10       # reconciled position, overlay has
+                                  # never seen this symbol at all
+out30d = om30q.on_signal({"side": SIDE_BUY, "price_e4": 400_0000,
+                          "symbol": "SPY", "strategy": "vwap_bounce"})
+check("an add with no committed overlay stop on record falls back to "
+     "the fixed --qty default (5) rather than crashing or risk-sizing "
+     "against an unknown/undefined stop",
+     broker30q.fills[-1]["qty"] if broker30q.fills else None, 5)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

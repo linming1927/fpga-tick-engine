@@ -972,3 +972,47 @@ the exact scenario that broke every subsequent run before this fix.
 4 new checks; 868 total across the host suite, 0 failures, confirmed
 stable across three consecutive full runs with no stray files left
 behind.
+
+**v3.43** — the "refined option 2" fix discussed after identifying that
+pyramiding adds bypassed risk sizing entirely: previously, only a
+FRESH entry (position going from flat to open) was risk-sized against
+the $500 budget; any subsequent add while already holding a position
+used the fixed --qty default with zero risk awareness, meaning total
+risk-if-stopped could accumulate without bound across repeated adds
+during a sustained decline -- exactly the scenario that concerned Ming.
+
+position_risk.py's risk_sized_qty() now takes optional held_qty/
+held_avg_cost_e4 parameters. For a pyramiding add (held_qty > 0), it
+caps the TOTAL position's risk-if-stopped at the budget -- using
+CostTracker's own blended average cost of shares already held against
+the SAME fixed stop (deliberately never recomputed for an add, which
+would let it drift with a declining session VWAP exactly the way the
+fixed-stop design was built to avoid) -- rather than letting each add
+independently target a fresh $500. As the position accumulates, less
+budget remains for further adds; once it's used up, the add is BLOCKED
+outright (0 shares means "no room," a legitimate outcome for an add,
+not a bug to paper over the way a fresh entry sizing to zero would be).
+A position with no committed overlay stop on record (e.g. reconciled
+from the broker rather than opened through this session) falls back to
+the fixed --qty default rather than risk-sizing against an unknown stop.
+
+Worth understanding directly: since a fresh entry is DESIGNED to use
+close to the full $500 budget already, this means pyramiding will be
+rare in practice under the default budget -- usually only a small
+leftover from flooring remains for a follow-up add, if any. This is
+the correct, intended consequence of capping TOTAL risk at the budget
+rather than per-trade; it isn't a bug, but it's a real behavior change
+worth knowing about if you were relying on this strategy pyramiding
+freely.
+
+New [G6] in test_position_risk.py (5 checks): a full three-step
+scenario, independently hand-verified before writing the test, proving
+a fresh entry sizes normally, a second add correctly uses only the
+REMAINING budget (not a fresh $500), and a third add is blocked once
+the budget is exhausted -- plus the held_qty=0 equivalence and the
+degenerate at-the-stop case. New [G30] in test_order_manager.py (6
+checks): the same scenario proven through the real on_signal() path
+end to end, with real fills updating CostTracker's blended average
+between steps, plus the no-committed-stop fallback. 11 new checks;
+881 total across the host suite, 0 failures. Verified end to end
+through a real historical-replay session with the full flag set active.

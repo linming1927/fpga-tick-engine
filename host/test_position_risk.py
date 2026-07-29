@@ -221,6 +221,62 @@ check("the value actually committed matches what was peeked "
      "beforehand, for the same mirror state",
      ov8.stop_price_e4("SPY"), peeked)
 
+# ---------------------------------------------------------------------------
+print("[G6] v3.43: pyramiding adds cap TOTAL position risk at the "
+     "budget (using CostTracker's own blended average cost against "
+     "the fixed stop), rather than each add independently targeting "
+     "a fresh $500 -- the real gap this fixes: previously every add "
+     "used the FIXED --qty default with no risk awareness at all, so "
+     "repeated adds during a decline could accumulate unbounded risk "
+     "regardless of the $500 target")
+
+ov9 = PositionRiskOverlay(risk_dollars_per_trade=500.0)
+STOP = 100_0000     # $100, fixed for this whole scenario
+
+# fresh entry ($433, wide risk-per-share so flooring leaves real room)
+shares1 = ov9.risk_sized_qty(entry_price_e4=433_0000, stop_price_e4=STOP)
+check("fresh entry (held_qty=0, the default): unchanged behavior, "
+     "sizes to use as much of the $500 budget as floors evenly",
+     shares1, 1)
+
+# second add ($150) -- must use only the REMAINING budget after the
+# first entry's $333 of risk, not a fresh $500
+shares2 = ov9.risk_sized_qty(entry_price_e4=150_0000, stop_price_e4=STOP,
+                             held_qty=shares1, held_avg_cost_e4=433_0000)
+check("second add uses only the ~$167 REMAINING budget, not a fresh "
+     "$500 -- 3 shares, not the 10 a naive per-add $500 target would "
+     "give at this risk-per-share",
+     shares2, 3)
+
+held_qty_after_2 = shares1 + shares2
+blended_avg = (shares1 * 433_0000 + shares2 * 150_0000) // held_qty_after_2
+
+# third add ($130) -- the budget is nearly exhausted by now; must block
+shares3 = ov9.risk_sized_qty(entry_price_e4=130_0000, stop_price_e4=STOP,
+                             held_qty=held_qty_after_2,
+                             held_avg_cost_e4=blended_avg)
+check("third add is BLOCKED (0) -- the position is already essentially "
+     "at its $500 risk budget after the first two entries; this is the "
+     "actual point of the fix: pyramiding can't silently accumulate "
+     "risk past the intended target no matter how many more signals "
+     "fire",
+     shares3, 0)
+
+check("a pyramiding add returns 0, not 1, when risk-per-share is "
+     "degenerate (entry at/through the stop) -- different from a "
+     "fresh entry, which still sizes minimally; an add has nothing "
+     "sensible to size into and should simply block",
+     ov9.risk_sized_qty(entry_price_e4=100_0000, stop_price_e4=100_0000,
+                        held_qty=5, held_avg_cost_e4=200_0000),
+     0)
+
+check("a pyramiding add with ZERO held_qty behaves identically to a "
+     "fresh entry (the held_qty=0 default) -- no special-casing "
+     "needed for a position that's genuinely flat",
+     ov9.risk_sized_qty(entry_price_e4=433_0000, stop_price_e4=STOP,
+                        held_qty=0, held_avg_cost_e4=0),
+     shares1)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")
