@@ -73,17 +73,28 @@ check("buy while already holding, still under max_shares, is now "
      "max_shares, they're no longer refused just for holding a "
      "position at all)", pol.evaluate(SIDE_BUY, 2, 1_000_000)[:2],
      (True, "ok"))
-check("buy correctly blocked once it would exceed max_shares",
+check("buy blocked once the position is AT max_shares -- v3.47: the "
+      "caps trim now, so this only blocks when there is no room left "
+      "for even one more share",
       pol.evaluate(SIDE_BUY, 4, 1_000_000)[:2],
-      (False, f"would exceed max_shares ({LIM['max_shares']})"))
+      (False, f"already at max_shares ({LIM['max_shares']})"))
 check("sell when flat blocked", pol.evaluate(SIDE_SELL, 0, 1_000_000)[0], False)
 check("sell closes the FULL accumulated position, not just one lot",
       pol.evaluate(SIDE_SELL, 4, 1_000_000)[2], 4)
-check("notional cap blocks",
-      pol.evaluate(SIDE_BUY, 0, 3_000_000)[0], False)   # 2 x $300 > $500
+# v3.47: the notional cap TRIMS rather than blocking. Two shares of a
+# $300 stock is $600 against a $500 cap -- one share fits, so one share
+# is bought instead of the whole order being thrown away. Rejecting is
+# what produced zero trades across a full year of real SPY replay.
+_trim = pol.evaluate(SIDE_BUY, 0, 3_000_000)
+check("notional cap trims instead of blocking", _trim[0], True)
+check("...to the number of shares that actually fit", _trim[2], 1)
+check("...and names the cap that did it",
+      "trimmed to fit order cap" in _trim[1], True)
 pol9 = RiskPolicy(RiskLimits(**{**LIM, "order_qty": 9}))
-check("max_shares still blocks a single oversized order from flat",
-      pol9.evaluate(SIDE_BUY, 0, 1)[0], False)
+_t9 = pol9.evaluate(SIDE_BUY, 0, 1)
+check("max_shares trims an oversized order from flat rather than "
+      "rejecting it", _t9[0], True)
+check("...down to exactly max_shares", _t9[2], LIM["max_shares"])
 
 pol.record_order()
 check("cooldown blocks immediately",
@@ -126,20 +137,27 @@ check("buy that keeps the total position under the cap is allowed "
      "$40 = $8,080 total, still under $10,000)",
      pol_mpn.evaluate(SIDE_BUY, 200, 40 * 10_000)[:2],
      (True, "ok"))
-check("...but pushing PAST $10,000 total IS blocked",
-      pol_mpn.evaluate(SIDE_BUY, 249, 40 * 10_000)[:2],  # 251sh * $40=$10,040
-      (False, "total position 10040.00 > 10000.00"))
-check("the existing max_shares check is COMPLETELY UNTOUCHED -- still "
-     "independently blocks even when max_position_notional_e4 would "
-     "have allowed it (cheap stock, small $ exposure, but too many "
-     "shares) -- this is the exact mechanism blended_strategy.py's "
-     "per-sleeve caps and backtest.py depend on continuing to work",
+# v3.47: pushing past the cap trims to the headroom remaining. 249
+# shares of a $40 stock is $9,960, leaving exactly $40 -- so precisely
+# one more share goes through.
+_tp = pol_mpn.evaluate(SIDE_BUY, 249, 40 * 10_000)
+check("pushing past $10,000 total now trims to fit", _tp[0], True)
+check("...to the single share the remaining $40 allows", _tp[2], 1)
+check("...naming the position cap as what trimmed it",
+      "position cap" in _tp[1], True)
+check("a position with NO room left still blocks outright",
+      pol_mpn.evaluate(SIDE_BUY, 250, 40 * 10_000)[0], False)
+check("max_shares still independently constrains even when "
+     "max_position_notional_e4 would have allowed it (cheap stock, "
+     "small $ exposure, too many shares) -- the mechanism "
+     "blended_strategy.py's per-sleeve caps depend on. v3.47: it "
+     "TRIMS to the remaining share room rather than rejecting",
      RiskPolicy(RiskLimits(
          order_qty=5, max_shares=10, max_notional_e4=10**12,
          max_position_notional_e4=10_000 * 10_000,
          require_market_hours=False))
-     .evaluate(SIDE_BUY, 8, 1 * 10_000)[:2],   # 13 shares of a $1 stock:
-     (False, "would exceed max_shares (10)"))  # tiny $, still blocked
+     .evaluate(SIDE_BUY, 8, 1 * 10_000)[:3],   # 13 shares of a $1 stock
+     (True, "ok (trimmed to fit max_shares 10)", 2))
 
 # ---------------------------------------------------------------------------
 # v3.28: run_alpaca(relay_url=...) -- connect to a local relay instead of
@@ -1909,12 +1927,13 @@ check("this test file's OWN --killfile default did not leak a stray "
      os.path.exists(os.path.join(
          os.path.dirname(os.path.abspath(__file__)), "om.kill")), False)
 
-print("[G30] v3.43: on_signal() correctly risk-sizes a PYRAMIDING ADD "
-     "(not just the fresh entry) using CostTracker's own blended "
-     "average cost, and blocks further adds once the risk budget is "
-     "used up -- integration proof that the fix from test_position_"
-     "risk.py's G6 is actually wired into real trading decisions, not "
-     "just correct in isolation")
+print("[G30] v3.47: on_signal() risk-sizes a PYRAMIDING ADD against the "
+     "ORIGINAL committed stop, with the notional caps -- not a separate "
+     "risk budget -- bounding the position. Replaces v3.43's total-risk "
+     "budget, which blocked adds outright once spent: that made "
+     "pyramiding nearly unreachable by design, and in a real session it "
+     "was the single most common block ('position already at its risk "
+     "budget' on every symbol added mid-session)")
 
 om30p, broker30p, mirror30p = _fresh_om_wide_spread(
     stop_sigma_mult=3.0, risk_dollars_per_trade=500.0)
@@ -1925,37 +1944,60 @@ om30p.policy.lim.cooldown_s = 0.0   # this test deliberately fires
                                     # would otherwise block every
                                     # signal after the first,
                                     # regardless of risk sizing
-# wide-spread fixture: vwap $400, sigma $100 -> stop = $400-3*100=$100,
-# matching test_position_risk.py's G6 scenario exactly so the same
-# hand-verified numbers apply here too
+# wide-spread fixture: vwap $400, sigma $100 -> stop = $400-3*100=$100.
+# Its caps are effectively unlimited (10**12), so nothing trims here and
+# the raw risk sizing is visible on its own.
 
 out30a = om30p.on_signal({"side": SIDE_BUY, "price_e4": 433_0000,
                           "symbol": "SPY", "strategy": "vwap_bounce"})
 check("fresh entry fills", out30a, "FILLED")
-shares_after_1 = om30p.positions["SPY"]
 check("fresh entry sizes to 1 share, matching the hand-verified math "
      "(risk-per-share $333, floor(500/333)=1)",
-     shares_after_1, 1)
+     om30p.positions["SPY"], 1)
 
 out30b = om30p.on_signal({"side": SIDE_BUY, "price_e4": 150_0000,
                           "symbol": "SPY", "strategy": "vwap_bounce"})
-check("the pyramiding add ALSO fills (not blocked -- there was real "
-     "remaining budget)", out30b, "FILLED")
-check("the add sizes to 3 shares (1+3=4 total), using the REMAINING "
-     "~$167 budget after the first entry, not a fresh $500 -- a naive "
-     "per-add sizing would have given 10 shares here instead",
-     om30p.positions["SPY"], 4)
+check("the pyramiding add fills", out30b, "FILLED")
+check("the add is sized INDEPENDENTLY at the full risk budget against "
+     "the committed $100 stop -- entry $150 means risk-per-share $50, "
+     "so floor(500/50)=10 shares, 11 total. Under v3.43's budget this "
+     "was 3, deliberately starved by what the fresh entry had spent",
+     om30p.positions["SPY"], 11)
 
 out30c = om30p.on_signal({"side": SIDE_BUY, "price_e4": 130_0000,
                           "symbol": "SPY", "strategy": "vwap_bounce"})
-check("a THIRD add, once the risk budget is essentially exhausted by "
-     "the first two, is BLOCKED through the real on_signal() path -- "
-     "not silently filled at some arbitrary small size",
-     out30c.startswith("blocked:"), True)
-check("position unchanged after the blocked add -- nothing partial "
-     "was filled", om30p.positions["SPY"], 4)
-check("the block reason explains it's a risk-budget block specifically",
-      "risk budget" in out30c, True)
+check("a third add still fills rather than hitting a budget wall -- "
+     "v3.43 blocked here", out30c, "FILLED")
+check("...sized off that same fixed stop (entry $130, risk-per-share "
+     "$30, floor(500/30)=16), 27 total",
+     om30p.positions["SPY"], 27)
+check("the stop stayed FIXED at the original $100 across all three "
+     "entries, never recomputed from the current session VWAP -- the "
+     "part of v3.43's design that still holds",
+     om30p.risk_overlay.stop_price_e4("SPY"), 100_0000)
+
+# ...and the notional cap is what actually bounds the position now.
+om30r, _b30r, _m30r = _fresh_om_wide_spread(
+    stop_sigma_mult=3.0, risk_dollars_per_trade=500.0)
+om30r.policy.lim.cooldown_s = 0.0
+om30r.policy.lim.max_position_notional_e4 = 5_000 * 10_000      # $5,000
+om30r.on_signal({"side": SIDE_BUY, "price_e4": 433_0000,
+                 "symbol": "SPY", "strategy": "vwap_bounce"})
+for _ in range(6):
+    om30r.on_signal({"side": SIDE_BUY, "price_e4": 150_0000,
+                     "symbol": "SPY", "strategy": "vwap_bounce"})
+_held = om30r.positions["SPY"]
+check("with a real $5,000 position cap, repeated adds fill up TO it "
+     "and stop -- the cap, not a risk budget, is the bound",
+     _held * 150_0000 <= 5_000 * 10_000, True)
+check("...and it got close to the cap rather than stalling well below "
+     "it, which is the whole point of trimming instead of rejecting "
+     "the overshooting order",
+     _held * 150_0000 > 4_000 * 10_000, True)
+out30r = om30r.on_signal({"side": SIDE_BUY, "price_e4": 150_0000,
+                          "symbol": "SPY", "strategy": "vwap_bounce"})
+check("once genuinely full, further adds block and name the cap",
+      out30r.startswith("blocked:") and "cap" in out30r, True)
 
 # regression: a position with NO recorded overlay stop (e.g. reconciled
 # from the broker at startup, never opened through on_signal itself)
@@ -2009,7 +2051,17 @@ with open(g31_trades, "w") as f:
 _RISK_ARGS_G31 = ["--strategy", "vwap_bounce", "--stop-sigma-mult", "3.0",
                  "--anchor-gate-tolerance", "0.01", "--risk-per-trade",
                  "500", "--max-position-notional", "50000",
-                 "--cooldown", "60"]
+                 # v3.47: cooldown 0. Orders actually FILL now that the
+                 # caps trim instead of rejecting, which starts the
+                 # cooldown clock -- and the two tools measure that
+                 # clock differently in a historical replay
+                 # (order_manager.py's live policy uses wall-clock time;
+                 # backtest.py uses each tick's own timestamp). That is
+                 # a real, pre-existing difference, invisible until now
+                 # because nothing ever filled, and it is NOT what this
+                 # test is about. Disabling cooldown isolates the
+                 # comparison to the risk sizing and the caps.
+                 "--cooldown", "0"]
 
 emu31 = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
 port31 = emu31.start()
@@ -2047,11 +2099,20 @@ check("the two tools produce IDENTICAL block reasons (same counts, "
      "showed a completely different set of blocks (or none at all) "
      "because it was silently sizing every entry to 1 share",
      reasons_om31, reasons_bt31)
-check("neither tool degenerated to the 1-share-only fallback -- at "
-     "least one real 'total position' block with a genuine, non-tiny "
-     "dollar figure shows the risk-sizing actually used a real, "
-     "non-empty sigma, not the degenerate empty-mirror case",
-     any("total position" in r for r in reasons_om31), True)
+def _fills_g31(stdout):
+    return [int(l.split("FILLED BUY ")[1].split()[0])
+            for l in stdout.splitlines() if "FILLED BUY" in l]
+
+_f_om, _f_bt = _fills_g31(r_om31.stdout), _fills_g31(r_bt31.stdout)
+check("both tools filled the SAME buy quantities in the same order -- "
+     "a stronger form of the agreement this test exists to prove than "
+     "matching block reasons, and one that only became checkable once "
+     "v3.47's trimming let orders actually fill",
+     _f_om, _f_bt)
+check("...and at least one fill was bigger than a single share, "
+     "proving the sizing ran against a real, non-empty sigma rather "
+     "than the degenerate empty-mirror fallback that always returns 1",
+     any(q > 1 for q in _f_om), True)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

@@ -523,18 +523,48 @@ class RiskPolicy:
 
         if side == SIDE_BUY:
             qty = qty_override if qty_override is not None else lim.order_qty
-            if position_qty + qty > lim.max_shares:
-                return False, f"would exceed max_shares ({lim.max_shares})", 0
-            if lim.max_position_notional_e4 is not None:
-                total_e4 = (position_qty + qty) * price_e4
-                if total_e4 > lim.max_position_notional_e4:
-                    return False, (f"total position "
-                                   f"{dollars(total_e4):.2f} > "
-                                   f"{dollars(lim.max_position_notional_e4):.2f}"), 0
+            trims = []
+
+            # v3.47: the caps now TRIM the order rather than reject it.
+            # A risk-sized quantity that overshoots a cap is a reason to
+            # buy LESS, not a reason to skip the trade -- rejecting was
+            # why a full year of real SPY replay produced ZERO trades at
+            # every strategy, and why five live symbols sat blocked all
+            # morning. Only a cap with no room left for even one share
+            # still blocks.
             if qty * price_e4 > lim.max_notional_e4:
-                return False, (f"notional {dollars(qty*price_e4):.2f} > "
-                               f"{dollars(lim.max_notional_e4):.2f}"), 0
-            return True, "ok", qty
+                qty = lim.max_notional_e4 // price_e4
+                if qty <= 0:
+                    return False, (f"one share at "
+                                   f"{dollars(price_e4):.2f} already "
+                                   f"exceeds the "
+                                   f"{dollars(lim.max_notional_e4):.2f} "
+                                   f"order cap"), 0
+                trims.append(f"order cap "
+                             f"{dollars(lim.max_notional_e4):.0f}")
+
+            if lim.max_position_notional_e4 is not None:
+                room_e4 = (lim.max_position_notional_e4
+                           - position_qty * price_e4)
+                if room_e4 < price_e4:
+                    return False, (f"position already at its "
+                                   f"{dollars(lim.max_position_notional_e4):.2f}"
+                                   f" cap -- no room for another share"), 0
+                if qty * price_e4 > room_e4:
+                    qty = room_e4 // price_e4
+                    trims.append(f"position cap "
+                                 f"{dollars(lim.max_position_notional_e4):.0f}")
+
+            if position_qty + qty > lim.max_shares:
+                qty = lim.max_shares - position_qty
+                if qty <= 0:
+                    return False, (f"already at max_shares "
+                                   f"({lim.max_shares})"), 0
+                trims.append(f"max_shares {lim.max_shares}")
+
+            return True, ("ok" if not trims
+                          else "ok (trimmed to fit " + ", ".join(trims)
+                               + ")"), qty
 
         if side == SIDE_SELL:
             if position_qty <= 0:
@@ -749,35 +779,35 @@ class OrderManager:
                 stop_e4 = overlay.peek_stop_price_e4(self.vwap_models.get(sym))
                 qty_override = overlay.risk_sized_qty(price_e4, stop_e4)
             else:
-                # v3.43: a pyramiding add onto an ALREADY-open position.
-                # Deliberately uses the ORIGINAL, fixed stop already
-                # committed at the first entry (stop_price_e4 --
-                # never peek_stop_price_e4 here, which would recompute
-                # from the CURRENT session VWAP and let the stop drift
-                # with a declining market, exactly what a fixed stop is
-                # supposed to avoid). held_qty/held_avg_cost_e4 come
-                # straight from CostTracker's own blended average for
-                # this symbol -- the risk overlay stays a pure function
-                # of its inputs, no direct CostTracker dependency.
+                # A pyramiding add onto an ALREADY-open position. Still
+                # sized against the ORIGINAL committed stop (v3.43's
+                # reasoning holds and is unchanged: never
+                # peek_stop_price_e4 here, which would recompute from
+                # the CURRENT session VWAP and let the stop drift down
+                # with a declining market -- exactly what a fixed stop
+                # exists to prevent).
+                #
+                # v3.47: what IS gone is v3.43's total-risk budget,
+                # which compared the blended cost of shares already
+                # held against that stop and BLOCKED the add outright
+                # once the budget was spent. Two reasons it had to go.
+                # It made pyramiding almost unreachable by design (a
+                # fresh entry consumed most of the budget), and in
+                # practice it was the single most common block in a
+                # real session -- every mid-session symbol this
+                # afternoon died on "position already at its risk
+                # budget". Position exposure is now bounded by
+                # max_position_notional_e4 in evaluate() instead, which
+                # TRIMS to fit rather than rejecting, so an add still
+                # happens, just smaller as the position fills up. Each
+                # add is independently sized to risk_dollars_per_trade
+                # against the real stop that will actually execute;
+                # total risk at a full position is bounded by
+                # 2 * position_cap * sigma%, not by a separate budget.
                 existing_stop_e4 = overlay.stop_price_e4(sym)
                 if existing_stop_e4 is not None:
-                    held_qty, held_avg_cost_e4 = self.costs._entries.get(
-                        sym, [0, 0])
                     qty_override = overlay.risk_sized_qty(
-                        price_e4, existing_stop_e4,
-                        held_qty=held_qty,
-                        held_avg_cost_e4=held_avg_cost_e4)
-                    if qty_override == 0:
-                        self.blocked += 1
-                        reason = ("position already at its risk budget "
-                                 "-- no room to add more without "
-                                 "exceeding the intended risk-if-"
-                                 "stopped for this position")
-                        self._audit("blocked", reason=reason, symbol=sym,
-                                    side=side, price_e4=price_e4,
-                                    position_qty=self.positions[sym])
-                        print(f"[om] blocked {sym} BUY: {reason}")
-                        return f"blocked: {reason}"
+                        price_e4, existing_stop_e4)
                 # else: no committed stop on record for this symbol
                 # (e.g. a position reconciled from the broker at
                 # startup rather than opened through this session) --
@@ -787,6 +817,17 @@ class OrderManager:
 
         allowed, reason, qty = self.policy.evaluate(
             side, self.positions[sym], price_e4, qty_override=qty_override)
+        if allowed and reason != "ok" and qty_override is not None:
+            # v3.47: a cap reduced the risk-sized quantity. Say so --
+            # silently filling a smaller order than the risk model
+            # asked for is exactly the kind of thing that should be
+            # visible in the log and the audit trail, not inferred
+            # later from a share count that looks surprising.
+            self._audit("trimmed", symbol=sym, side=side, price_e4=price_e4,
+                        wanted_qty=qty_override, filled_qty=qty,
+                        reason=reason)
+            print(f"[om] {sym} BUY sized {qty_override} -> {qty} "
+                  f"({reason[4:-1] if reason.startswith('ok (') else reason})")
         if not allowed:
             self.blocked += 1
             self._audit("blocked", reason=reason, symbol=sym, side=side,
@@ -1216,6 +1257,27 @@ def main():
     args = ap.parse_args()
     if not args.no_timestamps:
         install_local_timestamps()
+
+    # v3.47: fail fast on a missing feed dependency. run_alpaca does its
+    # own import check, but that only runs AFTER cost-basis replay, VWAP
+    # mirror rebuild, scored-signal restore and dashboard startup -- on a
+    # real session that is a couple of seconds of work and a screen of
+    # output before a one-line "you need websocket-client". Worse, until
+    # v3.46 order_manager.py imported bridge.py unconditionally, and
+    # bridge.py hard-exits at import time without pyserial, so an
+    # un-activated venv used to be caught instantly by that accidental
+    # tripwire. Making the bridge import lazy (correctly -- the direct
+    # engine needs no serial library) removed it, so check explicitly
+    # here instead.
+    if args.source == "alpaca":
+        try:
+            import websocket            # noqa: F401  (websocket-client)
+        except ImportError:
+            sys.exit("[om] --source alpaca needs websocket-client:\n"
+                     "       pip3 install websocket-client "
+                     "--break-system-packages\n"
+                     "     (if you use a virtualenv, check it's active "
+                     "first -- e.g. source ~/fpga-venv/bin/activate)")
 
     if args.selftest:
         # hardware acceptance test — real board, no broker, no

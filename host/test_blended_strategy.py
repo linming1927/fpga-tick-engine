@@ -241,7 +241,7 @@ check("fractional value passes through",
 # dict can NEVER show a VWAP reason when SMA-PG's bucket counts are
 # orders of magnitude larger, no matter how much of VWAP's own blocked
 # count it would explain. Reproduced deterministically: both sleeves
-# hit the exact same reason ("would exceed max_shares"), SMA-PG just
+# hit the exact same reason ("already at max_shares"), SMA-PG just
 # hits it far more often -- exactly the real QQQ/VTI report's shape.
 print("[G11] blend gate reasons: per-sleeve summary, not a global top-3 "
      "that silently drops the quieter sleeve")
@@ -299,21 +299,26 @@ check("confirms the BUG this fixes: a naive global top-3 over the "
 summary = blend2.gate_summary()
 check("gate_summary() shows vwap's reason despite being vastly "
      "outnumbered -- the actual fix",
-     "vwap: would exceed max_shares" in summary, True)
+     "vwap: already at max_shares" in summary, True)
 check("gate_summary() ALSO still shows all three of sma-pg's reasons "
      "(fixing vwap's visibility shouldn't cost sma-pg any of its own; "
      "the sleeve label prefixes its whole group once, so this checks "
      "for the reason text within that group, not a repeated prefix)",
      "sma-pg:" in summary
      and "would realize a loss x300" in summary
-     and "would exceed max_shares x250" in summary
-     and "notional" in summary, True)
+     and "already at max_shares x250" in summary
+     and "order cap" in summary, True)   # v3.47: the notional block
+                                        # is now worded "one share ...
+                                        # exceeds the ... order cap",
+                                        # since a cap that CAN be met
+                                        # by fewer shares now trims
+                                        # instead of blocking
 
 rep2 = comparison_report({"blend": blend2})
 check("comparison_report uses gate_summary() for cards that expose "
      "it, so the printed report line -- not just the underlying "
      "method -- actually shows both sleeves",
-     "vwap: would exceed max_shares x5" in rep2
+     "vwap: already at max_shares x5" in rep2
      and "sma-pg:" in rep2
      and "would realize a loss x300" in rep2, True)
 
@@ -335,7 +340,7 @@ check("a plain card has no gate_summary -- comparison_report() falls "
 rep3 = comparison_report({"plain": plain_card})
 check("plain card's report line still renders correctly (no "
      "regression from the hasattr branch)",
-     "would exceed max_shares" in rep3, True)
+     "already at max_shares" in rep3, True)
 
 print("=" * 46)
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
