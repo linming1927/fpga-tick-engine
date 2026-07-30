@@ -1294,6 +1294,29 @@ g23_env = os.environ.copy()
 g23_env.pop("ALPACA_KEY", None)
 g23_env.pop("ALPACA_SECRET", None)
 
+# v3.47 made this test environment-dependent without meaning to. This
+# group exercises a sys.exit deep INSIDE run_alpaca (missing ALPACA_KEY)
+# -- but run_alpaca's first act is `import websocket`, and v3.47 added an
+# argument-parse-time check for that same import. On a machine WITHOUT
+# websocket-client the run now exits at that early check instead, so the
+# three assertions below all failed with no hint as to why (a real
+# report: 235 PASS / 3 FAIL, on a box that had pyserial but not
+# websocket-client).
+#
+# Fixed by making the dependency deterministic rather than inherited
+# from whatever Python happens to be running the tests: a stub
+# `websocket` module on PYTHONPATH, which takes precedence over
+# site-packages. run_alpaca never touches it -- it exits on the missing
+# key first -- so a bare empty module is enough, and the test now
+# exercises the path it means to whether or not the real package is
+# installed.
+g23_stub = tempfile.mkdtemp()
+open(os.path.join(g23_stub, "websocket.py"), "w").write(
+    "# stub: satisfies `import websocket` for test_order_manager.py's\n"
+    "# [G23], which needs to reach run_alpaca's ALPACA_KEY check.\n")
+g23_env["PYTHONPATH"] = (g23_stub + os.pathsep
+                         + g23_env.get("PYTHONPATH", ""))
+
 emu23 = FPGAEmulator(symbol="SPY", fast_n=8, slow_n=32)
 port23 = emu23.start()
 r = subprocess.run(
@@ -1317,6 +1340,38 @@ check("the summary STILL prints afterward (useful context: confirms "
 check("ticks sent correctly shows 0 -- the abort happened before "
      "anything could flow, consistent with the surfaced reason",
      "ticks sent            0" in r.stdout, True)
+
+# ...and the OTHER side of the same coin: with the dependency genuinely
+# missing, v3.47's parse-time check must fire FAST and say so plainly,
+# rather than doing seconds of cost-basis replay and dashboard startup
+# first. Same stub trick, but this one raises on import.
+g23_nows = tempfile.mkdtemp()
+open(os.path.join(g23_nows, "websocket.py"), "w").write(
+    "raise ImportError('stub: websocket-client deliberately absent')\n")
+g23_env_nows = g23_env.copy()
+g23_env_nows["PYTHONPATH"] = (g23_nows + os.pathsep
+                              + os.environ.get("PYTHONPATH", ""))
+r_nows = subprocess.run(
+    [sys.executable, ORDER_MANAGER_PY, "--symbol", "SPY",
+     "--source", "alpaca", "--broker", "mock", "--no-timestamps",
+     "--audit", os.path.join(g23_tmp, "audit2.jsonl"),
+     "--killfile", os.path.join(g23_tmp, "om2.kill")],
+    capture_output=True, text=True, timeout=30, env=g23_env_nows)
+check("a missing websocket-client exits nonzero", r_nows.returncode != 0,
+      True)
+# sys.exit(<str>) writes the message to STDERR, not stdout
+_nows_out = r_nows.stdout + r_nows.stderr
+check("...naming the actual package to install",
+      "websocket-client" in _nows_out, True)
+check("...and mentioning the virtualenv, since an inactive one is the "
+     "likeliest cause on a machine that had it working yesterday",
+     "virtualenv" in _nows_out, True)
+check("...before ANY session startup work -- no cost-basis replay, no "
+     "broker reconciliation, no dashboard. This is the whole point of "
+     "checking at parse time: v3.46's lazy bridge import removed the "
+     "accidental pyserial tripwire that used to catch this instantly",
+     ("reconciled positions" not in r_nows.stdout
+      and "direct engine" not in r_nows.stdout), True)
 
 # regression: a NORMAL, successful --source sim session (no early
 # abort at all) must be completely unaffected -- same exit-code logic
