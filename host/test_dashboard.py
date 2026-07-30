@@ -95,7 +95,15 @@ check("series matches echo count", len(s["series"]), min(br.echoes, 240))
 check("signals present", len(s["signals"]) > 0, True)
 check("signals mirror verifiers", s["verified"],
       sum(v.verified for v in br.verifiers.values()))
-check("series carries both strategies", len(s["series"][0]), 7)
+check("v3.48: each series point is VWAP-shaped -- "
+     "(price, vwap, sigma, warmed) -- not the old 7-tuple of SMA/EMA "
+     "values. Sigma is carried raw so the browser can derive BOTH the "
+     "+/-k signal band and the N-sigma stop line from one number",
+     len(s["series"][0]), 4)
+check("v3.48: ONLY vwap_bounce signals are reported -- sma/ema are "
+     "still scored in the background and still appear in the "
+     "end-of-session comparison, they are just not shown here",
+     all(x["strategy"] == "vwap_bounce" for x in s["signals"]), True)
 check("signals carry strategy tags",
       all(x["strategy"] in ("sma", "ema", "vwap_bounce")
           for x in s["signals"]), True)
@@ -154,7 +162,7 @@ check("event logged", any("KILL" in e["text"] for e in s["events"]), True)
 # ---- v3.1: the outcome column reaches the API, not just the object ----
 print("[G_outcome] on_signal's outcome parameter reaches /api/state")
 dash.on_signal({"side": 1, "price_e4": 1_000_000, "symbol": "SPY",
-                "strategy": "sma", "sma_fast": 0, "sma_slow": 0},
+                "strategy": "vwap_bounce", "vwap": 0},
                outcome="blocked: cooldown (5.0s < 60.0s)")
 s2 = json.loads(get("/api/state"))
 check("newest signal carries the real outcome string",
@@ -172,7 +180,7 @@ print("[G_markers] per-symbol chart signals aren't crowded out by a "
 
 def fab(sym, side, price):
     return {"side": side, "price_e4": price, "symbol": sym,
-            "sma_fast": 0, "sma_slow": 0, "strategy": "sma"}
+            "vwap": 0, "strategy": "vwap_bounce"}
 
 # QQQ fires ONE signal early...
 dash.on_signal(fab("QQQ", 1, 4_000_000), outcome="FILLED")
@@ -197,6 +205,83 @@ check("the GLOBAL table-facing list is independent of the per-symbol "
      "table is 'recent across everything', not 'never forget any "
      "symbol' — only the PER-SYMBOL chart view needed that guarantee)",
      any(x["symbol"] == "QQQ" for x in spy_state["signals"]), False)
+
+# ---- v3.48: the HOLDINGS table and the VWAP chart's band parameters --
+print("[G_holdings] HOLDINGS table and chart band/stop multipliers")
+
+from position_risk import PositionRiskOverlay
+
+s3 = json.loads(get("/api/state"))
+check("band_k is exposed so the chart draws the REAL signal band "
+     "rather than a hardcoded multiple", s3["band_k"], 1.0)
+check("stop_mult is exposed the same way; 0.0 when the risk overlay "
+     "is off, which tells the chart to omit the stop line entirely",
+     s3["stop_mult"], 0.0)
+check("holdings is always present, even with nothing open",
+      isinstance(s3["holdings"], list), True)
+check("...and is empty when flat", s3["holdings"], [])
+check("only the LIVE strategy row is reported now",
+      all(c["live"] for c in s3["strategies"]), True)
+
+# a real open position, with the overlay armed the way a live session
+# would arm it
+om.risk_overlay = PositionRiskOverlay(stop_sigma_mult=3.0,
+                                      risk_dollars_per_trade=50.0)
+om.vwap_models = br.models["vwap_bounce"]
+om.positions["SPY"] = 4
+om.costs._entries["SPY"] = [4, 1_000_000]        # 4 @ $100.00
+# the mirror needs real accumulated data, otherwise sigma is 0 and the
+# committed stop degenerates to 0 -- which is exactly the empty-mirror
+# pathology v3.46 fixed, not what this test is about
+_vm = br.models["vwap_bounce"]["SPY"]
+for _p in (98_0000, 102_0000) * 15:
+    _vm.ingest(_p, 100)                      # vwap ~$100, sigma ~$2
+om.risk_overlay.on_position_opened(
+    "SPY", om.policy._now_fn().date(),       # a DATE, per its docstring
+    _vm)
+check("the fixture's stop is real, not the degenerate empty-mirror 0 "
+     "-- otherwise the rows below would all be vacuously None",
+     om.risk_overlay.stop_price_e4("SPY") > 0, True)
+om.risk_overlay.on_tick("SPY", 1_020_000, 100)
+dash._last_price["SPY"] = 1_020_000              # last $102.00
+
+h = json.loads(get("/api/state"))["holdings"]
+check("the open position appears", len(h), 1)
+row = h[0]
+check("symbol", row["symbol"], "SPY")
+check("qty", row["qty"], 4)
+check("avg cost comes from CostTracker's own blended average, so the "
+     "table can never disagree with what the trading logic uses",
+     row["avg_e4"], 1_000_000)
+check("last price is marked to the latest tick", row["last_e4"], 1_020_000)
+check("position value = qty * last", round(row["value"], 2), 408.00)
+check("unrealized P&L = qty * (last - avg)", round(row["unreal"], 2), 8.00)
+check("unrealized percent", row["unreal_pct"], 2.0)
+check("the committed stop is surfaced, not recomputed",
+      row["stop_e4"], om.risk_overlay.stop_price_e4("SPY"))
+check("anchored VWAP is surfaced -- it is what the sell gate judges an "
+     "overnight position against",
+     row["anchor_e4"], om.risk_overlay.anchored_vwap_e4("SPY"))
+check("same_day is reported, since it decides whether the sell gate "
+     "applies at all", row["same_day"], True)
+check("sell_ok reports the gate's ACTUAL answer, so \"why didn\'t it "
+     "sell?\" is visible rather than silent",
+     row["sell_ok"],
+     om.risk_overlay.sell_allowed("SPY", 1_020_000,
+                                  om.policy._now_fn().date()))
+check("risk-if-stopped is qty * (avg - stop) -- the real exposure from "
+     "here, which is NOT --risk-per-trade once the caps have trimmed "
+     "an order or the position has been added to",
+     round(row["risk"], 2),
+     round(4 * (1_000_000 - row["stop_e4"]) / 10_000, 2))
+check("distance-to-stop is a percentage of the CURRENT price, the "
+     "single most useful number when judging danger",
+     row["to_stop_pct"],
+     round((1_020_000 - row["stop_e4"]) / 1_020_000 * 100, 2))
+
+om.positions["SPY"] = 0
+check("a closed position drops out of the table again",
+      json.loads(get("/api/state"))["holdings"], [])
 
 dash.stop(); br.close(); emu.stop()
 

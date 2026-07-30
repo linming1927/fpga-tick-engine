@@ -63,39 +63,53 @@ class DashboardServer:
                                                   # still visible on screen —
                                                   # a real reported bug.
         self._events = deque(maxlen=30)
+        self._last_price = {}                   # symbol -> latest price_e4,
+                                                # for the HOLDINGS table's
+                                                # mark-to-market column
         self._last_echo_t = 0.0
         self._last_trouble_t = 0.0
         self.t0 = time.time()
 
         bridge.on_echo = self._on_echo          # hook added in bridge.py
 
-    # ---- feed hooks (called from bridge threads) ------------------------------
+    # ---- feed hooks (called from engine threads) ------------------------------
     def _on_echo(self, fr: dict):
+        """v3.48: the chart series is VWAP-shaped now, not SMA/EMA.
+        Each point is (price_e4, vwap_e4, sigma_e4, warmed_up) -- the
+        sigma is carried raw rather than pre-multiplied into bands so
+        the browser can draw whatever multiples it wants (the +/-1 sigma
+        signal band AND the 3 sigma stop level) from one number."""
         sym = fr["symbol"].strip()
-        m = self.bridge.models["sma"].get(sym)
-        e = self.bridge.models["ema"].get(sym)
-        if m is None:
+        v = self.bridge.models["vwap_bounce"].get(sym)
+        if v is None:
             return
+        # the same variance the overlay and vwap_engine.sv both use:
+        # mean_sq - vwap^2, in e4 units
+        if v.sum_v > 0 and v.vwap > 0:
+            mean_sq = v.sum_ppv / v.sum_v
+            sigma = max(0.0, mean_sq - v.vwap ** 2) ** 0.5
+        else:
+            sigma = 0.0
         with self._lock:
             d = self._series.setdefault(sym, deque(maxlen=self._points))
-            d.append((fr["price_e4"], m.sma_fast, m.sma_slow, m.warmed_up,
-                      e.ema_fast, e.ema_slow, e.warmed_up))
+            d.append((fr["price_e4"], v.vwap, sigma, v.warmed_up))
+            self._last_price[sym] = fr["price_e4"]
             self._last_echo_t = time.time()
 
     def on_signal(self, fr: dict, outcome: str = ""):
+        # v3.48: VWAP-bounce only. SMA and EMA are still scored in the
+        # background and still appear in the end-of-session report --
+        # they are just not reported HERE any more, so the signals
+        # table and the chart markers show only what actually trades.
+        if fr.get("strategy") != "vwap_bounce":
+            return
         with self._lock:
             rec = {"t": time.strftime("%H:%M:%S"),
-                  "strategy": fr.get("strategy", "sma"),
+                  "strategy": fr.get("strategy", "vwap_bounce"),
                   "symbol": fr["symbol"].strip(),
                   "side": fr["side"],
                   "price_e4": fr["price_e4"],
-                  # v3.19: fabric VWAP signals (0x85) carry {vwap,
-                  # eval_skips} instead of {sma_fast, sma_slow}; map the
-                  # vwap into the "fast" column so the signals table
-                  # shows the cross-check value, and leave "slow" None
-                  # (rendered as a dash, not $NaN — see the JS side)
-                  "sma_fast": fr.get("sma_fast", fr.get("vwap")),
-                  "sma_slow": fr.get("sma_slow"),
+                  "vwap": fr.get("vwap"),
                   "outcome": outcome}
             self._signals.appendleft(rec)
             sym = rec["symbol"]
@@ -113,10 +127,10 @@ class DashboardServer:
     def snapshot(self, sym: str | None = None) -> dict:
         br, om = self.bridge, self.om
         sym = (sym or self.chart_symbol).strip().upper()
-        if sym not in br.models["sma"]:
+        if sym not in br.models["vwap_bounce"]:
             sym = br.symbol
         self.chart_symbol = sym
-        m = br.models["sma"][sym]
+        m = br.models["vwap_bounce"][sym]
         now = time.time()
         rtt = sorted(br.rtt_us[-200:]) if br.rtt_us else []
         with self._lock:
@@ -124,9 +138,59 @@ class DashboardServer:
             signals = list(self._signals)
             chart_signals = list(self._signals_by_symbol.get(sym, ()))
             events = list(self._events)
+            last_px = dict(self._last_price)
             echo_age = now - self._last_echo_t if self._last_echo_t else 1e9
             trouble_age = (now - self._last_trouble_t
                            if self._last_trouble_t else 1e9)
+
+        # v3.48: HOLDINGS. Everything here is read off state that already
+        # exists -- CostTracker's blended average and the risk overlay's
+        # committed stop / anchored VWAP -- so the table shows what the
+        # trading logic is ACTUALLY using to make decisions, not a
+        # parallel recalculation that could drift from it.
+        ov = getattr(om, "risk_overlay", None)
+        # the policy's OWN clock, not datetime.now() -- same notion of
+        # "today" the sell gate itself uses, so the table can never
+        # disagree with the decision it is describing
+        today = om.policy._now_fn().date()
+        holdings = []
+        for hsym, hqty in sorted(om.positions.items()):
+            if not hqty:
+                continue
+            _, avg_e4 = om.costs._entries.get(hsym, [0, 0])
+            last_e4 = last_px.get(hsym) or avg_e4
+            stop_e4 = ov.stop_price_e4(hsym) if ov else None
+            anchor_e4 = ov.anchored_vwap_e4(hsym) if ov else None
+            holdings.append({
+                "symbol": hsym,
+                "qty": hqty,
+                "avg_e4": avg_e4,
+                "last_e4": last_e4,
+                "value": hqty * last_e4 / 10_000,
+                "unreal": hqty * (last_e4 - avg_e4) / 10_000,
+                "unreal_pct": (round((last_e4 - avg_e4) / avg_e4 * 100, 2)
+                               if avg_e4 else None),
+                "stop_e4": stop_e4,
+                # how far price can fall before the stop fires, as a
+                # percentage -- the single most useful number here when
+                # deciding whether a position is in danger
+                "to_stop_pct": (round((last_e4 - stop_e4) / last_e4 * 100, 2)
+                                if stop_e4 and last_e4 else None),
+                # what a stop-out would actually cost from here, which is
+                # NOT --risk-per-trade once the caps have trimmed the
+                # order or the position has been added to
+                "risk": (hqty * (avg_e4 - stop_e4) / 10_000
+                         if stop_e4 else None),
+                "anchor_e4": anchor_e4,
+                "same_day": ov.is_same_day(hsym, today) if ov else None,
+                # the v3.38 sell gate: an older position can only be sold
+                # at or above its own anchored VWAP (unless the stop
+                # fires, which always overrides). Worth surfacing --
+                # otherwise "why didn't it sell?" is invisible.
+                "sell_ok": (ov.sell_allowed(hsym, last_e4, today)
+                            if ov and last_e4 else None),
+            })
+
         return {
             "symbol": sym,
             "symbols": list(br.symbols),
@@ -135,20 +199,31 @@ class DashboardServer:
             "signals": signals,       # global, all symbols — feeds the table
             "chart_signals": chart_signals,   # THIS symbol only — chart markers
             "events": events,
+            "holdings": holdings,
+            # the chart draws its bands from these: the +/-k sigma signal
+            # band the strategy actually triggers on, and the N sigma
+            # stop level. Read from live config rather than hardcoded, so
+            # the picture always matches the running session.
+            "band_k": round((m.k2_q8 / 256.0) ** 0.5, 4),
+            "stop_mult": (ov.stop_sigma_mult if ov else 0.0),
             "sent": br.sent, "echoes": br.echoes,
             "resyncs": br.parser.resync_count,
             "fpga_signals": br.fpga_signals,
             "verified": sum(v.verified for v in br.verifiers.values()),
             "divergences": sum(v.divergences
                                for v in br.verifiers.values()),
+            # v3.48: the live (traded) row only. SMA and EMA are still
+            # scored in the background and still printed in the
+            # end-of-session comparison -- they are just not reported on
+            # this page any more.
             "strategies": [
                 {"name": c.name, "live": c.live, "signals": c.signals,
                  "trips": c.trips, "wins": c.wins, "blocked": c.blocked,
                  "net": round(c.net_usd, 2),
                  "open": sum(1 for v in c.positions.values() if v) > 0}
-                for c in (self.scorecards or {}).values()],
+                for c in (self.scorecards or {}).values() if c.live],
             "warmed_up": m.warmed_up,
-            "fill": m.fill, "slow_n": m.slow_n,
+            "fill": m.ticks, "slow_n": m.warmup_n,
             "rtt": {"min": rtt[0], "med": rtt[len(rtt)//2],
                     "max": rtt[-1]} if rtt else None,
             "positions": {k: v for k, v in om.positions.items() if v},
@@ -281,6 +356,9 @@ canvas{width:100%;height:300px;display:block}
 .legend{display:flex;gap:16px;font-size:11px;color:var(--dim);margin-top:6px}
 .legend b{font-weight:400}
 .k-price{color:var(--amber)}.k-f{color:var(--cyan)}.k-s{color:var(--violet)}
+.k-vwap{color:var(--cyan)}.k-band{color:var(--violet)}.k-stop{color:#E5484D}
+td.pos{color:var(--green)}td.neg{color:var(--red)}
+td.warn{color:#E5B454}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
   gap:10px;margin:14px 0}
 .stat{background:var(--panel);border:1px solid var(--line);border-radius:6px;
@@ -340,27 +418,35 @@ td:first-child,th:first-child{text-align:left}
 </div>
 <div class="stats" id="stats"></div>
 <div class="grid2">
-  <div class="panel"><h2>PRICE / SMA / EMA — LAST 240 TICKS
+  <div class="panel"><h2>PRICE / VWAP / σ BANDS — LAST 240 TICKS
       <select id="csym"></select></h2>
     <canvas id="chart"></canvas>
     <div class="legend"><b class="k-price">— price</b>
-      <b class="k-f">— sma fast</b><b class="k-s">— sma slow</b>
-      <b class="k-f">┄ ema fast</b><b class="k-s">┄ ema slow</b>
+      <b class="k-vwap">— vwap</b><b class="k-band">┄ ±<span class="bk">1</span>σ band</b>
+      <b class="k-stop">·· −<span class="sm">3</span>σ stop</b>
       <b class="buy">▲ buy</b><b class="sell">▼ sell</b></div>
   </div>
-  <div class="panel"><h2>PRICE / SMA / EMA — LAST 240 TICKS
+  <div class="panel"><h2>PRICE / VWAP / σ BANDS — LAST 240 TICKS
       <select id="csym2"></select></h2>
     <canvas id="chart2"></canvas>
     <div class="legend"><b class="k-price">— price</b>
-      <b class="k-f">— sma fast</b><b class="k-s">— sma slow</b>
-      <b class="k-f">┄ ema fast</b><b class="k-s">┄ ema slow</b>
+      <b class="k-vwap">— vwap</b><b class="k-band">┄ ±<span class="bk">1</span>σ band</b>
+      <b class="k-stop">·· −<span class="sm">3</span>σ stop</b>
       <b class="buy">▲ buy</b><b class="sell">▼ sell</b></div>
   </div>
 </div>
+<div class="panel" style="margin-top:14px"><h2>HOLDINGS</h2>
+  <table id="holdtbl"><thead><tr>
+    <th>sym</th><th>qty</th><th>avg cost</th><th>last</th><th>value</th>
+    <th>unreal P&amp;L</th><th>stop</th><th>to stop</th><th>risk</th>
+    <th>anchor vwap</th><th>age</th><th>can sell</th>
+  </tr></thead><tbody id="holdbody"></tbody></table>
+  <div id="holdnote" class="legend"></div>
+</div>
 <div class="panel" style="margin-top:14px"><div id="cmp"></div></div>
 <div class="panel" style="margin-top:14px"><h2>SIGNALS</h2>
-  <table><thead><tr><th>t</th><th>sym</th><th>strat</th><th>side</th>
-  <th>price</th><th>fast</th><th>slow</th><th>outcome</th></tr></thead>
+  <table><thead><tr><th>t</th><th>sym</th><th>side</th>
+  <th>price</th><th>vwap</th><th>outcome</th></tr></thead>
   <tbody id="sigs"></tbody></table>
 </div>
 <div class="panel" style="margin-top:14px"><h2>EVENTS</h2>
@@ -378,48 +464,92 @@ const $=id=>document.getElementById(id);
 const usd=e4=>'$'+(e4/1e4).toFixed(2);
 const money=v=>(v<0?'-':'')+'$'+Math.abs(v).toFixed(2);
 
-function drawChart(canvasId,series,signals){
+function drawChart(canvasId,series,signals,bandK,stopMult){
   const c=$(canvasId),dpr=window.devicePixelRatio||1;
   const W=c.clientWidth,H=c.clientHeight;
   c.width=W*dpr;c.height=H*dpr;
   const g=c.getContext('2d');g.scale(dpr,dpr);g.clearRect(0,0,W,H);
   if(series.length<2)return;
+  // v3.48: each point is [price, vwap, sigma, warmed]. Bands are derived
+  // here rather than server-side so one sigma can drive both the +/-k
+  // signal band and the -N stop line without sending either over the wire.
+  const bk=bandK||1, sm=stopMult||0;
+  const up=pt=>pt[1]+bk*pt[2], dn=pt=>pt[1]-bk*pt[2],
+        stopAt=pt=>pt[1]-sm*pt[2];
   let lo=1/0,hi=-1/0;
   for(const pt of series){lo=Math.min(lo,pt[0]);hi=Math.max(hi,pt[0]);
-    if(pt[3]){lo=Math.min(lo,pt[1],pt[2]);hi=Math.max(hi,pt[1],pt[2]);}
-    if(pt[6]){lo=Math.min(lo,pt[4],pt[5]);hi=Math.max(hi,pt[4],pt[5]);}}
+    if(pt[3]){lo=Math.min(lo,dn(pt),sm?stopAt(pt):dn(pt));
+              hi=Math.max(hi,up(pt));}}
   const pad=(hi-lo)*0.08||1;lo-=pad;hi+=pad;
   const X=i=>i/(series.length-1)*(W-60),Y=v=>H-8-(v-lo)/(hi-lo)*(H-16);
   g.strokeStyle='#232C38';g.fillStyle='#66788E';
   g.font='10px ui-monospace,monospace';g.textAlign='left';
   for(let k=0;k<4;k++){const v=lo+(hi-lo)*k/3,y=Y(v);
     g.beginPath();g.moveTo(0,y);g.lineTo(W-60,y);g.stroke();
-    // usd() (defined above), not a bare toFixed -- matches every other
-    // price on the page ($436.72, not 436.72). Gutter is 60px (was 46)
-    // specifically so a 4-digit price with cents ("$1234.56", ~48px at
-    // this font) has room to fully render instead of clipping against
-    // the canvas edge -- confirmed by measuring actual glyph widths,
-    // not guessed: the old 46px gutter gave "$436.72" alone only 42px,
-    // already tight, and cut off anything priced in four digits.
+    // usd(), not a bare toFixed -- matches every other price on the page.
+    // 60px gutter so a 4-digit price with cents fully renders.
     g.fillText(usd(v),W-56,y+3);}
-  const line=(idx,color,wid,gate,dash)=>{g.strokeStyle=color;g.lineWidth=wid;
+  // trace(valueFn, colour, width, dash): only draws where the VWAP has
+  // warmed up, since an un-warmed sigma is meaningless rather than zero
+  const trace=(fn,color,wid,dash,gated)=>{g.strokeStyle=color;g.lineWidth=wid;
     g.setLineDash(dash||[]);g.beginPath();let started=false;
-    series.forEach((pt,i)=>{if(gate>=0&&!pt[gate])return;
-      const x=X(i),y=Y(pt[idx]);
+    series.forEach((pt,i)=>{if(gated&&!pt[3]){started=false;return;}
+      const x=X(i),y=Y(fn(pt));
       started?g.lineTo(x,y):(g.moveTo(x,y),started=true);});
     g.stroke();g.setLineDash([]);};
-  line(0,'#E5B454',1.6,-1);line(1,'#5CC8FF',1.1,3);line(2,'#B18CFF',1.1,3);
-  line(4,'#5CC8FF',1.0,6,[4,4]);line(5,'#B18CFF',1.0,6,[4,4]);
+  trace(pt=>pt[0],'#E5B454',1.6,null,false);          // price
+  trace(pt=>pt[1],'#5CC8FF',1.3,null,true);           // vwap
+  trace(up,'#B18CFF',1.0,[4,4],true);                 // +k sigma
+  trace(dn,'#B18CFF',1.0,[4,4],true);                 // -k sigma (entry)
+  if(sm>0){trace(stopAt,'#E5484D',1.0,[2,3],true);}   // -N sigma (stop)
   // signal markers: match by price on recent points, newest first
   g.textAlign='center';
   for(const s of signals){
     for(let i=series.length-1;i>=0;i--){
       if(series[i][0]===s.price_e4){
-        const x=X(i),y=Y(s.price_e4),up=s.side===1;
-        g.fillStyle=up?'#4CC38A':'#E5484D';g.beginPath();
-        if(up){g.moveTo(x,y+16);g.lineTo(x-5,y+24);g.lineTo(x+5,y+24);}
+        const x=X(i),y=Y(s.price_e4),isBuy=s.side===1;
+        g.fillStyle=isBuy?'#4CC38A':'#E5484D';g.beginPath();
+        if(isBuy){g.moveTo(x,y+16);g.lineTo(x-5,y+24);g.lineTo(x+5,y+24);}
         else {g.moveTo(x,y-16);g.lineTo(x-5,y-24);g.lineTo(x+5,y-24);}
         g.closePath();g.fill();break;}}}
+}
+
+function renderHoldings(hs){
+  const b=$('holdbody');
+  if(!hs||!hs.length){
+    b.innerHTML='<tr><td colspan="12" style="color:var(--dim)">'+
+      'no open positions</td></tr>';
+    $('holdnote').textContent='';return;}
+  const sgn=v=>(v>0?'pos':(v<0?'neg':''));
+  b.innerHTML=hs.map(h=>{
+    const stop=h.stop_e4==null?'—':usd(h.stop_e4);
+    const toStop=h.to_stop_pct==null?'—':h.to_stop_pct.toFixed(2)+'%';
+    // under 1% of headroom left is worth flagging: the stop is close
+    const nearStop=h.to_stop_pct!=null&&h.to_stop_pct<1.0;
+    const risk=h.risk==null?'—':'$'+h.risk.toFixed(2);
+    const anch=h.anchor_e4==null?'—':usd(h.anchor_e4);
+    const age=h.same_day==null?'—':(h.same_day?'today':'held over');
+    const sell=h.sell_ok==null?'—':(h.sell_ok?'yes':'gated');
+    return '<tr><td>'+h.symbol+'</td><td>'+h.qty+'</td>'+
+      '<td>'+usd(h.avg_e4)+'</td><td>'+usd(h.last_e4)+'</td>'+
+      '<td>$'+h.value.toFixed(2)+'</td>'+
+      '<td class="'+sgn(h.unreal)+'">$'+h.unreal.toFixed(2)+
+        (h.unreal_pct==null?'':' ('+h.unreal_pct.toFixed(2)+'%)')+'</td>'+
+      '<td>'+stop+'</td>'+
+      '<td class="'+(nearStop?'warn':'')+'">'+toStop+'</td>'+
+      '<td>'+risk+'</td><td>'+anch+'</td>'+
+      '<td class="'+(h.same_day===false?'warn':'')+'">'+age+'</td>'+
+      '<td class="'+(h.sell_ok===false?'warn':'')+'">'+sell+'</td></tr>';
+  }).join('');
+  const totRisk=hs.reduce((a,h)=>a+(h.risk||0),0);
+  const totVal=hs.reduce((a,h)=>a+h.value,0);
+  const totUn=hs.reduce((a,h)=>a+h.unreal,0);
+  $('holdnote').textContent=
+    hs.length+' position(s) · $'+totVal.toFixed(2)+' at risk of market · '+
+    'unrealized $'+totUn.toFixed(2)+' · '+
+    'total loss if every stop fired: $'+totRisk.toFixed(2)+
+    ' · "can sell" is the anchored-VWAP gate: a position held overnight '+
+    'can only be sold at or above its own anchor, unless the stop fires';
 }
 
 function stat(label,val,cls){return '<div class="stat '+(cls||'')+'">'+
@@ -476,7 +606,7 @@ async function poll(){
       slotsSeeded=true;}
     $('sym').textContent=s.symbol+' · up '+
       Math.floor(s.uptime_s/60)+'m'+(s.uptime_s%60)+'s';
-    $('warm').textContent=s.warmed_up?'SMA windows full':
+    $('warm').textContent=s.warmed_up?'VWAP warmed up':
       'warming up '+s.fill+'/'+s.slow_n;
     $('led0').classList.toggle('on',s.led.trouble);
     $('led1').classList.toggle('on',s.led.activity);
@@ -497,8 +627,14 @@ async function poll(){
       stat('RTT µs',s.rtt?s.rtt.med+' ('+s.rtt.min+'–'+s.rtt.max+')':'—')+
       stat('ECHO / SENT',s.echoes+' / '+s.sent,
            s.echoes===s.sent?'':'bad');
-    drawChart('chart',s.series,s.chart_signals);
-    drawChart('chart2',s2.series,s2.chart_signals);
+    drawChart('chart',s.series,s.chart_signals,s.band_k,s.stop_mult);
+    drawChart('chart2',s2.series,s2.chart_signals,s2.band_k,s2.stop_mult);
+    renderHoldings(s.holdings);
+    // legend reflects the RUNNING config, not hardcoded multipliers
+    document.querySelectorAll('.bk').forEach(e=>{
+      e.textContent=(s.band_k||1).toFixed(s.band_k%1?2:0);});
+    document.querySelectorAll('.sm').forEach(e=>{
+      e.textContent=(s.stop_mult||0).toFixed(s.stop_mult%1?1:0);});
     if(s.strategies&&s.strategies.length)
       $('cmp').innerHTML='<table><thead><tr><th>strategy</th><th>signals'+
         '</th><th>trips</th><th>wins</th><th>blocked/gated</th>'+
@@ -510,11 +646,9 @@ async function poll(){
         '</td></tr>').join('')+'</tbody></table>';
     $('sigs').innerHTML=s.signals.map(x=>'<tr><td>'+x.t+'</td>'+
       '<td>'+x.symbol+'</td>'+
-      '<td>'+x.strategy.toUpperCase()+'</td>'+
       '<td class="'+(x.side===1?'buy">BUY':'sell">SELL')+'</td>'+
       '<td>'+usd(x.price_e4)+'</td>'+
-      '<td>'+(x.sma_fast==null?'—':usd(x.sma_fast))+'</td>'+
-      '<td>'+(x.sma_slow==null?'—':usd(x.sma_slow))+'</td>'+
+      '<td>'+(x.vwap==null?'—':usd(x.vwap))+'</td>'+
       '<td class="outcome '+(x.outcome.startsWith('FILLED')?'buy':
                      x.outcome.startsWith('rejected')?'sell':'')+
       '" style="'+(x.outcome.startsWith('blocked')||
