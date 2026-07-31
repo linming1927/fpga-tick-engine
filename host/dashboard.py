@@ -97,7 +97,8 @@ class DashboardServer:
             self._last_echo_t = time.time()
 
     def on_signal(self, fr: dict, outcome: str = "",
-                  trade_pnl_e4: int | None = None):
+                  trade_pnl_e4: int | None = None,
+                  fill_qty: int | None = None):
         # v3.48: VWAP-bounce only. SMA and EMA are still scored in the
         # background and still appear in the end-of-session report --
         # they are just not reported HERE any more, so the signals
@@ -115,6 +116,11 @@ class DashboardServer:
                   # own result, not the session total. None for buys and
                   # for signals that never filled.
                   "trade_pnl_e4": trade_pnl_e4,
+                  # v3.54: shares actually FILLED. Not the quantity the
+                  # strategy asked for -- the caps trim rather than
+                  # reject, so a risk-sized 40 routinely becomes a
+                  # filled 15, and only the filled number is real.
+                  "fill_qty": fill_qty,
                   "outcome": outcome}
             self._signals.appendleft(rec)
             sym = rec["symbol"]
@@ -451,7 +457,8 @@ td:first-child,th:first-child{text-align:left}
 <div class="panel" style="margin-top:14px"><div id="cmp"></div></div>
 <div class="panel" style="margin-top:14px"><h2>SIGNALS</h2>
   <table><thead><tr><th>t</th><th>sym</th><th>side</th>
-  <th>price</th><th>vwap</th><th>P&amp;L</th><th>outcome</th></tr></thead>
+  <th>price</th><th>shares</th><th>vwap</th><th>P&amp;L</th>
+  <th>outcome</th></tr></thead>
   <tbody id="sigs"></tbody></table>
 </div>
 <div class="panel" style="margin-top:14px"><h2>EVENTS</h2>
@@ -654,6 +661,7 @@ async function poll(){
       '<td>'+x.symbol+'</td>'+
       '<td class="'+(x.side===1?'buy">BUY':'sell">SELL')+'</td>'+
       '<td>'+usd(x.price_e4)+'</td>'+
+      '<td>'+(x.fill_qty==null?'—':x.fill_qty)+'</td>'+
       '<td>'+(x.vwap==null?'—':usd(x.vwap))+'</td>'+
       '<td class="'+(x.trade_pnl_e4==null?'':
         (x.trade_pnl_e4>=0?'buy':'sell'))+'">'+

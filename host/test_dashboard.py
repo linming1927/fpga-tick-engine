@@ -291,13 +291,13 @@ print("[G_pnl] SELL rows carry the round trip's own realized P&L, and "
 
 dash.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000, "symbol": "SPY",
                 "strategy": "vwap_bounce", "vwap": 1_010_000},
-               outcome="FILLED", trade_pnl_e4=None)
+               outcome="FILLED", trade_pnl_e4=None, fill_qty=7)
 dash.on_signal({"side": SIDE_SELL, "price_e4": 1_100_000, "symbol": "SPY",
                 "strategy": "vwap_bounce", "vwap": 1_010_000},
-               outcome="FILLED", trade_pnl_e4=123_456)
+               outcome="FILLED", trade_pnl_e4=123_456, fill_qty=4)
 dash.on_signal({"side": SIDE_SELL, "price_e4": 900_000, "symbol": "SPY",
                 "strategy": "vwap_bounce", "vwap": 1_010_000},
-               outcome="FILLED", trade_pnl_e4=-45_000)
+               outcome="FILLED", trade_pnl_e4=-45_000, fill_qty=4)
 dash.on_signal({"side": SIDE_SELL, "price_e4": 950_000, "symbol": "SPY",
                 "strategy": "vwap_bounce", "vwap": 1_010_000},
                outcome="blocked: cooldown (1.0s < 60.0s)")
@@ -313,9 +313,16 @@ check("a signal that never filled carries none either, so the column "
      "cannot imply a trip that did not happen",
      sig_pnl[0]["trade_pnl_e4"], None)
 
+check("a filled BUY row carries the share count -- the ask that "
+     "prompted this column", sig_pnl[3]["fill_qty"], 7)
+check("a filled SELL row carries it too", sig_pnl[2]["fill_qty"], 4)
+check("a blocked signal carries none, so the column never shows shares "
+     "for an order that did not happen", sig_pnl[0]["fill_qty"], None)
+
 page_pnl = get("/").decode()
 check("the signals table has a P&L column", "<th>P&amp;L</th>" in page_pnl,
       True)
+check("...and a shares column", "<th>shares</th>" in page_pnl, True)
 check("the VERIFIED tile is gone -- it counts fabric signals matched "
      "against the host mirror, which means nothing on the direct "
      "in-process engine", "stat('VERIFIED'" in page_pnl, False)

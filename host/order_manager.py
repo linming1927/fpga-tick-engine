@@ -735,6 +735,11 @@ class OrderManager:
         # in e4. None after a buy. Read by the dashboard so a
         # signal row can show what the trip actually made.
         self.last_trade_pnl_e4 = None
+        # v3.54: shares in the most recent fill. The FILLED quantity,
+        # not the requested one -- with the caps trimming rather than
+        # rejecting, those two routinely differ and only the filled
+        # number reflects what actually happened.
+        self.last_fill_qty = None
         # v3.50: symbol -> {order_id, qty, side, price_e4, t}
         # for orders that were submitted but never confirmed
         # filled. Kept OUT of self.positions on purpose: the
@@ -1002,6 +1007,7 @@ class OrderManager:
         trade_pnl_e4 = (self.costs.realized_pnl_e4 - _pnl_before
                         if verb == "sell" else None)
         self.last_trade_pnl_e4 = trade_pnl_e4
+        self.last_fill_qty = qty
         self._audit("order_filled", symbol=sym, side=verb, qty=qty,
                     trade_pnl_e4=trade_pnl_e4,
                     fill_price_e4=fill_e4, order_id=order_id,
@@ -1233,6 +1239,7 @@ class OrderManager:
         trade_pnl_e4 = (self.costs.realized_pnl_e4 - _pnl_before
                         if verb == "sell" else None)
         self.last_trade_pnl_e4 = trade_pnl_e4
+        self.last_fill_qty = qty
         self._audit("order_filled", **fill,
                     position_qty=self.positions[sym], fees=fees,
                     trade_pnl_e4=trade_pnl_e4,
@@ -2157,7 +2164,9 @@ def main():
             # for buys and for anything that did not fill.
             dash.on_signal(fr, outcome,
                            trade_pnl_e4=(om.last_trade_pnl_e4
-                                         if outcome == "FILLED" else None))
+                                         if outcome == "FILLED" else None),
+                           fill_qty=(om.last_fill_qty
+                                     if outcome == "FILLED" else None))
 
     def on_divergence(info):
         if dash:

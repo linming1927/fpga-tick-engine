@@ -2425,6 +2425,31 @@ check("...and the session total really is still positive, proving the "
      "two are different numbers",
      om34.costs.realized_pnl_e4 > 0, True)
 
+check("a BUY fill records how many shares actually filled",
+      om34.last_fill_qty, 10)
+
+# the number must be what FILLED, not what was asked for. With the caps
+# trimming instead of rejecting (v3.47), those differ constantly -- a
+# risk-sized 40 becoming a filled 15 was exactly the real session that
+# prompted the pending-order work.
+_d34t = tempfile.mkdtemp()
+b34t = MockBroker()
+om34t = OrderManager(b34t, ["SPY"],
+                     RiskLimits(order_qty=50, require_market_hours=False,
+                                cooldown_s=0.0,
+                                max_notional_e4=to_e4(500.0),
+                                max_position_notional_e4=10**12),
+                     audit_path=os.path.join(_d34t, "a.jsonl"),
+                     killfile=os.path.join(_d34t, "om.kill"))
+om34t.on_signal({"side": SIDE_BUY, "price_e4": 100_0000, "symbol": "SPY",
+                 "strategy": "sma"})
+check("50 shares of a $100 stock is $5,000 against a $500 order cap, so "
+      "the cap trims it to 5 -- and the recorded figure is the FILLED 5, "
+      "not the requested 50",
+      om34t.last_fill_qty, 5)
+check("...matching the position the broker actually took on",
+      b34t.get_position_qty("SPY"), 5)
+
 _fills34 = [_json.loads(l) for l in
             open(os.path.join(_d34, "a.jsonl"))
             if '"order_filled"' in l]
