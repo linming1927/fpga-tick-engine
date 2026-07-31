@@ -645,6 +645,7 @@ check("ungated scorecard: buy-while-open is reported as ignored, "
 print("[G14] a real restart (two subprocess sessions, same audit file) "
      "resumes EMA and SMA-profit-gated's numbers instead of resetting them")
 import subprocess, re
+import inspect
 d14 = tempfile.mkdtemp()
 audit14 = os.path.join(d14, "a.jsonl")
 
@@ -2458,6 +2459,69 @@ check("every fill is audited with trade_pnl_e4",
 check("...None on the buys", [f["trade_pnl_e4"] for f in _fills34][0], None)
 check("...and the realized figure on the sells",
       [f["trade_pnl_e4"] for f in _fills34][1], (110_0000 - 100_0000) * 10)
+
+# ---- v3.55: clock disagreement must not lock the cooldown on ---------
+print("[G35] v3.55: a last_order_t in the FUTURE must not block forever, "
+     "and a backtest must not inherit a previous run's state. Both from "
+     "one real incident: the audit log stamps fills with WALL-CLOCK "
+     "time, a backtest runs on a HISTORICAL clock, so restoring "
+     "'today's' fills into a replay of last year set last_order_t about "
+     "a year ahead of now -- gap went negative, negative is always < the "
+     "cooldown, and every signal blocked for the entire run. Three real "
+     "runs across two symbols each reported an identical 815 trips / "
+     "$12,586.52 because none of them traded at all; the numbers were "
+     "purely what the previous run had left in the audit log")
+
+_lim35 = RiskLimits(order_qty=5, require_market_hours=False,
+                    cooldown_s=60.0, max_notional_e4=10**12,
+                    max_position_notional_e4=10**12)
+_p35 = RiskPolicy(_lim35)
+_p35.last_order_t = time.time() + 365 * 86_400        # a year in the future
+check("a future last_order_t does NOT block -- the old test compared a "
+     "negative gap against the cooldown and blocked on every signal "
+     "forever, with no way out",
+     _p35.evaluate(SIDE_BUY, 0, 100_0000)[0], True)
+
+_p35b = RiskPolicy(_lim35)
+_p35b.last_order_t = time.time() - 1.0                # genuinely recent
+check("...while a genuinely recent order still blocks normally",
+      _p35b.evaluate(SIDE_BUY, 0, 100_0000)[0], False)
+_p35c = RiskPolicy(_lim35)
+_p35c.last_order_t = time.time() - 3600.0             # long past
+check("...and an old one does not", _p35c.evaluate(SIDE_BUY, 0, 100_0000)[0],
+      True)
+
+# restore_state=False: a backtest starts clean every time
+_d35 = tempfile.mkdtemp()
+_a35 = os.path.join(_d35, "a.jsonl")
+with open(_a35, "w") as f:
+    for _side in ("buy", "sell"):
+        f.write(_json.dumps({"t": int(time.time()*1_000_000), "event": "order_filled",
+                             "symbol": "SPY", "side": _side, "qty": 5,
+                             "fill_price_e4": 100_0000}) + "\n")
+
+_om35r = OrderManager(MockBroker(), ["SPY"], _lim35, audit_path=_a35,
+                      killfile=os.path.join(_d35, "k1.kill"))
+check("a LIVE session still restores today's fills across a restart -- "
+     "that is the whole point there",
+     _om35r.policy.orders_today, 2)
+check("...including the cooldown anchor", _om35r.policy.last_order_t > 0,
+      True)
+
+_om35f = OrderManager(MockBroker(), ["SPY"], _lim35, audit_path=_a35,
+                      killfile=os.path.join(_d35, "k2.kill"),
+                      restore_state=False)
+check("restore_state=False ignores them entirely, so a backtest is "
+     "reproducible and independent of whatever ran before it",
+     _om35f.policy.orders_today, 0)
+check("...no inherited cooldown anchor", _om35f.policy.last_order_t, 0.0)
+check("...and no inherited P&L, which is what made consecutive runs "
+     "report the earlier run's numbers unchanged",
+     _om35f.costs.realized_pnl_e4, 0)
+
+import backtest as _bt35
+check("backtest.py opts out, so every run starts clean",
+      "restore_state=False" in inspect.getsource(_bt35.run_backtest), True)
 
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")

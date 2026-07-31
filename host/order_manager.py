@@ -651,7 +651,20 @@ class RiskPolicy:
         if self.orders_today >= lim.max_orders_per_day:
             return False, f"daily order cap ({lim.max_orders_per_day}) reached", 0
         gap = now.timestamp() - self.last_order_t
-        if self.last_order_t and gap < lim.cooldown_s:
+        # v3.55: `0 <= gap` matters. A NEGATIVE gap means last_order_t sits
+        # in the future relative to this policy's clock, and the old test
+        # blocked on it forever -- every signal, for the entire run, with
+        # no way out. It happens whenever the two clocks disagree: the
+        # audit log stamps fills with WALL-CLOCK time, while a backtest
+        # runs on a historical clock at the tick timestamps. Restoring
+        # "today's" fills into a replay of last year therefore set
+        # last_order_t about a year AHEAD of now, and the cooldown never
+        # expired. Observed on real runs: 1,247,326 signals, 1,247,326
+        # blocked, 100% cooldown, zero fills -- while the reported P&L
+        # and trip count were just the restored numbers from the previous
+        # run, unchanged. A future timestamp is nonsense in any context,
+        # so treat the cooldown as satisfied rather than trusting it.
+        if self.last_order_t and 0 <= gap < lim.cooldown_s:
             return False, f"cooldown ({gap:.1f}s < {lim.cooldown_s}s)", 0
 
         if side == SIDE_BUY:
@@ -720,7 +733,8 @@ class OrderManager:
     def __init__(self, broker, symbols, limits: RiskLimits,
                  audit_path: str = "om_audit.jsonl",
                  killfile: str = "om.kill",
-                 risk_overlay=None, vwap_models: dict | None = None):
+                 risk_overlay=None, vwap_models: dict | None = None,
+                 restore_state: bool = True):
         self.broker = broker
         if isinstance(symbols, str):
             symbols = [symbols]
@@ -787,6 +801,16 @@ class OrderManager:
         # prior day's buy that established its true cost basis had been
         # discarded along with everything else from before today.
         prior_fills, todays_fills = _load_fills_split_by_today(audit_path)
+        if not restore_state:
+            # v3.55: a BACKTEST must be reproducible and independent of
+            # whatever ran before it. Inheriting a previous run's P&L,
+            # trip count and daily order count made consecutive runs
+            # report the earlier run's numbers unchanged -- three real
+            # runs across two different symbols all reported an
+            # identical 815 trips / $12,586.52, because none of them
+            # traded at all. Live sessions still restore: resuming
+            # today's totals across a restart is the whole point there.
+            prior_fills, todays_fills = [], []
         # v3.51: when each still-open position actually opened, for the
         # risk overlay to adopt once main() has wired one up
         self.position_open_dates = _position_open_dates(prior_fills

@@ -155,8 +155,13 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
     # --broker mock session -- no slippage, no partial fills, exactly
     # as honest (or not) as the old scored rows always were.
     broker = MockBroker()
+    # v3.55: restore_state=False -- a backtest starts clean every time.
+    # Sharing the default audit file across runs made each run inherit
+    # the previous one's P&L, trip count and daily order count, and a
+    # restored wall-clock last_order_t against this historical clock
+    # locked the cooldown on permanently.
     om = OrderManager(broker, [symbol], limits, audit_path=audit_path,
-                      killfile=killfile)
+                      killfile=killfile, restore_state=False)
     om.policy._now_fn = HistoricalClock()   # historical time, not wall
                                             # clock -- same trick every
                                             # other row here already uses
