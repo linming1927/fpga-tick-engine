@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -253,26 +254,107 @@ class BrokerError(Exception):
     pass
 
 
-class MockBroker:
-    """Instant fills at the signal price; injectable rejections for tests."""
+class OrderPending(Exception):
+    """v3.50: a submitted order did NOT confirm as filled inside the
+    poll window. It is not a rejection -- the order is live at the
+    broker and may still fill, partially or fully, at a price nobody
+    knows yet.
 
-    def __init__(self, reject_next: int = 0):
+    Deliberately NOT a subclass of BrokerError: every existing
+    `except BrokerError` treats its catch as a failed order and counts
+    it toward the kill switch, which is the opposite of what should
+    happen here.
+
+    This replaces submit_market_order()'s old behaviour of INVENTING a
+    fill when the poll expired -- returning the signal price as the
+    fill price with a "note". The caller took that at face value, so
+    the position and the cost basis both moved for shares that did not
+    exist yet. Real consequence, from a real session: two NVDA buys
+    "filled" that way, our books said 25 shares, the broker actually
+    had 7, and the next SELL was rejected as a wash trade against the
+    still-open buy -- three times in one second, tripping the kill
+    switch. 31 of 1,125 fills in that audit log were invented this way,
+    each also recording a fabricated price.
+    """
+
+    def __init__(self, order_id: str, symbol: str, qty: int, side: str):
+        self.order_id = order_id
+        self.symbol = symbol
+        self.qty = qty
+        self.side = side
+        super().__init__(f"order {order_id} ({side} {qty} {symbol}) still "
+                         f"open after the poll window -- NOT counted as a "
+                         f"fill")
+
+
+class MockBroker:
+    """Instant fills at the signal price; injectable rejections for tests.
+
+    v3.50: also injectable PENDING outcomes (pending_next) plus
+    get_order/cancel_order, so the pending-order path can be tested
+    without a real broker. A pending order is tracked here exactly as
+    Alpaca would: live, unfilled, and in the way of an opposite-side
+    order on the same symbol until it is resolved or cancelled.
+    """
+
+    def __init__(self, reject_next: int = 0, pending_next: int = 0,
+                 wash_on_opposite: bool = False):
         self.positions: dict[str, int] = {}
         self.fills: list[dict] = []
         self.reject_next = reject_next     # tests: fail this many submissions
+        self.pending_next = pending_next   # tests: leave this many unfilled
+        self.wash_on_opposite = wash_on_opposite   # tests: reject an
+                                                   # opposite-side order
+                                                   # while one is open,
+                                                   # the way Alpaca does
+        self.open_orders: dict[str, dict] = {}     # order_id -> order
+        self._next_id = 1
 
     def get_position_qty(self, symbol: str) -> int:
         return self.positions.get(symbol, 0)
+
+    def get_order(self, order_id: str) -> dict:
+        o = self.open_orders.get(order_id)
+        return o if o else {"id": order_id, "status": "canceled"}
+
+    def cancel_order(self, order_id: str) -> bool:
+        self.open_orders.pop(order_id, None)
+        return True
+
+    def list_open_orders(self) -> list[dict]:
+        return list(self.open_orders.values())
+
+    def cancel_all_open_orders(self) -> list[dict]:
+        out = [{"id": i, "status": "canceled"} for i in self.open_orders]
+        self.open_orders.clear()
+        return out
 
     def submit_market_order(self, symbol: str, qty: int, side: str,
                             ref_price_e4: int) -> dict:
         if self.reject_next > 0:
             self.reject_next -= 1
             raise BrokerError("mock rejection (injected)")
+        if self.wash_on_opposite:
+            for o in self.open_orders.values():
+                if o["symbol"] == symbol and o["side"] != side:
+                    raise BrokerError(
+                        'POST /v2/orders: HTTP 403 {"code":40310000,'
+                        f'"existing_order_id":"{o["id"]}",'
+                        '"message":"potential wash trade detected. use '
+                        'complex orders","reject_reason":"opposite side '
+                        'market/stop order exists"}')
+        oid = f"mock-{self._next_id}"
+        self._next_id += 1
+        if self.pending_next > 0:
+            self.pending_next -= 1
+            self.open_orders[oid] = {"id": oid, "symbol": symbol, "qty": qty,
+                                     "side": side, "status": "new"}
+            raise OrderPending(oid, symbol, qty, side)
         self.positions[symbol] = self.positions.get(symbol, 0) + \
             (qty if side == "buy" else -qty)
         fill = {"symbol": symbol, "qty": qty, "side": side,
-                "fill_price_e4": ref_price_e4, "t": now_us()}
+                "fill_price_e4": ref_price_e4, "order_id": oid,
+                "t": now_us()}
         self.fills.append(fill)
         return fill
 
@@ -343,9 +425,30 @@ class _AlpacaREST:
             if o.get("status") in ("rejected", "canceled", "expired"):
                 raise BrokerError(f"order {oid} ended {o['status']}")
             time.sleep(0.25)
-        return {"symbol": symbol, "qty": qty, "side": side,
-                "fill_price_e4": ref_price_e4, "order_id": oid,
-                "t": now_us(), "note": "fill not confirmed within poll window"}
+        # v3.50: the poll expired with the order still live. It used to
+        # return a synthetic fill here (ref_price_e4 + a "note"), which
+        # the caller then applied to the position and the cost basis --
+        # see OrderPending's docstring for what that cost in practice.
+        # Raise instead, and let the caller track it as pending.
+        raise OrderPending(oid, symbol, qty, side)
+
+    def get_order(self, order_id: str) -> dict:
+        """v3.50: current state of one order, for resolving a pending
+        submission before touching that symbol again."""
+        return self._req("GET", f"/v2/orders/{order_id}")
+
+    def cancel_order(self, order_id: str) -> bool:
+        """v3.50: cancel ONE order. cancel_all_open_orders() already
+        existed but is far too blunt mid-session -- it would also kill
+        orders on unrelated symbols, and any the user placed by hand."""
+        try:
+            self._req("DELETE", f"/v2/orders/{order_id}")
+            return True
+        except BrokerError as e:
+            # 404 (already gone) and 422 (already filled/cancelled) both
+            # mean "it is no longer in the way", which is what the
+            # caller actually cares about
+            return "HTTP 404" in str(e) or "HTTP 422" in str(e)
 
 
 class AlpacaPaperBroker(_AlpacaREST):
@@ -598,6 +701,11 @@ class OrderManager:
         self.halted = False
         self.halt_reason = ""
         self.consecutive_rejects = 0
+        # v3.50: symbol -> {order_id, qty, side, price_e4, t}
+        # for orders that were submitted but never confirmed
+        # filled. Kept OUT of self.positions on purpose: the
+        # shares do not exist until the broker says so.
+        self.pending_orders: dict[str, dict] = {}
         self.orders = 0
         self.blocked = 0
         self.costs = CostTracker()
@@ -727,6 +835,128 @@ class OrderManager:
         return self.positions.get(self.symbol, 0)
 
     # ---- the signal path ---------------------------------------------------------
+    def _resolve_pending(self, sym: str, before_side: str = None) -> None:
+        """v3.50: settle a previously-unconfirmed order on `sym` before
+        doing anything else with that symbol.
+
+        Three outcomes, all of which end with nothing outstanding:
+          * it filled after all -> apply it now, at the price the broker
+            actually got, not the signal price we would have guessed
+          * still working -> cancel it, so it cannot collide with what we
+            are about to send (this is the wash-trade trigger)
+          * already gone (cancelled/expired/rejected) -> just forget it
+        """
+        p = self.pending_orders.get(sym)
+        if not p:
+            return
+        get_order = getattr(self.broker, "get_order", None)
+        if get_order is None:                 # broker too simple to ask
+            self.pending_orders.pop(sym, None)
+            return
+        try:
+            o = get_order(p["order_id"])
+        except Exception as e:                # never let reconciliation
+            print(f"[om] could not check pending {sym} order "   # itself
+                  f"{p['order_id']}: {e}")                       # halt us
+            return
+        status = (o or {}).get("status", "")
+        filled_qty = int(float((o or {}).get("filled_qty") or 0))
+
+        if status == "filled" or filled_qty >= p["qty"]:
+            px = float((o or {}).get("filled_avg_price") or 0)
+            fill_e4 = int(round(px * 10_000)) or p["price_e4"]
+            self._apply_fill(sym, p["side"], p["qty"], fill_e4,
+                             p["order_id"], late=True)
+            self.pending_orders.pop(sym, None)
+            return
+
+        if status in ("canceled", "expired", "rejected"):
+            self._audit("pending_resolved", symbol=sym,
+                        order_id=p["order_id"], outcome=status,
+                        filled_qty=filled_qty)
+            print(f"[om] pending {sym} order {p['order_id']} ended "
+                  f"{status} — nothing to apply")
+            self.pending_orders.pop(sym, None)
+            return
+
+        # still live. Partial fills count for what actually filled.
+        if filled_qty > 0:
+            px = float((o or {}).get("filled_avg_price") or 0)
+            fill_e4 = int(round(px * 10_000)) or p["price_e4"]
+            self._apply_fill(sym, p["side"], filled_qty, fill_e4,
+                             p["order_id"], late=True, partial=True)
+        cancel = getattr(self.broker, "cancel_order", None)
+        ok = bool(cancel and cancel(p["order_id"]))
+        self._audit("pending_resolved", symbol=sym, order_id=p["order_id"],
+                    outcome="cancelled" if ok else "cancel_failed",
+                    filled_qty=filled_qty)
+        print(f"[om] pending {sym} order {p['order_id']} was still open "
+              f"({filled_qty}/{p['qty']} filled) — "
+              f"{'cancelled' if ok else 'COULD NOT CANCEL'} before "
+              f"sending the next order")
+        self.pending_orders.pop(sym, None)
+
+    def _apply_fill(self, sym: str, verb: str, qty: int, fill_e4: int,
+                    order_id: str, late: bool = False,
+                    partial: bool = False) -> None:
+        """Book a fill that really happened: position, cost basis, audit."""
+        self.positions[sym] = self.positions.get(sym, 0) + \
+            (qty if verb == "buy" else -qty)
+        fees = self.costs.on_fill(verb, qty, fill_e4, sym)
+        self._audit("order_filled", symbol=sym, side=verb, qty=qty,
+                    fill_price_e4=fill_e4, order_id=order_id,
+                    position_qty=self.positions[sym], fees=fees,
+                    realized_pnl_e4=self.costs.realized_pnl_e4,
+                    late=late, partial=partial)
+        fee_str = f"  fees ${fees['total']:.2f}" if fees else ""
+        tag = " (late" + (", partial)" if partial else ")") if late else ""
+        print(f"[om] FILLED{tag} {verb.upper()} {qty} {sym} @ "
+              f"${dollars(fill_e4):.4f}  -> position "
+              f"{self.positions[sym]}{fee_str}")
+
+    _WASH_MARKERS = ("wash trade", "opposite side")
+
+    def _submit_with_wash_recovery(self, sym: str, qty: int, verb: str,
+                                   price_e4: int) -> dict:
+        """v3.50: a wash-trade 403 is not "the broker is broken" -- it is
+        "you already have a conflicting order live", which is
+        self-inflicted and recoverable. Alpaca even hands back the
+        offending existing_order_id. Cancel that order and retry ONCE;
+        only if the retry also fails does it count as a real rejection
+        toward the kill switch.
+
+        Without this, three identical wash-trade rejections in one second
+        looked like a broker meltdown and halted the session -- three
+        times in this project's history, always minutes after the open.
+        """
+        try:
+            return self.broker.submit_market_order(sym, qty, verb, price_e4)
+        except BrokerError as e:
+            msg = str(e)
+            if not any(m in msg.lower() for m in self._WASH_MARKERS):
+                raise
+            oid = None
+            m = re.search(r'"existing_order_id"\s*:\s*"([^"]+)"', msg)
+            if m:
+                oid = m.group(1)
+            cancel = getattr(self.broker, "cancel_order", None)
+            cancelled = False
+            if oid and cancel:
+                try:
+                    cancelled = bool(cancel(oid))
+                except Exception:
+                    cancelled = False
+            self._audit("wash_recovery", symbol=sym, side=verb, qty=qty,
+                        existing_order_id=oid, cancelled=cancelled)
+            _outcome = ("cancelled it, retrying once" if cancelled
+                        else "could not cancel it")
+            print(f"[om] {sym} {verb.upper()} hit a wash-trade rejection "
+                  f"against order {oid or '(id not reported)'} — "
+                  f"{_outcome}")
+            if not cancelled:
+                raise
+            return self.broker.submit_market_order(sym, qty, verb, price_e4)
+
     def on_signal(self, fr: dict) -> str:
         """Callback for VERIFIED FPGA signals (bridge SignalVerifier).
         Returns a short status string describing what happened to this
@@ -743,6 +973,15 @@ class OrderManager:
             self._audit("blocked", reason=f"halted: {self.halt_reason}",
                         symbol=sym, side=side, price_e4=price_e4)
             return f"blocked: halted: {self.halt_reason}"
+
+        # v3.50: settle any unconfirmed order on this symbol BEFORE the
+        # risk gate runs, not just before submitting. If it filled late,
+        # self.positions is wrong until we book it -- and a stale zero
+        # would get a perfectly legitimate SELL blocked as "flat
+        # (long-only: nothing to sell)", leaving a real position with no
+        # way out. Gating has to see the true position.
+        if self.pending_orders.get(sym):
+            self._resolve_pending(sym)
 
         # v3.38: the risk overlay only applies to the vwap_bounce
         # strategy (stop/anchor concepts are inherently VWAP-based;
@@ -838,13 +1077,36 @@ class OrderManager:
             return f"blocked: {reason}"
 
         verb = "buy" if side == SIDE_BUY else "sell"
+
         self._audit("order_submit", symbol=sym, side=verb, qty=qty,
                     price_e4=price_e4)
         try:
-            fill = self.broker.submit_market_order(sym, qty, verb,
-                                                   price_e4)
+            fill = self._submit_with_wash_recovery(sym, qty, verb, price_e4)
+        except OrderPending as p:
+            # NOT a fill and NOT a rejection. Record it, leave the
+            # position and the cost basis alone, and start the cooldown
+            # so the strategy does not immediately fire again into an
+            # order that is still working.
+            self.pending_orders[sym] = {"order_id": p.order_id, "qty": p.qty,
+                                        "side": p.side,
+                                        "price_e4": price_e4,
+                                        "t": now_us()}
+            self.policy.record_order()
+            self._audit("order_pending", symbol=sym, side=verb, qty=qty,
+                        price_e4=price_e4, order_id=p.order_id)
+            print(f"[om] {sym} {verb.upper()} {qty} PENDING (order "
+                  f"{p.order_id} still open) — position unchanged; it "
+                  f"will be reconciled before the next order on {sym}")
+            return f"pending: {p.order_id}"
         except BrokerError as e:
             self.consecutive_rejects += 1
+            # v3.50: a rejection now starts the cooldown too. record_order()
+            # used to run ONLY on the success path, so a rejected order left
+            # last_order_t untouched and the very next tick retried
+            # immediately -- three identical rejections inside one second,
+            # the entire kill-switch budget spent on one conflict while a
+            # 60s cooldown was configured and doing nothing.
+            self.policy.record_order()
             self._audit("order_rejected", error=str(e),
                         consecutive=self.consecutive_rejects)
             print(f"[om] order rejected: {e}")

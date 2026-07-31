@@ -2169,6 +2169,117 @@ check("...and at least one fill was bigger than a single share, "
      "than the degenerate empty-mirror fallback that always returns 1",
      any(q > 1 for q in _f_om), True)
 
+# ---- v3.50: unconfirmed orders, wash-trade recovery, reject cooldown --
+print("[G32] v3.50: an order that does not confirm inside the poll "
+     "window is PENDING, not a fill. Diagnosed from a real halted "
+     "session: submit_market_order() used to INVENT a fill when the "
+     "poll expired -- returning the signal price with a 'note' -- and "
+     "the caller booked it. Two NVDA buys 'filled' that way, our books "
+     "said 25 shares, the broker actually had 7, and the next SELL was "
+     "rejected as a wash trade against the still-open buy, three times "
+     "in one second, tripping the kill switch. All three such kills in "
+     "that log landed within five minutes of the open, when fills are "
+     "slowest and the window expires most often")
+
+_G32_LIM = dict(order_qty=5, require_market_hours=False, cooldown_s=60.0,
+                max_notional_e4=10**12, max_position_notional_e4=10**12)
+
+
+def _g32_om(**broker_kw):
+    d = tempfile.mkdtemp()
+    b = MockBroker(**broker_kw)
+    o = OrderManager(b, ["NVDA"], RiskLimits(**_G32_LIM),
+                     audit_path=os.path.join(d, "a.jsonl"),
+                     killfile=os.path.join(d, "om.kill"))
+    return o, b
+
+
+def _g32_buy(o, px=1_933_550):
+    return o.on_signal({"side": SIDE_BUY, "price_e4": px,
+                        "symbol": "NVDA", "strategy": "vwap_bounce"})
+
+
+def _g32_sell(o, px=1_920_300):
+    return o.on_signal({"side": SIDE_SELL, "price_e4": px,
+                        "symbol": "NVDA", "strategy": "vwap_bounce"})
+
+
+om32, b32 = _g32_om(pending_next=1)
+out32 = _g32_buy(om32)
+check("an unconfirmed submission reports pending, not FILLED",
+      out32.startswith("pending:"), True)
+check("the position does NOT move -- the shares do not exist yet",
+      om32.positions["NVDA"], 0)
+check("...and matches what the broker actually holds, which is the "
+      "whole point (the real session diverged 25 vs 7)",
+      om32.positions["NVDA"], b32.get_position_qty("NVDA"))
+check("it is tracked so it can be settled later",
+      om32.pending_orders["NVDA"]["order_id"] is not None, True)
+check("a pending order is NOT counted as a broker rejection",
+      om32.consecutive_rejects, 0)
+check("...and does not trip the kill switch", om32.halted, False)
+check("nothing was booked to the cost tracker",
+      om32.costs._entries.get("NVDA", [0, 0])[0], 0)
+
+# it fills late, at a price nobody could have guessed at submit time
+_oid = om32.pending_orders["NVDA"]["order_id"]
+b32.open_orders[_oid].update({"status": "filled", "filled_qty": "5",
+                              "filled_avg_price": "195.10"})
+om32.policy.lim.cooldown_s = 0.0
+out32b = _g32_sell(om32, 1_960_000)
+check("a LATE fill is booked when we next look, so a legitimate sell "
+      "is not blocked as 'flat' on a position that really exists",
+      out32b, "FILLED")
+check("...and it used the broker's REAL fill price, not the signal "
+      "price the old code fabricated ($195.10, not $193.355)",
+      om32.costs.realized_pnl_e4, (1_960_000 - 1_951_000) * 5)
+
+# still-open order gets cancelled rather than collided with
+om32c, b32c = _g32_om(pending_next=1, wash_on_opposite=True)
+_g32_buy(om32c)
+om32c.policy.lim.cooldown_s = 0.0
+om32c.positions["NVDA"] = 5
+b32c.positions["NVDA"] = 5
+out32c = _g32_sell(om32c)
+check("a still-open order is cancelled before the next order goes out",
+      len(b32c.open_orders), 0)
+check("...so the opposite-side order goes through instead of hitting a "
+      "wash-trade rejection", out32c, "FILLED")
+check("...with no rejection recorded at all", om32c.consecutive_rejects, 0)
+check("...and no halt", om32c.halted, False)
+
+# wash-trade 403 that arrives anyway: cancel the named order, retry once
+om32d, b32d = _g32_om(pending_next=1, wash_on_opposite=True)
+_g32_buy(om32d)
+om32d.pending_orders.pop("NVDA")        # we lost track of it
+om32d.policy.lim.cooldown_s = 0.0
+om32d.positions["NVDA"] = 5
+b32d.positions["NVDA"] = 5
+out32d = _g32_sell(om32d)
+check("a wash-trade 403 is recovered from -- the error names the "
+      "offending existing_order_id, so cancel it and retry ONCE rather "
+      "than treating a self-inflicted state conflict as a broker "
+      "meltdown", out32d, "FILLED")
+check("...it does not count toward the kill switch",
+      om32d.consecutive_rejects, 0)
+check("...and the session survives", om32d.halted, False)
+
+# a rejection must start the cooldown, or three retries burn the whole
+# strike budget in about a second -- exactly what the real log shows
+om32e, b32e = _g32_om(reject_next=1)
+om32e.positions["NVDA"] = 5
+b32e.positions["NVDA"] = 5
+_t_before = om32e.policy.last_order_t
+_g32_sell(om32e)
+check("a REJECTED order now starts the cooldown too -- record_order() "
+      "used to run only on the success path, so the next tick retried "
+      "instantly: three identical rejections inside one second, the "
+      "entire kill-switch budget spent on one conflict while a 60s "
+      "cooldown sat configured and doing nothing",
+      om32e.policy.last_order_t > _t_before, True)
+check("...and the retry is now actually gated by that cooldown",
+      _g32_sell(om32e).startswith("blocked: cooldown"), True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")
