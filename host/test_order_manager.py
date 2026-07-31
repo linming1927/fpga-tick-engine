@@ -2280,6 +2280,99 @@ check("a REJECTED order now starts the cooldown too -- record_order() "
 check("...and the retry is now actually gated by that cooldown",
       _g32_sell(om32e).startswith("blocked: cooldown"), True)
 
+# ---- v3.51: carried positions get adopted, and get a real stop --------
+print("[G33] v3.51: a position carried across a restart is adopted into "
+     "the risk overlay, with its true open date recovered from the audit "
+     "log and its stop deferred until the session VWAP warms up. Found "
+     "by asking what would happen to a real 32-share SOFI holding: it "
+     "had NO stop, could never get one, and neither could any other "
+     "carried position")
+
+from order_manager import (_position_open_dates,
+                           _load_fills_split_by_today)
+from position_risk import PositionRiskOverlay as _PRO33
+from tick_protocol import VWAPMirror as _VM33, to_e4 as _e4_33
+import time as _time33
+from datetime import timedelta as _td33
+
+_d33 = tempfile.mkdtemp()
+_audit33 = os.path.join(_d33, "a.jsonl")
+_t0 = int(_time33.time()*1_000_000) - 3 * 86_400 * 1_000_000          # three days ago
+with open(_audit33, "w") as f:
+    for off, sym, side, qty in (
+            (0, "SOFI", "buy", 32),      # opens SOFI, 3 days ago
+            (1, "OLD", "buy", 5),        # opens OLD
+            (2, "OLD", "sell", 5),       # ...and closes it again
+            (3, "SPY", "buy", 4),        # opens SPY
+            (4, "SPY", "sell", 4)):      # ...closed too
+        f.write(_json.dumps({
+            "t": _t0 + off * 3_600 * 1_000_000, "event": "order_filled",
+            "symbol": sym, "side": side, "qty": qty,
+            "fill_price_e4": 154_000}) + "\n")
+
+_opened = _position_open_dates(list(_load_fills_split_by_today(_audit33)[0])
+                               + list(_load_fills_split_by_today(_audit33)[1]))
+check("only STILL-OPEN positions are reported", sorted(_opened), ["SOFI"])
+check("...with the date the position actually opened",
+      _opened["SOFI"],
+      datetime.fromtimestamp(_t0 / 1_000_000, tz=ET).date())
+
+b33 = MockBroker(); b33.positions["SOFI"] = 32
+om33 = OrderManager(b33, ["SOFI"],
+                    RiskLimits(require_market_hours=False, cooldown_s=0.0,
+                               max_notional_e4=10**12,
+                               max_position_notional_e4=10**12),
+                    audit_path=_audit33,
+                    killfile=os.path.join(_d33, "om.kill"))
+check("startup recovers the open date without being asked",
+      om33.position_open_dates.get("SOFI"),
+      datetime.fromtimestamp(_t0 / 1_000_000, tz=ET).date())
+
+om33.risk_overlay = _PRO33(stop_sigma_mult=3.0, risk_dollars_per_trade=50.0)
+_mir33 = _VM33(warmup_n=20)
+om33.vwap_models = {"SOFI": _mir33}
+check("before adoption the carried position has no stop -- the bug",
+      om33.risk_overlay.stop_price_e4("SOFI"), None)
+
+om33.adopt_open_positions()
+check("adoption marks the stop pending", om33.risk_overlay.stop_is_pending("SOFI"),
+      True)
+check("...and does NOT commit a stop of 0 off the empty startup mirror",
+      om33.risk_overlay.stop_price_e4("SOFI"), None)
+check("the position is treated as OLDER, so the sell gate applies",
+      om33.risk_overlay.is_same_day("SOFI", om33.policy._now_fn().date()),
+      False)
+
+om33._commit_pending_stops("SOFI")
+check("a cold mirror commits nothing", om33.risk_overlay.stop_is_pending("SOFI"),
+      True)
+for _p in (15.20, 16.40) * 15:
+    _mir33.ingest(_e4_33(_p), 100)
+om33._commit_pending_stops("SOFI")
+check("once the session VWAP has real data the stop is armed",
+      om33.risk_overlay.stop_price_e4("SOFI") is not None, True)
+check("...and it can finally fire on a real decline",
+      om33.risk_overlay.stop_triggered("SOFI", _e4_33(1.00)), True)
+check("...and _commit_pending_stops is idempotent thereafter",
+      om33.risk_overlay.stop_is_pending("SOFI"), False)
+
+# held with NO opening fill anywhere -- must be the cautious reading
+b33b = MockBroker(); b33b.positions["ZZZ"] = 9
+_d33b = tempfile.mkdtemp()
+om33b = OrderManager(b33b, ["ZZZ"],
+                     RiskLimits(require_market_hours=False, cooldown_s=0.0),
+                     audit_path=os.path.join(_d33b, "a.jsonl"),
+                     killfile=os.path.join(_d33b, "om.kill"))
+om33b.risk_overlay = _PRO33(stop_sigma_mult=3.0)
+om33b.vwap_models = {}
+om33b.adopt_open_positions()
+check("a holding with no opening fill in the log is adopted as OLDER, "
+     "not as today's -- today would tell the sell gate it is a fresh "
+     "scalp, which is the permissive guess and the wrong one to make "
+     "blind",
+     om33b.risk_overlay.is_same_day("ZZZ", om33b.policy._now_fn().date()),
+     False)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

@@ -39,6 +39,9 @@ class _SymbolRiskState:
     anchor_sum_v: int = 0                 # Σv since the anchor
     stop_price_e4: int | None = None      # fixed at position-open time;
                                           # None means flat
+    stop_pending: bool = False            # v3.51: adopted at startup,
+                                          # stop deferred until the
+                                          # session VWAP warms up
 
 
 class PositionRiskOverlay:
@@ -96,6 +99,62 @@ class PositionRiskOverlay:
         sigma = self._sigma_e4(vwap_mirror)
         vwap = vwap_mirror.vwap if vwap_mirror is not None else 0
         st.stop_price_e4 = int(vwap - self.stop_sigma_mult * sigma)
+        st.stop_pending = False
+
+    def adopt_existing_position(self, sym: str, when) -> None:
+        """v3.51: take responsibility for a position this overlay did
+        NOT open -- one reconciled from the broker at startup.
+
+        on_position_opened() only ever runs on a fresh flat->non-flat
+        entry inside a live session, so a position carried across a
+        restart previously got no overlay state at all: no anchor, and
+        stop_price_e4 None, which makes stop_triggered() return False on
+        every tick forever. A real holding (32 SOFI shares) sat that way
+        across several sessions with no downside protection whatsoever,
+        and it was not a quirk of that symbol -- EVERY carried position
+        was in the same state.
+
+        `when` is the date the position actually opened, recovered from
+        the audit log, so the same-day-vs-older sell gate judges it
+        correctly rather than treating an overnight holding as a fresh
+        scalp.
+
+        The stop is deliberately NOT computed here. At startup the
+        session VWAP mirror is empty, and a stop computed from an empty
+        mirror is exactly 0 -- unable to ever trigger, which is the very
+        failure this is meant to fix. commit_pending_stop() sets it once
+        the mirror has real data.
+        """
+        st = self._get(sym)
+        st.anchor_date = when
+        st.anchor_sum_pv = 0
+        st.anchor_sum_v = 0
+        st.stop_price_e4 = None
+        st.stop_pending = True
+
+    def stop_is_pending(self, sym: str) -> bool:
+        st = self._state.get(sym)
+        return bool(st is not None and st.stop_pending)
+
+    def commit_pending_stop(self, sym: str, vwap_mirror) -> int | None:
+        """v3.51: place the deferred stop for an adopted position, once
+        the session VWAP has actually warmed up. A no-op unless this
+        symbol is waiting for one. Returns the committed stop, or None
+        if it is not ready yet (so the caller can report it exactly
+        once, when it lands)."""
+        st = self._state.get(sym)
+        if st is None or not st.stop_pending or st.anchor_date is None:
+            return None
+        if vwap_mirror is None or not getattr(vwap_mirror, "warmed_up", False):
+            return None
+        sigma = self._sigma_e4(vwap_mirror)
+        if sigma <= 0:
+            return None          # warmed but still no dispersion -- wait,
+                                 # rather than commit another stop of 0
+        st.stop_price_e4 = int(vwap_mirror.vwap
+                               - self.stop_sigma_mult * sigma)
+        st.stop_pending = False
+        return st.stop_price_e4
 
     def on_position_closed(self, sym: str) -> None:
         """Call when a symbol's position returns to flat (a full
@@ -105,6 +164,7 @@ class PositionRiskOverlay:
         st.anchor_sum_pv = 0
         st.anchor_sum_v = 0
         st.stop_price_e4 = None
+        st.stop_pending = False
 
     def on_tick(self, sym: str, price_e4: int, qty: int) -> None:
         """Feed EVERY raw trade tick for a symbol — a no-op unless

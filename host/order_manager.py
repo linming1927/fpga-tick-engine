@@ -58,7 +58,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -202,6 +202,36 @@ def _replay_vwap_from_log(br, log_path: str, today) -> int:
                 model.ingest(ev["price_e4"], ev.get("qty", 0))
                 n += 1
     return n
+
+
+def _position_open_dates(all_fills: list[dict]) -> dict[str, object]:
+    """v3.51: for every symbol still holding shares at the end of the
+    audit history, the ET date on which that position last went from
+    flat to non-flat.
+
+    Needed because the risk overlay's same-day-vs-older sell gate keys
+    off when a position OPENED, and a position reconciled from the
+    broker at startup has no such record in memory. Reading it back from
+    the fills is the only way to tell an overnight holding from a fresh
+    scalp -- getting this wrong in the permissive direction would let
+    the gate treat a week-old position as a same-day one.
+    """
+    running: dict[str, int] = {}
+    opened: dict[str, object] = {}
+    for ev in all_fills:
+        sym = ev.get("symbol", "").strip()
+        if not sym or "t" not in ev:
+            continue
+        before = running.get(sym, 0)
+        qty = int(ev.get("qty", 0))
+        after = before + (qty if ev.get("side") == "buy" else -qty)
+        running[sym] = after
+        if before == 0 and after != 0:
+            opened[sym] = datetime.fromtimestamp(ev["t"] / 1_000_000,
+                                                 tz=ET).date()
+        elif after == 0:
+            opened.pop(sym, None)
+    return {k: v for k, v in opened.items() if running.get(k, 0) != 0}
 
 
 def _load_fills_split_by_today(audit_path: str) -> tuple[list[dict], list[dict]]:
@@ -748,6 +778,10 @@ class OrderManager:
         # prior day's buy that established its true cost basis had been
         # discarded along with everything else from before today.
         prior_fills, todays_fills = _load_fills_split_by_today(audit_path)
+        # v3.51: when each still-open position actually opened, for the
+        # risk overlay to adopt once main() has wired one up
+        self.position_open_dates = _position_open_dates(prior_fills
+                                                        + todays_fills)
         for ev in prior_fills:
             # silent: rebuilds cost basis for anything still open,
             # without polluting today's reported totals
@@ -835,6 +869,63 @@ class OrderManager:
         return self.positions.get(self.symbol, 0)
 
     # ---- the signal path ---------------------------------------------------------
+    def adopt_open_positions(self) -> None:
+        """v3.51: hand every position we are already holding to the risk
+        overlay. Call once, after main() has wired self.risk_overlay up.
+
+        on_position_opened() only ever runs on a fresh flat->non-flat
+        entry inside a live session, so until now a position carried
+        across a restart got NO overlay state: stop_price_e4 stayed
+        None and stop_triggered() returned False on every tick, forever.
+        A real 32-share SOFI holding sat that way across several
+        sessions with no downside protection, and every other carried
+        position was in the same state.
+
+        The stop cannot be computed yet -- the session VWAP mirror is
+        empty at startup and would give a stop of exactly 0, which can
+        never trigger. It is deferred to the first warmed-up tick; see
+        _commit_pending_stops().
+        """
+        ov = self.risk_overlay
+        if ov is None:
+            return
+        for sym, qty in self.positions.items():
+            if not qty:
+                continue
+            when = self.position_open_dates.get(sym)
+            if when is None:
+                # held, but no fill history explains it -- the same
+                # situation the v3.37 cost-basis warning already flags.
+                # Treat it as OLDER (today's date would tell the sell
+                # gate it is a fresh scalp, which is the permissive
+                # guess and the wrong one to make blind).
+                when = (self.policy._now_fn().date()
+                        - timedelta(days=1))
+                print(f"[om] {sym}: {qty} share(s) held with no opening "
+                      f"fill in the audit log — adopting as an OLDER "
+                      f"position (the cautious reading; the sell gate "
+                      f"will require its anchored VWAP)")
+            ov.adopt_existing_position(sym, when)
+            self._audit("position_adopted", symbol=sym, qty=qty,
+                        opened=str(when))
+            print(f"[om] adopted {qty} {sym} opened {when} into the risk "
+                  f"overlay — stop pending until the session VWAP warms up")
+
+    def _commit_pending_stops(self, sym: str) -> None:
+        """v3.51: place an adopted position's deferred stop the moment
+        that symbol's session VWAP has real data behind it."""
+        ov = self.risk_overlay
+        if ov is None or not ov.stop_is_pending(sym):
+            return
+        stop = ov.commit_pending_stop(sym, self.vwap_models.get(sym))
+        if stop is None:
+            return
+        self._audit("stop_committed", symbol=sym, stop_price_e4=stop,
+                    adopted=True)
+        print(f"[om] {sym}: stop now armed at ${dollars(stop):.4f} "
+              f"(adopted position — it had none until the session VWAP "
+              f"warmed up)")
+
     def _resolve_pending(self, sym: str, before_side: str = None) -> None:
         """v3.50: settle a previously-unconfirmed order on `sym` before
         doing anything else with that symbol.
@@ -1928,6 +2019,12 @@ def main():
             anchor_gate_tolerance=args.anchor_gate_tolerance,
             risk_dollars_per_trade=args.risk_per_trade)
         om.vwap_models = br.models["vwap_bounce"]
+        # v3.51: hand any position we are ALREADY holding to the overlay.
+        # Must happen after vwap_models is wired, and it is what gives a
+        # carried-over position a stop at all -- without it,
+        # on_position_opened() never runs for those and they trade
+        # unprotected for as long as they are held.
+        om.adopt_open_positions()
 
         # v3.44: a REAL bug, found via a direct comparison against a
         # from-scratch backtest.py rewrite that was supposed to match
@@ -1977,6 +2074,11 @@ def main():
             sym = fr["symbol"].strip()
             price_e4 = fr["price_e4"]
             om.risk_overlay.on_tick(sym, price_e4, fr["qty"])
+            # v3.51: an adopted position's stop is deferred until this
+            # symbol's session VWAP actually has data behind it -- at
+            # startup the mirror is empty and would yield a stop of 0,
+            # which can never fire. Cheap: a no-op once committed.
+            om._commit_pending_stops(sym)
             if (om.positions.get(sym, 0) > 0
                     and om.risk_overlay.stop_triggered(sym, price_e4)):
                 om.on_signal({"side": SIDE_SELL, "price_e4": price_e4,

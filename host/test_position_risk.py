@@ -277,6 +277,72 @@ check("a pyramiding add with ZERO held_qty behaves identically to a "
                         held_qty=0, held_avg_cost_e4=0),
      shares1)
 
+# ---- v3.51: adopting a position the overlay did not open --------------
+print("[G7] v3.51: adopt_existing_position() + a DEFERRED stop, for a "
+     "position carried across a restart. on_position_opened() only runs "
+     "on a fresh flat->non-flat entry inside a live session, so a "
+     "reconciled position previously got no overlay state at all: "
+     "stop_price_e4 None, stop_triggered() False on every tick forever. "
+     "A real 32-share SOFI holding sat that way across several sessions "
+     "with no downside protection -- and every other carried position "
+     "was in the same state")
+
+ov7 = PositionRiskOverlay(stop_sigma_mult=3.0)
+check("a symbol the overlay never opened has no stop at all -- the bug",
+      ov7.stop_price_e4("SOFI"), None)
+check("...so its stop can never fire, at any price",
+      ov7.stop_triggered("SOFI", 1), False)
+
+ov7.adopt_existing_position("SOFI", YESTERDAY)
+check("adoption records the date the position ACTUALLY opened, not "
+     "today -- treating an overnight holding as a fresh scalp is the "
+     "permissive guess and would wrongly skip the sell gate",
+     ov7.is_same_day("SOFI", TODAY), False)
+check("the stop is left PENDING, not computed on the spot",
+      ov7.stop_is_pending("SOFI"), True)
+check("...and is still None rather than 0. At startup the session VWAP "
+     "mirror is empty, and int(0 - 3*0) is exactly 0 -- a stop that can "
+     "never trigger, which is the very failure being fixed",
+     ov7.stop_price_e4("SOFI"), None)
+
+check("committing against an EMPTY mirror refuses and stays pending",
+      ov7.commit_pending_stop("SOFI", _FakeVWAPMirror(0, 0, sum_v=0)),
+      None)
+check("...still pending afterwards", ov7.stop_is_pending("SOFI"), True)
+
+
+class _ColdMirror(_FakeVWAPMirror):
+    warmed_up = False
+
+
+class _WarmMirror(_FakeVWAPMirror):
+    warmed_up = True
+
+
+check("a warmed mirror with ZERO dispersion is also refused -- warmed "
+     "is not the same as usable, and sigma 0 would put the stop exactly "
+     "at VWAP",
+     ov7.commit_pending_stop("SOFI", _WarmMirror(160_000, 0)), None)
+check("an UNWARMED mirror is refused even with real dispersion",
+      ov7.commit_pending_stop("SOFI", _ColdMirror(160_000, 5_000)), None)
+
+stop7 = ov7.commit_pending_stop("SOFI", _WarmMirror(160_000, 5_000))
+check("once the mirror is warm AND has dispersion, the stop commits at "
+     "vwap - N*sigma", stop7, 160_000 - 3 * 5_000)
+check("...and is no longer pending", ov7.stop_is_pending("SOFI"), False)
+check("...so it can finally fire", ov7.stop_triggered("SOFI", 144_000),
+      True)
+check("...but not above it", ov7.stop_triggered("SOFI", 146_000), False)
+check("a second commit is a no-op -- the stop is fixed, not re-derived "
+     "on every tick",
+     ov7.commit_pending_stop("SOFI", _WarmMirror(200_000, 9_000)), None)
+check("...and the original stop is untouched by that attempt",
+      ov7.stop_price_e4("SOFI"), 160_000 - 3 * 5_000)
+
+ov7.on_position_closed("SOFI")
+check("closing clears the pending flag too, so a later fresh entry "
+     "computes its own stop normally", ov7.stop_is_pending("SOFI"), False)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")
