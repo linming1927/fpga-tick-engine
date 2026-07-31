@@ -112,8 +112,15 @@ hold. Position logic is applied downstream: sells only ever close an
 existing position, and the strategy never shorts.
 
 `--strategy sma` and `--strategy ema` (moving-average crossovers) are
-also available and are scored in parallel for comparison, but
-`vwap_bounce` is the one the risk overlay is built around.
+also available and are scored in parallel, but `vwap_bounce` is the one
+the risk overlay is built around.
+
+A live session's console reports **only the strategy it actually
+trades**. The others are still scored, still written to the audit log
+and still restored across restarts — they simply stop narrating
+crossings the session will never act on. Pass
+`--report-all-strategies` to see them. A backtest always shows the full
+comparison, since comparing strategies over the same data is the point.
 
 ---
 
@@ -286,6 +293,7 @@ repeating conflict cannot burn the whole rejection budget in a second.
 | `--filing-status` | `mfj` | `single` or `mfj` |
 | `--state-rate` | `4.4` | state income tax rate, percent |
 | `--gross` | off | report gross P&L instead of net |
+| `--report-all-strategies` | off | show scored strategies on the console too, not just the traded one |
 | `--no-timestamps` | off | drop timestamps from console output |
 
 ### Hardware mode
