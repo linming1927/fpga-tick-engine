@@ -355,13 +355,33 @@ class ProfitGatedScorecard(StrategyScorecard):
                                             # already passed
 
 
-def comparison_report(cards: dict[str, StrategyScorecard]) -> str:
-    lines = ["---- strategy comparison ([LIVE] = real fills; the other is "
-             "replayed through an identical RiskPolicy clone) ----",
+def comparison_report(cards: dict[str, StrategyScorecard],
+                     live_only: bool = False) -> str:
+    """live_only (v3.52) reports ONLY the strategy that actually traded.
+
+    A live session trades one strategy; the others are scored purely as
+    a background reference and are not acted on. order_manager.py passes
+    live_only=True so its console reports what happened rather than a
+    comparison nobody asked for -- matching the dashboard, which stopped
+    showing them at v3.48. They are still scored, still audited, and
+    still restored across restarts.
+
+    backtest.py deliberately does NOT pass it: comparing strategies over
+    the same data is the entire point of a backtest.
+    """
+    shown = {k: c for k, c in cards.items()
+             if c.live} if live_only else cards
+    if live_only and not shown:          # nothing flagged live -- report
+        shown = cards                    # everything rather than nothing
+    header = ("---- strategy comparison ([LIVE] = real fills; the other is "
+              "replayed through an identical RiskPolicy clone) ----"
+              if not live_only else
+              "---- session result ([LIVE] = real broker fills) ----")
+    lines = [header,
              "  strategy                 signals  trips  win     gross $ "
              " fees $      net $  position"]
-    lines += [c.row() for c in cards.values()]
-    for c in cards.values():
+    lines += [c.row() for c in shown.values()]
+    for c in shown.values():
         if c.policy is not None and c.block_reasons:
             # NOTE: shown regardless of c.live. The [LIVE] tag means
             # "these numbers are real broker fills" (true in a live

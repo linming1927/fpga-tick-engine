@@ -102,7 +102,8 @@ class TickEngine:
     def __init__(self, symbols, fast_n: int, slow_n: int,
                  k_fast: int, k_slow: int,
                  vwap_warmup: int = 20, vwap_k2_q8: int = 256,
-                 log=None, quiet: bool = False):
+                 log=None, quiet: bool = False,
+                 report_strategies=None):
         self.symbols = [s.strip().upper() for s in symbols if s.strip()]
         if not self.symbols:
             raise ValueError("TickEngine needs at least one symbol")
@@ -118,6 +119,14 @@ class TickEngine:
         self._q: queue.Queue = queue.Queue()
         self.log = log
         self.quiet = quiet
+        # v3.52: which strategies print their signals to the terminal.
+        # None means all of them. order_manager.py narrows this to the
+        # ONE strategy that actually trades -- the others are still
+        # scored, and still appear in saved results, but a live session
+        # trading vwap_bounce has no use for a running commentary of
+        # sma/ema crossings it will never act on.
+        self.report_strategies = (set(report_strategies)
+                                  if report_strategies is not None else None)
 
         # hooks (same names/semantics as Bridge)
         self.on_verified = None        # callback(fr) -- a strategy signal
@@ -275,7 +284,8 @@ class TickEngine:
               side_name: str, price_e4: int) -> None:
         self.fpga_signals += 1
         self.signals_by_strategy[strategy] += 1
-        if not self.quiet:
+        if not self.quiet and (self.report_strategies is None
+                               or strategy in self.report_strategies):
             print(f">> [{strategy}] {sym}: {side_name} @ "
                   f"${dollars(price_e4):.4f}")
         if self.on_verified:

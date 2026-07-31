@@ -656,6 +656,12 @@ def run_session(n_ticks):
          "--source", "sim", "--broker", "mock", "--cooldown", "0",
          "--n", str(n_ticks), "--rate", "50", "--fast", "4", "--slow", "8",
          "--ema-kf", "1", "--ema-ks", "3", "--profit-gate",
+         # v3.52: a live session reports only the strategy it trades.
+         # This test is specifically about the OTHER strategies' numbers
+         # surviving a restart, so it asks for the full report -- the
+         # restore itself is unchanged, only what gets printed by
+         # default is.
+         "--report-all-strategies",
          "--killfile", os.path.join(d14, "om.kill"),
          "--no-timestamps",   # v3.41: this test parses fixed-column
                               # positions from the output (trips_win_net
@@ -923,6 +929,10 @@ r = subprocess.run(
     [sys.executable, "order_manager.py", "--port", port,
      "--source", "sim", "--broker", "mock", "--cooldown", "0",
      "--n", "600", "--rate", "200", "--fast", "4", "--slow", "8",
+     # v3.52: this group is about a SCORED strategy's signals routing
+     # correctly while a different one trades, so it has to ask for the
+     # full report -- the default now prints only the traded strategy.
+     "--report-all-strategies",
      "--audit", "{g18_audit_path}"],
     capture_output=True, text=True, timeout=110)
 emu.stop()
@@ -1166,6 +1176,9 @@ r = subprocess.run(
      "--fast", "8", "--slow", "32", "--source", "historical",
      "--trades", g21_trades_path, "--replay-rate", "300",
      "--broker", "mock", "--strategy", "vwap_bounce",
+     # v3.52: asserts SMA and EMA appear as SCORED peers alongside the
+     # traded row, which is exactly what the default no longer prints.
+     "--report-all-strategies",
      "--audit", g21_audit_path,
      "--killfile", os.path.join(g21_tmp, "om.kill")],
     capture_output=True, text=True, timeout=90)

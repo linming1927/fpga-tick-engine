@@ -1010,6 +1010,72 @@ finally:
                                     # silently timestamp every
                                     # subsequent test's output too
 
+# ---- v3.52: console reporting must not alter frame DISPATCH ----------
+print("[G15] Bridge.report_strategies gates PRINTING only -- it must "
+     "never change which branch a frame takes. Caught for real: folding "
+     "the gate into the `strat == \"vwap_bounce\"` test sent VWAP frames "
+     "down the SMA branch whenever vwap reporting was off, where "
+     "fr['sma_fast'] does not exist. The KeyError killed the pump "
+     "thread and the whole session stopped silently -- a replay that "
+     "should have processed 80 trades processed none, with a clean exit "
+     "code and no traceback")
+
+import io as _io15
+from contextlib import redirect_stdout as _rso15
+
+
+class _DispatchBridge(Bridge):
+    """Bridge with the serial port removed -- _handle() is pure frame
+    logic and needs nothing else to exercise."""
+    def __init__(self):
+        self.report_strategies = None
+        self.echoes = self.fpga_signals = 0
+        self.fpga_by_strategy = {"sma": 0, "ema": 0, "vwap_bounce": 0}
+        self.fpga_by_key = {}
+        self.echoes_by_symbol = {}
+        self.verifiers = {}
+        self.log = None
+        self.on_verified = self.on_divergence = self.on_echo = None
+        self.symbol = "SPY"
+
+
+_VWAP_FRAME = {"kind": "signal", "strategy": "vwap_bounce", "symbol": "SPY",
+               "side": 1, "price_e4": 1_000_000, "vwap": 1_010_000,
+               "eval_skips": 0}
+
+
+class _RecordingVerifier:
+    def __init__(self):
+        self.seen = 0
+
+    def on_fpga_signal(self, fr, t, echoes):
+        self.seen += 1
+
+
+for _label, _rs, _want_print in (
+        ("reporting ON", None, True),
+        ("reporting OFF", {"sma"}, False)):
+    _b = _DispatchBridge()
+    _b.report_strategies = _rs
+    _v = _RecordingVerifier()
+    _b.verifiers[("vwap_bounce", "SPY")] = _v
+    _buf = _io15.StringIO()
+    _crashed = None
+    try:
+        with _rso15(_buf):
+            _b._handle(dict(_VWAP_FRAME))
+    except Exception as e:                      # the actual regression
+        _crashed = f"{type(e).__name__}: {e}"
+    check(f"a VWAP signal frame does not raise with {_label}", _crashed,
+          None)
+    check(f"...and still reaches its verifier with {_label}", _v.seen, 1)
+    check(f"...and is counted with {_label}", _b.fpga_signals, 1)
+    check(f"...printing follows report_strategies ({_label})",
+          "FPGA[vwap_bounce]" in _buf.getvalue(), _want_print)
+    check(f"...and it is NEVER mistaken for an SMA frame ({_label}) -- "
+          f"that misroute is what produced the KeyError",
+          "fast=" in _buf.getvalue(), False)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

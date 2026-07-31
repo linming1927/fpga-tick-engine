@@ -253,6 +253,11 @@ class Bridge:
         self.symcfg_acks: dict[int, dict] = {}
         self.sessrst_acks: list[dict] = []
         self.on_symbols_changed = None            # alpaca resubscribe hook
+        # v3.52: which strategies print their signals. None = all;
+        # order_manager.py narrows it to the one that actually trades.
+        # Same knob and same meaning as TickEngine's, so the two engines
+        # produce the same console output for the same session.
+        self.report_strategies = None
         self.parser = FrameParser()
         self.frames: queue.Queue = queue.Queue()
         self.log = open(log_path, "a") if log_path else None
@@ -394,6 +399,11 @@ class Bridge:
             if not timeout:
                 continue
 
+    def _reports(self, strategy: str) -> bool:
+        """v3.52: should this strategy's signals appear on the console?"""
+        return (self.report_strategies is None
+                or strategy in self.report_strategies)
+
     def _handle(self, fr: dict):
         if fr["kind"] == "echo":
             self.echoes += 1
@@ -430,9 +440,10 @@ class Bridge:
                 for name in ("sma", "ema"):
                     sig = self.models[name][sym].ingest(fr["price_e4"])
                     if sig:
-                        print(f">> model[{name}] {sym}: {sig.side_name} @ "
-                              f"${dollars(sig.price_e4):.4f}  "
-                              f"fast={sig.sma_fast} slow={sig.sma_slow}")
+                        if self._reports(name):
+                            print(f">> model[{name}] {sym}: {sig.side_name} @ "
+                                  f"${dollars(sig.price_e4):.4f}  "
+                                  f"fast={sig.sma_fast} slow={sig.sma_slow}")
                         self.verifiers[(name, sym)].on_model_signal(
                             sig, time.monotonic(), self.echoes_by_symbol[sym])
                 # VWAP mirror: same accept filter (this symbol's TRADE
@@ -442,9 +453,11 @@ class Bridge:
                 vsig = self.models["vwap_bounce"][sym].ingest(
                     fr["price_e4"], fr["qty"])
                 if vsig:
-                    print(f">> model[vwap_bounce] {sym}: {vsig.side_name} "
-                          f"@ ${dollars(vsig.price_e4):.4f}  "
-                          f"vwap={vsig.vwap}")
+                    if self._reports("vwap_bounce"):
+                        print(f">> model[vwap_bounce] {sym}: "
+                              f"{vsig.side_name} @ "
+                              f"${dollars(vsig.price_e4):.4f}  "
+                              f"vwap={vsig.vwap}")
                     self.verifiers[("vwap_bounce", sym)].on_model_signal(
                         vsig, time.monotonic(), self.echoes_by_symbol[sym])
             for (_, vsym), v in self.verifiers.items():
@@ -459,11 +472,18 @@ class Bridge:
             self.fpga_signals += 1
             self.fpga_by_strategy[strat] += 1
             self.fpga_by_key[key] = self.fpga_by_key.get(key, 0) + 1
+            # NOTE: the strategy dispatch and the console gate are
+            # deliberately separate ifs. Folding _reports() into the
+            # `strat == "vwap_bounce"` test sends VWAP frames down the
+            # SMA branch below whenever vwap reporting is off, where
+            # fr['sma_fast'] does not exist -- a KeyError that kills the
+            # pump thread and silently stops the whole session.
             if strat == "vwap_bounce":
-                print(f">> FPGA[{strat}] {sym}: "
-                      f"{SIDE_NAME.get(fr['side'], '?')} @ "
-                      f"${dollars(fr['price_e4']):.4f}  "
-                      f"vwap={fr['vwap']}")
+                if self._reports(strat):
+                    print(f">> FPGA[{strat}] {sym}: "
+                          f"{SIDE_NAME.get(fr['side'], '?')} @ "
+                          f"${dollars(fr['price_e4']):.4f}  "
+                          f"vwap={fr['vwap']}")
                 if fr.get("eval_skips", 0):
                     # nonzero means the tick rate exceeded the engine's
                     # evaluation rate and ticks were coalesced (exact
@@ -478,7 +498,7 @@ class Bridge:
                           f"{fr['eval_skips']}: tick rate exceeded the "
                           f"evaluation rate — mirror comparison is not "
                           f"tick-for-tick while this is nonzero")
-            else:
+            elif self._reports(strat):
                 print(f">> FPGA[{strat}] {sym}: "
                       f"{SIDE_NAME.get(fr['side'], '?')} @ "
                       f"${dollars(fr['price_e4']):.4f}  "

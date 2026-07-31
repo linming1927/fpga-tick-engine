@@ -1592,6 +1592,14 @@ def main():
                     default="mfj")
     ap.add_argument("--state-rate", type=float, default=4.40,
                     help="flat state income tax %% (default: Colorado 4.40)")
+    ap.add_argument("--report-all-strategies", action="store_true",
+                    help="v3.52: restore the full multi-strategy console "
+                        "output. By default a live session reports only "
+                        "the strategy it actually trades -- the others "
+                        "are still scored, audited and restored across "
+                        "restarts, they just don't narrate signals the "
+                        "session will never act on. Pass this to see how "
+                        "the untraded strategies would have done")
     ap.add_argument("--gross", action="store_true",
                     help="treat --household-income as gross; subtract the "
                          "2026 standard deduction")
@@ -1740,6 +1748,13 @@ def main():
                         vwap_k2_q8=args.vwap_k2_q8, log=_eng_log)
         print("[om] direct engine (no --port): ticks go straight into "
               "the mirror models")
+    # v3.52: only the strategy that actually TRADES reports its signals
+    # to the console. The others are still scored, still audited and
+    # still restored across restarts -- they just stop narrating
+    # crossings the session will never act on. Same knob on both
+    # engines, so --port and the direct path print the same thing.
+    if not args.report_all_strategies:
+        br.report_strategies = {args.strategy}
 
     # v3.19: command the fabric VWAP session boundary at startup.
     # v3.38: NOT unconditionally anymore. The original reasoning was
@@ -2159,7 +2174,8 @@ def main():
         sync_live_card(cards, args.strategy, om)  # final guarantee, even if
                                                   # nothing arrived between
                                                   # the last signal and Ctrl+C
-        print(comparison_report(cards))
+        print(comparison_report(
+            cards, live_only=not args.report_all_strategies))
         om.summary(args.household_income, args.filing_status,
                    args.state_rate, args.gross)
         br.close()
