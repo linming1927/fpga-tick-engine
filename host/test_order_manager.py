@@ -2386,6 +2386,54 @@ check("a holding with no opening fill in the log is adopted as OLDER, "
      om33b.risk_overlay.is_same_day("ZZZ", om33b.policy._now_fn().date()),
      False)
 
+# ---- v3.53: per-fill realized P&L ------------------------------------
+print("[G34] v3.53: every SELL fill reports the realized P&L of that "
+     "round trip -- the delta in the running total across the fill, not "
+     "the session's cumulative figure, which is what you want the "
+     "moment a position closes")
+
+_d34 = tempfile.mkdtemp()
+b34 = MockBroker()
+om34 = OrderManager(b34, ["SPY"],
+                    RiskLimits(order_qty=10, require_market_hours=False,
+                               cooldown_s=0.0, max_notional_e4=10**12,
+                               max_position_notional_e4=10**12),
+                    audit_path=os.path.join(_d34, "a.jsonl"),
+                    killfile=os.path.join(_d34, "om.kill"))
+check("nothing realized before any fill", om34.last_trade_pnl_e4, None)
+
+om34.on_signal({"side": SIDE_BUY, "price_e4": 100_0000, "symbol": "SPY",
+                "strategy": "sma"})
+check("a BUY realizes nothing -- the trip is not closed yet",
+      om34.last_trade_pnl_e4, None)
+
+om34.on_signal({"side": SIDE_SELL, "price_e4": 110_0000, "symbol": "SPY",
+                "strategy": "sma"})
+check("a winning SELL reports the trip's own gain: 10 shares bought at "
+     "$100 and sold at $110 is +$100 gross",
+     om34.last_trade_pnl_e4, (110_0000 - 100_0000) * 10)
+
+om34.on_signal({"side": SIDE_BUY, "price_e4": 100_0000, "symbol": "SPY",
+                "strategy": "sma"})
+om34.on_signal({"side": SIDE_SELL, "price_e4": 95_0000, "symbol": "SPY",
+                "strategy": "sma"})
+check("a losing SELL reports a NEGATIVE number, not the cumulative "
+     "session total (which is still positive at this point) -- that "
+     "distinction is the whole point",
+     om34.last_trade_pnl_e4, (95_0000 - 100_0000) * 10)
+check("...and the session total really is still positive, proving the "
+     "two are different numbers",
+     om34.costs.realized_pnl_e4 > 0, True)
+
+_fills34 = [_json.loads(l) for l in
+            open(os.path.join(_d34, "a.jsonl"))
+            if '"order_filled"' in l]
+check("every fill is audited with trade_pnl_e4",
+      all("trade_pnl_e4" in f for f in _fills34), True)
+check("...None on the buys", [f["trade_pnl_e4"] for f in _fills34][0], None)
+check("...and the realized figure on the sells",
+      [f["trade_pnl_e4"] for f in _fills34][1], (110_0000 - 100_0000) * 10)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

@@ -283,6 +283,48 @@ om.positions["SPY"] = 0
 check("a closed position drops out of the table again",
       json.loads(get("/api/state"))["holdings"], [])
 
+# ---- v3.53: per-fill P&L in the signals table, and two tiles gone ----
+from tick_protocol import SIDE_BUY, SIDE_SELL
+
+print("[G_pnl] SELL rows carry the round trip's own realized P&L, and "
+     "the UART-only VERIFIED / RTT tiles are gone")
+
+dash.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000, "symbol": "SPY",
+                "strategy": "vwap_bounce", "vwap": 1_010_000},
+               outcome="FILLED", trade_pnl_e4=None)
+dash.on_signal({"side": SIDE_SELL, "price_e4": 1_100_000, "symbol": "SPY",
+                "strategy": "vwap_bounce", "vwap": 1_010_000},
+               outcome="FILLED", trade_pnl_e4=123_456)
+dash.on_signal({"side": SIDE_SELL, "price_e4": 900_000, "symbol": "SPY",
+                "strategy": "vwap_bounce", "vwap": 1_010_000},
+               outcome="FILLED", trade_pnl_e4=-45_000)
+dash.on_signal({"side": SIDE_SELL, "price_e4": 950_000, "symbol": "SPY",
+                "strategy": "vwap_bounce", "vwap": 1_010_000},
+               outcome="blocked: cooldown (1.0s < 60.0s)")
+
+sig_pnl = json.loads(get("/api/state"))["signals"]
+check("a losing SELL carries a negative P&L", sig_pnl[1]["trade_pnl_e4"],
+      -45_000)
+check("a winning SELL carries a positive one", sig_pnl[2]["trade_pnl_e4"],
+      123_456)
+check("a BUY carries none -- nothing is realized until the position "
+     "closes", sig_pnl[3]["trade_pnl_e4"], None)
+check("a signal that never filled carries none either, so the column "
+     "cannot imply a trip that did not happen",
+     sig_pnl[0]["trade_pnl_e4"], None)
+
+page_pnl = get("/").decode()
+check("the signals table has a P&L column", "<th>P&amp;L</th>" in page_pnl,
+      True)
+check("the VERIFIED tile is gone -- it counts fabric signals matched "
+     "against the host mirror, which means nothing on the direct "
+     "in-process engine", "stat('VERIFIED'" in page_pnl, False)
+check("the RTT tile is gone -- there is no round trip to measure "
+     "without a UART", "stat('RTT" in page_pnl, False)
+check("...but the snapshot still carries rtt, so a --port session and "
+     "anything reading /api/state keep working",
+     "rtt" in json.loads(get("/api/state")), True)
+
 dash.stop(); br.close(); emu.stop()
 
 # ---- v3.14: right-axis chart labels weren't showing real prices -- two

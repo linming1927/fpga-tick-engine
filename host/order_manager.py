@@ -731,6 +731,10 @@ class OrderManager:
         self.halted = False
         self.halt_reason = ""
         self.consecutive_rejects = 0
+        # v3.53: realized P&L of the most recent SELL fill,
+        # in e4. None after a buy. Read by the dashboard so a
+        # signal row can show what the trip actually made.
+        self.last_trade_pnl_e4 = None
         # v3.50: symbol -> {order_id, qty, side, price_e4, t}
         # for orders that were submitted but never confirmed
         # filled. Kept OUT of self.positions on purpose: the
@@ -993,17 +997,26 @@ class OrderManager:
         """Book a fill that really happened: position, cost basis, audit."""
         self.positions[sym] = self.positions.get(sym, 0) + \
             (qty if verb == "buy" else -qty)
+        _pnl_before = self.costs.realized_pnl_e4
         fees = self.costs.on_fill(verb, qty, fill_e4, sym)
+        trade_pnl_e4 = (self.costs.realized_pnl_e4 - _pnl_before
+                        if verb == "sell" else None)
+        self.last_trade_pnl_e4 = trade_pnl_e4
         self._audit("order_filled", symbol=sym, side=verb, qty=qty,
+                    trade_pnl_e4=trade_pnl_e4,
                     fill_price_e4=fill_e4, order_id=order_id,
                     position_qty=self.positions[sym], fees=fees,
                     realized_pnl_e4=self.costs.realized_pnl_e4,
                     late=late, partial=partial)
         fee_str = f"  fees ${fees['total']:.2f}" if fees else ""
         tag = " (late" + (", partial)" if partial else ")") if late else ""
+        pnl_str = ""
+        if trade_pnl_e4 is not None:
+            pnl_str = (f"  {'PROFIT' if trade_pnl_e4 >= 0 else 'LOSS'} "
+                       f"${dollars(trade_pnl_e4):+,.2f}")
         print(f"[om] FILLED{tag} {verb.upper()} {qty} {sym} @ "
               f"${dollars(fill_e4):.4f}  -> position "
-              f"{self.positions[sym]}{fee_str}")
+              f"{self.positions[sym]}{fee_str}{pnl_str}")
 
     _WASH_MARKERS = ("wash trade", "opposite side")
 
@@ -1210,14 +1223,28 @@ class OrderManager:
         self.orders += 1
         self.policy.record_order()
         self.positions[sym] += qty if verb == "buy" else -qty
+        # v3.53: realized P&L for THIS fill, as the delta in the running
+        # total across it. A sell is the only thing that realizes
+        # anything, and the delta is the trip's own result rather than
+        # the session's cumulative figure -- which is what you actually
+        # want to see the moment a position closes.
+        _pnl_before = self.costs.realized_pnl_e4
         fees = self.costs.on_fill(verb, qty, fill["fill_price_e4"], sym)
+        trade_pnl_e4 = (self.costs.realized_pnl_e4 - _pnl_before
+                        if verb == "sell" else None)
+        self.last_trade_pnl_e4 = trade_pnl_e4
         self._audit("order_filled", **fill,
                     position_qty=self.positions[sym], fees=fees,
+                    trade_pnl_e4=trade_pnl_e4,
                     realized_pnl_e4=self.costs.realized_pnl_e4)
         fee_str = f"  fees ${fees['total']:.2f}" if fees else ""
+        pnl_str = ""
+        if trade_pnl_e4 is not None:
+            pnl_str = (f"  {'PROFIT' if trade_pnl_e4 >= 0 else 'LOSS'} "
+                       f"${dollars(trade_pnl_e4):+,.2f}")
         print(f"[om] FILLED {verb.upper()} {qty} {sym} @ "
               f"${dollars(fill['fill_price_e4']):.4f}  "
-              f"-> position {self.positions[sym]}{fee_str}")
+              f"-> position {self.positions[sym]}{fee_str}{pnl_str}")
         if overlay is not None:
             if verb == "buy" and is_fresh_entry:
                 overlay.on_position_opened(sym, datetime.now(ET).date(),
@@ -2125,7 +2152,12 @@ def main():
                                       and strat == "sma"):
             om._audit("scored_signal", **fr)
         if dash:
-            dash.on_signal(fr, outcome)
+            # v3.53: hand the dashboard the P&L this fill realized, so a
+            # SELL row can show what the round trip actually made. None
+            # for buys and for anything that did not fill.
+            dash.on_signal(fr, outcome,
+                           trade_pnl_e4=(om.last_trade_pnl_e4
+                                         if outcome == "FILLED" else None))
 
     def on_divergence(info):
         if dash:

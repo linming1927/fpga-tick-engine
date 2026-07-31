@@ -96,7 +96,8 @@ class DashboardServer:
             self._last_price[sym] = fr["price_e4"]
             self._last_echo_t = time.time()
 
-    def on_signal(self, fr: dict, outcome: str = ""):
+    def on_signal(self, fr: dict, outcome: str = "",
+                  trade_pnl_e4: int | None = None):
         # v3.48: VWAP-bounce only. SMA and EMA are still scored in the
         # background and still appear in the end-of-session report --
         # they are just not reported HERE any more, so the signals
@@ -110,6 +111,10 @@ class DashboardServer:
                   "side": fr["side"],
                   "price_e4": fr["price_e4"],
                   "vwap": fr.get("vwap"),
+                  # v3.53: realized P&L for THIS fill -- the round trip's
+                  # own result, not the session total. None for buys and
+                  # for signals that never filled.
+                  "trade_pnl_e4": trade_pnl_e4,
                   "outcome": outcome}
             self._signals.appendleft(rec)
             sym = rec["symbol"]
@@ -446,7 +451,7 @@ td:first-child,th:first-child{text-align:left}
 <div class="panel" style="margin-top:14px"><div id="cmp"></div></div>
 <div class="panel" style="margin-top:14px"><h2>SIGNALS</h2>
   <table><thead><tr><th>t</th><th>sym</th><th>side</th>
-  <th>price</th><th>vwap</th><th>outcome</th></tr></thead>
+  <th>price</th><th>vwap</th><th>P&amp;L</th><th>outcome</th></tr></thead>
   <tbody id="sigs"></tbody></table>
 </div>
 <div class="panel" style="margin-top:14px"><h2>EVENTS</h2>
@@ -622,9 +627,10 @@ async function poll(){
       stat('NET P&L',money(s.pnl_net),s.pnl_net>=0?'good':'bad')+
       stat('FEES',money(s.fees))+
       stat('FILLS / BLOCKED',s.orders+' / '+s.blocked)+
-      stat('VERIFIED',s.verified+' / '+s.fpga_signals,
-           s.divergences?'bad':'good')+
-      stat('RTT µs',s.rtt?s.rtt.med+' ('+s.rtt.min+'–'+s.rtt.max+')':'—')+
+      // v3.53: VERIFIED and RTT tiles removed. Both describe the UART
+      // link to the FPGA -- meaningless on the direct in-process engine,
+      // which has no round trip and nothing independent to verify
+      // against. Still reported in --port sessions' console output.
       stat('ECHO / SENT',s.echoes+' / '+s.sent,
            s.echoes===s.sent?'':'bad');
     drawChart('chart',s.series,s.chart_signals,s.band_k,s.stop_mult);
@@ -649,6 +655,11 @@ async function poll(){
       '<td class="'+(x.side===1?'buy">BUY':'sell">SELL')+'</td>'+
       '<td>'+usd(x.price_e4)+'</td>'+
       '<td>'+(x.vwap==null?'—':usd(x.vwap))+'</td>'+
+      '<td class="'+(x.trade_pnl_e4==null?'':
+        (x.trade_pnl_e4>=0?'buy':'sell'))+'">'+
+        (x.trade_pnl_e4==null?'—':
+         (x.trade_pnl_e4>=0?'+':'')+'$'+
+         Math.abs(x.trade_pnl_e4/10000).toFixed(2))+'</td>'+
       '<td class="outcome '+(x.outcome.startsWith('FILLED')?'buy':
                      x.outcome.startsWith('rejected')?'sell':'')+
       '" style="'+(x.outcome.startsWith('blocked')||

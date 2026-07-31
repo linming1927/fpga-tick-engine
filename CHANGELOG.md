@@ -1114,3 +1114,181 @@ same historical data that previously hit "would exceed max_shares
 (10)" now correctly shows only the dollar-based "total position"
 blocks, matching order_manager.py's own behavior on identical data
 exactly.
+
+**v3.36** — fixed a real bug found from an actual overnight session:
+a session started the evening before market open never resumed
+trading once the market actually opened, with no error anywhere.
+Root cause: run_alpaca()'s websocket connection was started once in
+a background thread with zero supervision -- if it ever disconnected
+for ANY reason (an idle overnight gap with no trades to keep it
+alive, a network blip, an Alpaca-side reset), the feed just silently
+died and nothing brought it back, leaving the rest of the session
+running with zero incoming data and no visible indication why.
+Fixed with a proper reconnection supervisor: on any disconnect, it
+automatically reconnects after a backoff delay (starting at 5s,
+doubling up to a 60s cap on repeated failures so a persistent problem
+like bad credentials doesn't hammer the endpoint for hours
+unattended), and resets back to the short delay after any connection
+that stayed healthy a reasonable while, so a single random disconnect
+during an otherwise-fine session recovers quickly rather than
+inheriting a stale escalated delay from old failures. A clean Ctrl-C
+correctly stops the supervisor instead of triggering a spurious
+reconnect. The mid-session dashboard resubscribe path (on_symbols_
+changed) was updated to always reach the CURRENT live connection via
+a shared holder, since a reconnect replaces the underlying
+WebSocketApp object entirely. Backoff timing is now parameterized
+(reconnect_backoff_s/reconnect_backoff_max_s/reconnect_healthy_
+threshold_s, defaulting to the real 5s/60s/60s) specifically so the
+logic itself could be verified quickly and deterministically rather
+than by waiting through real delays. New [G12] in test_host.py:
+a fake WebSocketApp (no real network) proves multiple reconnects
+happen on repeated failures, and that a connection which stays
+"healthy" past the threshold still triggers a reconnect afterward.
+2 new checks; 784 total across the host suite, 0 failures.
+
+**v3.39** — README caught up with everything since v3.34: added the
+missing --relay-url (v3.28), --force-vwap-reset/--stop-sigma-mult/
+--anchor-gate-tolerance/--risk-per-trade (v3.38) rows to the CLI
+reference table, plus a new full narrative section ("VWAP risk
+management") explaining the stop-loss/anchored-VWAP/gate/sizing
+behavior with a real example command, matching the style of the
+existing VWAP sections. Corrected the final test census, frozen at
+v3.25's 4846 (729 host) for several drops -- now the current 4961
+(4117 RTL + 844 host across all 14 host test files). Documentation
+only, no code changes -- host suite unchanged at 844.
+
+**v3.40** — fixed a real gap in v3.36's reconnection logic, found from
+an actual VPN-toggle incident: turning on a VPN silently froze both
+the order_manager.py and fpga_emulator.py terminals, with the
+dashboard's LINK indicator going dark and no error or disconnect
+message anywhere. Root cause: websocket-client's own ping_interval
+defaults to 0 (disabled) -- run_alpaca() called run_forever() with no
+arguments, meaning no heartbeat existed at all. A VPN changing network
+routes can silently black-hole a connection (no FIN, no RST -- packets
+simply stop arriving) rather than cleanly closing it, and with no
+heartbeat, the underlying socket has nothing telling it the far end is
+gone. It just blocks in recv() forever, run_forever() never returns,
+and the entire v3.36 reconnection supervisor never gets a chance to
+run at all -- this wasn't a flaw in the backoff/retry logic itself,
+it was that nothing ever noticed there was a problem in the first
+place. Fixed by passing ping_interval_s (default 20s) and
+ping_timeout_s (default 10s) to run_forever() -- if a pong doesn't
+come back in time, the library closes the connection itself, which
+DOES make run_forever() return, handing control back to the same
+reconnection supervisor unchanged. Verified with a real installed
+websocket-client package (not just the fake test double) that the
+exact API accepts these parameters as expected.
+
+New [G13] in test_host.py confirms custom ping/timeout values and the
+real production defaults (20s/10s -- not websocket-client's own
+disabled default) actually reach run_forever(). Also fixed a real,
+separate pre-existing test-infrastructure bug this surfaced: the
+existing G12 tests' shutdown mechanism (closing the bridge's serial
+port) never actually interrupted run_alpaca()'s own main loop --
+pump() reads from an internal queue and just returns empty repeatedly
+rather than raising when the underlying port closes, so every
+previous test's background thread (and its own spawned supervisor
+sub-thread) kept running indefinitely afterward, silently
+contaminating later tests' shared fake-websocket state with stray
+reconnection attempts from threads that were supposed to have
+stopped. Fixed by patching pump() to genuinely raise KeyboardInterrupt
+once a test's time window elapses -- the same real interrupt path an
+actual Ctrl-C takes -- and by running the new G13 verification in a
+fully isolated subprocess (the same pattern already used elsewhere in
+this project for exactly this class of problem) rather than sharing
+process state with G12's tests at all. 2 new checks; 847 total across
+the host suite, 0 failures, confirmed stable across repeated runs.
+
+**v3.41** — the two things requested after the wash-trade kill-switch
+incident: automatic stale-open-order cleanup at startup, and a local
+timestamp on every printed line. Both had already been partially
+started in the working tree before this session picked them up, in
+a genuinely broken state -- completing them surfaced two real bugs
+worth knowing about.
+
+**Stale open orders**: found that check_stale_open_orders() was
+CALLED at startup (main() had the call site, and the underlying
+_AlpacaREST.list_open_orders()/cancel_all_open_orders() methods and
+the --cancel-stale-orders CLI flag all existed) but the function
+itself was never actually DEFINED anywhere -- main() would have
+crashed with NameError the instant it ran. Implemented it: at
+startup, if any open orders are already sitting on the account
+(e.g. left over from a session that disconnected before a fill
+confirmed -- exactly what caused the wash-trade rejections and the
+kill switch trip), warn about them by default, or cancel them all
+automatically with --cancel-stale-orders. MockBroker is a clean
+no-op (no open-orders concept at all, everything fills instantly) --
+checked via hasattr() rather than a broker-type check, so any future
+broker without the concept is unaffected without needing an update
+here. New [G28] in test_order_manager.py (12 checks): a lightweight
+fake broker (not real Alpaca HTTP mocking, since only the decision
+logic needs verifying) covers zero-orders silence, warn-without-
+touching, cancel-and-confirm with correct per-symbol summary
+formatting, error handling on both the check and the cancel path,
+and an end-to-end proof that a real session now reaches this call
+without the NameError crash that would have happened before.
+
+**Local timestamps**: tick_protocol.install_local_timestamps() also
+already existed (imported and called from both order_manager.py and
+fpga_emulator.py's main(), both gated behind a --no-timestamps
+opt-out flag) but had a real bug: the wrapper class was defined
+INSIDE the function, making it a distinct class object every call --
+so the idempotent guard's isinstance() check could never recognize
+an already-installed wrapper from an earlier call, silently double-
+wrapping stdout (and double-timestamping every line) the moment
+install_local_timestamps() got called more than once. Fixed by
+moving the class to module level. New [G14] in test_host.py (5
+checks, with careful sys.stdout save/restore so the mutation can't
+leak into other tests): a basic line gets exactly one timestamp,
+multiple print() arguments (several internal write() calls per
+statement) still get exactly one, a genuinely blank line stays
+blank rather than becoming a bare timestamp, and -- the direct
+regression test for the actual bug -- calling
+install_local_timestamps() two or three times in a row still
+produces exactly one timestamp per line, not two or three. Verified
+end to end through the real CLI: timestamps progress naturally
+across a real session, and --no-timestamps correctly disables the
+feature entirely.
+
+17 new checks; 864 total across the host suite, 0 failures, stable
+across repeated full-suite runs.
+
+**v3.52** — the live console now reports only the strategy that
+actually trades, and the README was rewritten around usage.
+
+SMA and EMA are still scored, still written to the audit log and still
+restored across restarts -- they simply stop narrating crossings the
+session will never act on, matching the dashboard, which stopped
+showing them at v3.48. The reporting filter follows --strategy rather
+than hardcoding vwap_bounce, so it stays correct whatever is being
+traded, and the same report_strategies knob exists on both engines so
+--port and the direct path print the same thing. The end-of-session
+table shows the live row alone under a "session result" header.
+--report-all-strategies restores the full output. backtest.py is
+deliberately untouched: comparing strategies over the same data is the
+entire point of a backtest.
+
+A bug introduced while making this change, caught before shipping:
+folding the console gate into the frame dispatch
+(`if strat == "vwap_bounce" and self._reports(strat)`) sent VWAP frames
+down the SMA branch whenever vwap reporting was off, where
+fr['sma_fast'] does not exist. The KeyError killed the pump thread, so
+a historical replay that should have processed 80 trades processed
+zero -- with a clean exit code, no traceback and a normal-looking
+summary. Dispatch and printing are now separate conditions. The
+hardware-mode "verified: FPGA SMAs" lines are deliberately left alone
+(they report hardware math confirmation, not strategy signals), and the
+eval_skips warning always prints, being a correctness signal.
+
+README.md rewritten around using the tool -- both commands, what the
+engine computes, how the VWAP bounce strategy fires, the full risk
+model, and complete flag tables for order_manager.py (53 flags) and
+backtest.py (35). Every flag and default was extracted from the current
+source rather than written from memory. Build history moved to
+README-history.md.
+
+New [G15] in test_host.py (10 checks) proves report_strategies gates
+printing only and never alters dispatch, mutation-tested against the
+original bug shape. [G14]/[G18]/[G21] in test_order_manager.py now pass
+--report-all-strategies, since they specifically test the scored rows.
+1036 total across the host suite, 0 failures.
