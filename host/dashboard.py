@@ -62,6 +62,15 @@ class DashboardServer:
                                                   # underlying price point was
                                                   # still visible on screen —
                                                   # a real reported bug.
+        # v3.57: ACTUAL FILLS only, kept separate from _signals. The
+        # signals deque holds 20 entries of everything the strategy
+        # emitted -- and the overwhelming majority are blocked, mostly
+        # on cooldown -- so a real transaction scrolls out of view in
+        # seconds and there is no way to get it back. These are the
+        # events with money attached, they are rare by comparison, and
+        # they are what you actually want a record of. 200 deep, which
+        # covers a full session for any symbol set traded so far.
+        self._fills = deque(maxlen=200)
         self._events = deque(maxlen=30)
         self._last_price = {}                   # symbol -> latest price_e4,
                                                 # for the HOLDINGS table's
@@ -123,6 +132,20 @@ class DashboardServer:
                   "fill_qty": fill_qty,
                   "outcome": outcome}
             self._signals.appendleft(rec)
+            if outcome == "FILLED":
+                # position and cumulative P&L are read straight from the
+                # OrderManager, immediately after the fill was applied,
+                # so the row shows the true state at that instant rather
+                # than a reconstruction
+                self._fills.appendleft({
+                    "t": rec["t"], "symbol": rec["symbol"],
+                    "side": rec["side"], "qty": fill_qty,
+                    "price_e4": rec["price_e4"],
+                    "notional": ((fill_qty or 0) * rec["price_e4"] / 10_000.0),
+                    "trade_pnl_e4": trade_pnl_e4,
+                    "position_after": self.om.positions.get(rec["symbol"], 0),
+                    "cum_pnl": self.om.costs.net_pnl_usd,
+                })
             sym = rec["symbol"]
             self._signals_by_symbol.setdefault(
                 sym, deque(maxlen=20)).appendleft(rec)
@@ -148,6 +171,7 @@ class DashboardServer:
             series = list(self._series.get(sym, ()))
             signals = list(self._signals)
             chart_signals = list(self._signals_by_symbol.get(sym, ()))
+            fills = list(self._fills)
             events = list(self._events)
             last_px = dict(self._last_price)
             echo_age = now - self._last_echo_t if self._last_echo_t else 1e9
@@ -209,6 +233,7 @@ class DashboardServer:
             "series": series,
             "signals": signals,       # global, all symbols — feeds the table
             "chart_signals": chart_signals,   # THIS symbol only — chart markers
+            "fills": fills,
             "events": events,
             "holdings": holdings,
             # the chart draws its bands from these: the +/-k sigma signal
@@ -455,6 +480,13 @@ td:first-child,th:first-child{text-align:left}
   <div id="holdnote" class="legend"></div>
 </div>
 <div class="panel" style="margin-top:14px"><div id="cmp"></div></div>
+<div class="panel" style="margin-top:14px"><h2>FILLS
+    <span id="fillnote" style="font-weight:400;color:var(--dim)"></span></h2>
+  <table><thead><tr><th>time</th><th>sym</th><th>side</th><th>shares</th>
+  <th>price</th><th>notional</th><th>P&amp;L</th><th>position</th>
+  <th>session P&amp;L</th></tr></thead>
+  <tbody id="fills"></tbody></table>
+</div>
 <div class="panel" style="margin-top:14px"><h2>SIGNALS</h2>
   <table><thead><tr><th>t</th><th>sym</th><th>side</th>
   <th>price</th><th>shares</th><th>vwap</th><th>P&amp;L</th>
@@ -524,6 +556,36 @@ function drawChart(canvasId,series,signals,bandK,stopMult){
         if(isBuy){g.moveTo(x,y+16);g.lineTo(x-5,y+24);g.lineTo(x+5,y+24);}
         else {g.moveTo(x,y-16);g.lineTo(x-5,y-24);g.lineTo(x+5,y-24);}
         g.closePath();g.fill();break;}}}
+}
+
+function renderFills(fs){
+  const b=$('fills');
+  if(!fs||!fs.length){
+    b.innerHTML='<tr><td colspan="9" style="color:var(--dim)">'+
+      'no fills yet this session</td></tr>';
+    $('fillnote').textContent='';return;}
+  b.innerHTML=fs.map(f=>{
+    const isBuy=f.side===1;
+    const pnl=f.trade_pnl_e4==null?'—':
+      (f.trade_pnl_e4>=0?'+':'')+'$'+Math.abs(f.trade_pnl_e4/10000).toFixed(2);
+    return '<tr><td>'+f.t+'</td><td>'+f.symbol+'</td>'+
+      '<td class="'+(isBuy?'buy">BUY':'sell">SELL')+'</td>'+
+      '<td>'+(f.qty==null?'—':f.qty)+'</td>'+
+      '<td>'+usd(f.price_e4)+'</td>'+
+      '<td>$'+f.notional.toFixed(2)+'</td>'+
+      '<td class="'+(f.trade_pnl_e4==null?'':
+        (f.trade_pnl_e4>=0?'buy':'sell'))+'">'+pnl+'</td>'+
+      '<td>'+f.position_after+'</td>'+
+      '<td class="'+(f.cum_pnl>=0?'buy':'sell')+'">$'+
+        f.cum_pnl.toFixed(2)+'</td></tr>';
+  }).join('');
+  const buys=fs.filter(f=>f.side===1).length;
+  const sells=fs.length-buys;
+  const closed=fs.filter(f=>f.trade_pnl_e4!=null);
+  const wins=closed.filter(f=>f.trade_pnl_e4>0).length;
+  $('fillnote').textContent=
+    ' — '+fs.length+' shown ('+buys+' buys, '+sells+' sells)'+
+    (closed.length?'  ·  '+wins+'/'+closed.length+' closed trips won':'');
 }
 
 function renderHoldings(hs){
@@ -643,6 +705,7 @@ async function poll(){
     drawChart('chart',s.series,s.chart_signals,s.band_k,s.stop_mult);
     drawChart('chart2',s2.series,s2.chart_signals,s2.band_k,s2.stop_mult);
     renderHoldings(s.holdings);
+    renderFills(s.fills);
     // legend reflects the RUNNING config, not hardcoded multipliers
     document.querySelectorAll('.bk').forEach(e=>{
       e.textContent=(s.band_k||1).toFixed(s.band_k%1?2:0);});

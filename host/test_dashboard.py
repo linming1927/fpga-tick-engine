@@ -319,6 +319,56 @@ check("a filled SELL row carries it too", sig_pnl[2]["fill_qty"], 4)
 check("a blocked signal carries none, so the column never shows shares "
      "for an order that did not happen", sig_pnl[0]["fill_qty"], None)
 
+# ---- v3.57: the FILLS log, separate from SIGNALS ---------------------
+# The four on_signal calls above were: one blocked SELL, then a filled
+# BUY, a filled SELL and another filled SELL. Only the three FILLED ones
+# belong in the fills log.
+# NOTE: earlier groups in this file drive a real emulator session that
+# produces genuine fills of its own, so this checks the three newest
+# entries -- the ones the G_pnl block just created -- rather than the
+# whole log.
+_fl_all = json.loads(get("/api/state"))["fills"]
+_fl = _fl_all[:3]
+check("the blocked SELL is ABSENT from the fills log while all three "
+     "FILLED events are present -- the whole point, since real "
+     "transactions were being crowded out of the 20-slot SIGNALS deque "
+     "by thousands of blocked signals, mostly cooldown",
+     [f["qty"] for f in _fl], [4, 4, 7])
+check("...newest first, matching the signals table's ordering",
+      _fl[0]["side"], SIDE_SELL)
+check("every entry in the log is a real fill, never a blocked signal",
+      all(f["qty"] is not None or f["price_e4"] for f in _fl_all), True)
+check("a SELL row carries the round trip's P&L",
+      _fl[0]["trade_pnl_e4"], -45_000)
+check("a BUY row carries none -- nothing is realized until it closes",
+      _fl[2]["trade_pnl_e4"], None)
+check("notional is shares x price, so the row stands alone without "
+     "arithmetic", round(_fl[2]["notional"], 2), round(7 * 100.0, 2))
+check("position_after is read from the OrderManager at fill time, not "
+     "reconstructed", "position_after" in _fl[0], True)
+check("...and the running session P&L is carried too, so the log shows "
+     "the trajectory rather than just isolated trades",
+     "cum_pnl" in _fl[0], True)
+
+_page_f = get("/").decode()
+check("the FILLS panel is on the page", "<h2>FILLS" in _page_f, True)
+check("...with its own renderer", "renderFills" in _page_f, True)
+check("...and its own table body", 'id="fills"' in _page_f, True)
+
+# the fills deque must outlive the signals deque
+_before_f = len(json.loads(get("/api/state"))["fills"])
+for _i in range(40):
+    dash.on_signal({"side": SIDE_BUY, "price_e4": 1_000_000, "symbol": "SPY",
+                    "strategy": "vwap_bounce", "vwap": 1_010_000},
+                   outcome="FILLED", trade_pnl_e4=None, fill_qty=1)
+_st = json.loads(get("/api/state"))
+check("SIGNALS still caps at 20 -- unchanged", len(_st["signals"]), 20)
+check("...while FILLS grew by all 40, so a transaction from earlier in "
+     "the session is still there long after the signals box has churned "
+     "past it", len(_st["fills"]) - _before_f, 40)
+check("...and the fills log holds far more than the signals box",
+      len(_st["fills"]) > len(_st["signals"]), True)
+
 page_pnl = get("/").decode()
 check("the signals table has a P&L column", "<th>P&amp;L</th>" in page_pnl,
       True)
