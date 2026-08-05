@@ -2523,6 +2523,70 @@ import backtest as _bt35
 check("backtest.py opts out, so every run starts clean",
       "restore_state=False" in inspect.getsource(_bt35.run_backtest), True)
 
+# ---- v3.56: audit I/O a backtest has no use for ----------------------
+print("[G36] v3.56: blocked-event auditing and per-record flushing are "
+     "optional. A full-year replay writes hundreds of thousands of "
+     "blocked records that NOTHING reads back, each with its own "
+     "flush() syscall -- one real run logged 5.1M blocked signals. Live "
+     "sessions keep both: there the audit log is the cost-basis record "
+     "of real money and a crash must not lose it")
+
+_d36 = tempfile.mkdtemp()
+_lim36 = RiskLimits(order_qty=5, require_market_hours=False,
+                    cooldown_s=3600.0, max_notional_e4=10**12,
+                    max_position_notional_e4=10**12)
+
+
+def _g36_run(tag, **kw):
+    ap = os.path.join(_d36, f"{tag}.jsonl")
+    om = OrderManager(MockBroker(), ["SPY"], _lim36, audit_path=ap,
+                      killfile=os.path.join(_d36, f"{tag}.kill"), **kw)
+    om.on_signal({"side": SIDE_BUY, "price_e4": 100_0000, "symbol": "SPY",
+                  "strategy": "sma"})                       # fills
+    for _ in range(5):                                      # all blocked
+        om.on_signal({"side": SIDE_BUY, "price_e4": 100_0000,
+                      "symbol": "SPY", "strategy": "sma"})
+    om._audit_f.flush()
+    evs = [_json.loads(l)["event"] for l in open(ap)]
+    return om, evs
+
+
+_om36a, _ev36a = _g36_run("on")
+check("by default (live) blocked events ARE audited",
+      _ev36a.count("blocked"), 5)
+check("...alongside the fill", _ev36a.count("order_filled"), 1)
+check("...and the file is flushed per record, so a crash loses nothing",
+      _om36a._audit_flush, True)
+
+_om36b, _ev36b = _g36_run("off", audit_blocked=False, audit_flush=False)
+check("with audit_blocked=False they are skipped entirely",
+      _ev36b.count("blocked"), 0)
+check("...but FILLS are still audited -- cost basis, restore and the "
+     "monthly breakdown all depend on those",
+     _ev36b.count("order_filled"), 1)
+check("...and the in-memory block counter is UNAFFECTED, so every "
+     "reported number stays identical -- the report reads counters, "
+     "not the audit file", _om36b.blocked, 5)
+
+# the counters that drive the report come from memory, not the log
+check("both runs blocked the same number of signals",
+      _om36a.blocked, _om36b.blocked)
+
+import backtest as _bt36
+_src36 = inspect.getsource(_bt36.run_backtest)
+check("backtest.py opts out of both", "audit_blocked=False" in _src36
+      and "audit_flush=False" in _src36, True)
+
+# a halt must still reach disk even with flushing off
+_om36c, _ = _g36_run("halt", audit_blocked=False, audit_flush=False)
+_om36c.halt("test halt")
+_om36c._audit_f.flush()
+_ev36c = [_json.loads(l)["event"]
+          for l in open(os.path.join(_d36, "halt.jsonl"))]
+check("a KILL is still recorded with flushing off -- close() flushes "
+     "the tail, and this is the one event you most need after the fact",
+     "KILL" in _ev36c, True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

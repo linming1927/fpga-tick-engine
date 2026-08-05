@@ -161,7 +161,14 @@ def run_backtest(trades_paths, symbol: str, fast_n: int, slow_n: int,
     # restored wall-clock last_order_t against this historical clock
     # locked the cooldown on permanently.
     om = OrderManager(broker, [symbol], limits, audit_path=audit_path,
-                      killfile=killfile, restore_state=False)
+                      killfile=killfile, restore_state=False,
+                      # v3.56: skip the write-only blocked records and the
+                      # per-record flush. A full-year replay writes hundreds
+                      # of thousands of blocked events that nothing ever
+                      # reads back, each with its own fsync -- all of it
+                      # pure I/O cost. Fills, halts and the rest are still
+                      # audited, and close() flushes the tail.
+                      audit_blocked=False, audit_flush=False)
     om.policy._now_fn = HistoricalClock()   # historical time, not wall
                                             # clock -- same trick every
                                             # other row here already uses
