@@ -350,10 +350,34 @@ check("...and the running session P&L is carried too, so the log shows "
      "the trajectory rather than just isolated trades",
      "cum_pnl" in _fl[0], True)
 
+# v3.58: the stop-loss path must reach the dashboard too. It calls
+# om.on_signal() directly from the tick hook -- deliberately, since a
+# breached stop has to act on the tick that breached it -- which meant
+# it skipped the one place dash.on_signal() was called. A stop-triggered
+# sell filled, booked P&L and moved the position while staying entirely
+# invisible on screen. Found from a real session: two sells (CIFR
+# -$4.32, MARA -$8.75) missing from the FILLS box with no trace.
+dash.on_signal({"side": SIDE_SELL, "price_e4": 900_000, "symbol": "SPY",
+                "strategy": "vwap_bounce", "vwap": 1_010_000},
+               outcome="FILLED", trade_pnl_e4=-43_200, fill_qty=17,
+               reason="stop-loss")
+_fl2 = json.loads(get("/api/state"))["fills"]
+check("a stop-loss fill reaches the fills log at all -- the actual bug",
+      _fl2[0]["qty"], 17)
+check("...tagged so a stop exit is distinguishable from a strategy "
+     "exit, which mean very different things",
+     _fl2[0]["reason"], "stop-loss")
+check("...carrying its realized loss like any other fill",
+      _fl2[0]["trade_pnl_e4"], -43_200)
+check("a normal signal fill is tagged 'signal', not left blank",
+      _fl2[1]["reason"], "signal")
+
 _page_f = get("/").decode()
 check("the FILLS panel is on the page", "<h2>FILLS" in _page_f, True)
 check("...with its own renderer", "renderFills" in _page_f, True)
 check("...and its own table body", 'id="fills"' in _page_f, True)
+check("...and a why column, so the trigger is visible per row",
+      "<th>why</th>" in _page_f, True)
 
 # the fills deque must outlive the signals deque
 _before_f = len(json.loads(get("/api/state"))["fills"])

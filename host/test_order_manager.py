@@ -2587,6 +2587,38 @@ check("a KILL is still recorded with flushing off -- close() flushes "
      "the tail, and this is the one event you most need after the fact",
      "KILL" in _ev36c, True)
 
+# ---- v3.58: the stop-loss path must notify the dashboard -------------
+print("[G37] v3.58: a stop-triggered sell reaches the GUI. The stop "
+     "check runs in the tick hook and calls on_signal() directly -- "
+     "deliberately, since a breached stop must act on the tick that "
+     "breached it rather than wait for the next bounce -- but that also "
+     "skipped the ONE place dash.on_signal() was called. Real session: "
+     "two sells (CIFR -$4.32, MARA -$8.75) filled, booked P&L, moved "
+     "the position and wrote to the audit log while staying completely "
+     "invisible on screen. Also: TickEngine never logged signal frames, "
+     "so ticks.jsonl held 857,551 trades and ZERO signals -- there was "
+     "no way to tell a strategy exit from a stop exit after the fact")
+
+_om_src = open(ORDER_MANAGER_PY).read()
+_hook = _om_src[_om_src.index("def _on_echo_with_risk"):
+                _om_src.index("br.on_echo = _on_echo_with_risk")]
+check("the stop-loss branch notifies the dashboard",
+      "dash.on_signal(" in _hook, True)
+check("...tagging it as a stop, not leaving the GUI to guess",
+      'reason="stop-loss"' in _hook, True)
+check("...and passes the realized P&L, so the row is not blank",
+      "trade_pnl_e4=" in _hook, True)
+check("...and the filled share count", "fill_qty=" in _hook, True)
+check("...guarded, so a --dashboard-less session still works",
+      "if dash:" in _hook, True)
+
+import tick_engine as _te37
+_emit_src = inspect.getsource(_te37.TickEngine._emit)
+check("TickEngine writes signal frames to --log, as the Bridge always "
+     "did -- without this the tick log records what the market did but "
+     "not what the strategy decided",
+     "self.log.write" in _emit_src, True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")

@@ -282,6 +282,17 @@ class TickEngine:
 
     def _emit(self, fr: dict, strategy: str, sym: str,
               side_name: str, price_e4: int) -> None:
+        # v3.58: write signal frames to --log, as the Bridge always did.
+        # This module only logged the per-tick echo frames, so on the
+        # direct engine ticks.jsonl recorded what the market did but not
+        # what the strategy DECIDED. Real cost: diagnosing a missing
+        # dashboard entry, the tick log held 857,551 trade records for
+        # the session and zero signals, so there was no way to tell
+        # which fills came from a strategy signal and which from the
+        # stop-loss.
+        if self.log:
+            self.log.write(json.dumps({"t": fr.get("fpga_ts", now_us()),
+                                       **fr}) + "\n")
         self.fpga_signals += 1
         self.signals_by_strategy[strategy] += 1
         if not self.quiet and (self.report_strategies is None

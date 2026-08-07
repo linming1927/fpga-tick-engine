@@ -2180,8 +2180,30 @@ def main():
             om._commit_pending_stops(sym)
             if (om.positions.get(sym, 0) > 0
                     and om.risk_overlay.stop_triggered(sym, price_e4)):
-                om.on_signal({"side": SIDE_SELL, "price_e4": price_e4,
-                             "symbol": sym, "strategy": "vwap_bounce"})
+                _stop_fr = {"side": SIDE_SELL, "price_e4": price_e4,
+                            "symbol": sym, "strategy": "vwap_bounce"}
+                _stop_out = om.on_signal(_stop_fr)
+                # v3.58: tell the dashboard. This path deliberately does
+                # NOT go through on_verified() -- a breached stop has to
+                # act on the tick that breached it, not wait for the next
+                # bounce signal -- but that meant it also skipped the one
+                # place dash.on_signal() is called. So a stop-triggered
+                # sell filled, booked its P&L, moved the position and
+                # wrote to the audit log while staying completely
+                # invisible in the GUI. Found from a real session: two
+                # sells (CIFR -$4.32, MARA -$8.75) were missing from the
+                # FILLS box with no trace anywhere on screen. They were
+                # never in SIGNALS either; the v3.57 fills log just made
+                # the hole obvious by giving fills somewhere durable to
+                # live.
+                if dash:
+                    dash.on_signal(
+                        _stop_fr, _stop_out,
+                        trade_pnl_e4=(om.last_trade_pnl_e4
+                                      if _stop_out == "FILLED" else None),
+                        fill_qty=(om.last_fill_qty
+                                  if _stop_out == "FILLED" else None),
+                        reason="stop-loss")
         br.on_echo = _on_echo_with_risk
 
     def on_verified(fr):

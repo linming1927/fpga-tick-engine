@@ -107,7 +107,7 @@ class DashboardServer:
 
     def on_signal(self, fr: dict, outcome: str = "",
                   trade_pnl_e4: int | None = None,
-                  fill_qty: int | None = None):
+                  fill_qty: int | None = None, reason: str = ""):
         # v3.48: VWAP-bounce only. SMA and EMA are still scored in the
         # background and still appear in the end-of-session report --
         # they are just not reported HERE any more, so the signals
@@ -130,6 +130,12 @@ class DashboardServer:
                   # reject, so a risk-sized 40 routinely becomes a
                   # filled 15, and only the filled number is real.
                   "fill_qty": fill_qty,
+                  # v3.58: WHY this order happened. "stop-loss" for the
+                  # tick-level stop, "signal" for a normal strategy
+                  # bounce/cross. Worth surfacing: a stop exit and a
+                  # strategy exit mean very different things, and until
+                  # now the stop path reached the GUI not at all.
+                  "reason": reason or "signal",
                   "outcome": outcome}
             self._signals.appendleft(rec)
             if outcome == "FILLED":
@@ -143,6 +149,7 @@ class DashboardServer:
                     "price_e4": rec["price_e4"],
                     "notional": ((fill_qty or 0) * rec["price_e4"] / 10_000.0),
                     "trade_pnl_e4": trade_pnl_e4,
+                    "reason": rec["reason"],
                     "position_after": self.om.positions.get(rec["symbol"], 0),
                     "cum_pnl": self.om.costs.net_pnl_usd,
                 })
@@ -483,8 +490,8 @@ td:first-child,th:first-child{text-align:left}
 <div class="panel" style="margin-top:14px"><h2>FILLS
     <span id="fillnote" style="font-weight:400;color:var(--dim)"></span></h2>
   <table><thead><tr><th>time</th><th>sym</th><th>side</th><th>shares</th>
-  <th>price</th><th>notional</th><th>P&amp;L</th><th>position</th>
-  <th>session P&amp;L</th></tr></thead>
+  <th>price</th><th>notional</th><th>P&amp;L</th><th>why</th>
+  <th>position</th><th>session P&amp;L</th></tr></thead>
   <tbody id="fills"></tbody></table>
 </div>
 <div class="panel" style="margin-top:14px"><h2>SIGNALS</h2>
@@ -561,7 +568,7 @@ function drawChart(canvasId,series,signals,bandK,stopMult){
 function renderFills(fs){
   const b=$('fills');
   if(!fs||!fs.length){
-    b.innerHTML='<tr><td colspan="9" style="color:var(--dim)">'+
+    b.innerHTML='<tr><td colspan="10" style="color:var(--dim)">'+
       'no fills yet this session</td></tr>';
     $('fillnote').textContent='';return;}
   b.innerHTML=fs.map(f=>{
@@ -575,6 +582,8 @@ function renderFills(fs){
       '<td>$'+f.notional.toFixed(2)+'</td>'+
       '<td class="'+(f.trade_pnl_e4==null?'':
         (f.trade_pnl_e4>=0?'buy':'sell'))+'">'+pnl+'</td>'+
+      '<td class="'+(f.reason==='stop-loss'?'sell':'')+'">'+
+        (f.reason||'signal')+'</td>'+
       '<td>'+f.position_after+'</td>'+
       '<td class="'+(f.cum_pnl>=0?'buy':'sell')+'">$'+
         f.cum_pnl.toFixed(2)+'</td></tr>';
