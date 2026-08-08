@@ -755,6 +755,16 @@ class OrderManager:
         # rejecting, those two routinely differ and only the filled
         # number reflects what actually happened.
         self.last_fill_qty = None
+        # v3.59: set by main() to the dashboard's on_signal. _apply_fill
+        # is reached ONLY from _resolve_pending -- the late/partial
+        # reconciliation of an order that did not confirm inside the
+        # poll window -- and that path books the fill directly, so it
+        # never touched the GUI. A real session: an RKLB sell for
+        # +$15.99 filled 3 minutes after submission, was reconciled on
+        # the next signal, and appeared nowhere on screen. Worse than a
+        # missing row: the session-P&L column includes it, so the
+        # visible rows stopped reconciling against the running total.
+        self.on_late_fill = None
         # v3.50: symbol -> {order_id, qty, side, price_e4, t}
         # for orders that were submitted but never confirmed
         # filled. Kept OUT of self.positions on purpose: the
@@ -984,7 +994,8 @@ class OrderManager:
               f"(adopted position — it had none until the session VWAP "
               f"warmed up)")
 
-    def _resolve_pending(self, sym: str, before_side: str = None) -> None:
+    def _resolve_pending(self, sym: str,
+                         incoming_verb: str = None) -> str | None:
         """v3.50: settle a previously-unconfirmed order on `sym` before
         doing anything else with that symbol.
 
@@ -1034,6 +1045,26 @@ class OrderManager:
             fill_e4 = int(round(px * 10_000)) or p["price_e4"]
             self._apply_fill(sym, p["side"], filled_qty, fill_e4,
                              p["order_id"], late=True, partial=True)
+        # v3.59: only an OPPOSITE-side order is in the way. The reason
+        # for cancelling is the wash-trade rejection, and Alpaca only
+        # raises that against an opposite-side working order -- so
+        # cancelling a working SELL just to submit an identical SELL
+        # buys nothing and actively costs. Observed live: three RKLB
+        # sells for the same 6 shares, cancelled at 07:31 and 07:32
+        # before the third finally filled at 07:36, because Alpaca paper
+        # was taking ~30s to fill right after the open while our poll
+        # window is 5s. The exit was delayed five minutes by our own
+        # churn. Leave it working and decline to duplicate it instead.
+        if incoming_verb is not None and incoming_verb == p["side"]:
+            self._audit("pending_kept", symbol=sym,
+                        order_id=p["order_id"], side=p["side"],
+                        filled_qty=filled_qty, qty=p["qty"])
+            print(f"[om] {sym}: a {p['side'].upper()} for {p['qty']} is "
+                  f"already working ({p['order_id']}) — leaving it alone "
+                  f"rather than cancelling and resubmitting the same "
+                  f"order")
+            return "working"
+
         cancel = getattr(self.broker, "cancel_order", None)
         ok = bool(cancel and cancel(p["order_id"]))
         self._audit("pending_resolved", symbol=sym, order_id=p["order_id"],
@@ -1072,6 +1103,13 @@ class OrderManager:
         print(f"[om] FILLED{tag} {verb.upper()} {qty} {sym} @ "
               f"${dollars(fill_e4):.4f}  -> position "
               f"{self.positions[sym]}{fee_str}{pnl_str}")
+        if self.on_late_fill:
+            self.on_late_fill(
+                {"side": SIDE_BUY if verb == "buy" else SIDE_SELL,
+                 "price_e4": fill_e4, "symbol": sym,
+                 "strategy": "vwap_bounce"},
+                "FILLED", trade_pnl_e4=trade_pnl_e4, fill_qty=qty,
+                reason="late fill" + (" (partial)" if partial else ""))
 
     _WASH_MARKERS = ("wash trade", "opposite side")
 
@@ -1140,7 +1178,23 @@ class OrderManager:
         # (long-only: nothing to sell)", leaving a real position with no
         # way out. Gating has to see the true position.
         if self.pending_orders.get(sym):
-            self._resolve_pending(sym)
+            _pend = self._resolve_pending(
+                sym, incoming_verb=("buy" if side == SIDE_BUY else "sell"))
+            if _pend == "working":
+                # v3.59: an identical-side order is already live at the
+                # broker. Submitting a second one would double the
+                # intended size, and cancelling the first to resubmit the
+                # same thing is pure churn -- which is exactly what
+                # delayed a real RKLB exit by five minutes.
+                self.blocked += 1
+                reason = ("an order on this symbol is already working at "
+                          "the broker (same side) -- not duplicating it")
+                self._audit("blocked", reason=reason, symbol=sym,
+                            side=side, price_e4=price_e4,
+                            position_qty=self.positions[sym])
+                print(f"[om] blocked {sym} "
+                      f"{'BUY' if side == SIDE_BUY else 'SELL'}: {reason}")
+                return f"blocked: {reason}"
 
         # v3.38: the risk overlay only applies to the vwap_bounce
         # strategy (stop/anchor concepts are inherently VWAP-based;
@@ -2051,6 +2105,10 @@ def main():
     if args.dashboard:
         from dashboard import DashboardServer
         dash = DashboardServer(br, om, args.dashboard, scorecards=cards)
+        # v3.59: late/partial fills reconciled from a pending order are
+        # booked inside _apply_fill, which is nowhere near on_verified()
+        # -- so they never reached the GUI. Wire them straight through.
+        om.on_late_fill = dash.on_signal
         dash.start()
 
     if ladder:

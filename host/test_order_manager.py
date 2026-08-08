@@ -2619,6 +2619,91 @@ check("TickEngine writes signal frames to --log, as the Bridge always "
      "not what the strategy decided",
      "self.log.write" in _emit_src, True)
 
+# ---- v3.59: late fills reach the GUI; no same-side churn -------------
+print("[G38] v3.59: two problems from one real 8/7 session. (1) A fill "
+     "reconciled from a pending order is booked in _apply_fill, which "
+     "on_verified() never sees -- an RKLB sell for +$15.99 filled three "
+     "minutes late, was booked correctly, and appeared NOWHERE on "
+     "screen. Worse than a missing row: the session-P&L column includes "
+     "it, so the visible rows stopped reconciling against the running "
+     "total. (2) A same-side pending order was cancelled and resubmitted "
+     "identically -- three RKLB sells for the same 6 shares, cancelled "
+     "at 07:31 and 07:32, filling only at 07:36, because Alpaca paper "
+     "takes ~30s to fill at the open while the poll window is 5s. Our "
+     "own churn delayed that exit by five minutes")
+
+_d38 = tempfile.mkdtemp()
+_lim38 = RiskLimits(order_qty=6, require_market_hours=False, cooldown_s=0.0,
+                    max_notional_e4=10**12, max_position_notional_e4=10**12)
+
+
+def _om38(tag, **bkw):
+    b = MockBroker(**bkw)
+    o = OrderManager(b, ["RKLB"], _lim38,
+                     audit_path=os.path.join(_d38, f"{tag}.jsonl"),
+                     killfile=os.path.join(_d38, f"{tag}.kill"))
+    o.positions["RKLB"] = 6
+    b.positions["RKLB"] = 6
+    o.costs._entries["RKLB"] = [6, 770_000]
+    return o, b
+
+
+def _sell38(o, px=780_000):
+    return o.on_signal({"side": SIDE_SELL, "price_e4": px,
+                        "symbol": "RKLB", "strategy": "vwap_bounce"})
+
+
+# (1) the late fill must be announced
+_om, _b = _om38("late", pending_next=1)
+_seen = []
+_om.on_late_fill = lambda fr, outcome, **kw: _seen.append((fr, outcome, kw))
+check("an unconfirmed order reports pending, not filled",
+      _sell38(_om).startswith("pending:"), True)
+check("...and nothing is announced yet -- the shares do not exist",
+      _seen, [])
+_oid = _om.pending_orders["RKLB"]["order_id"]
+_b.open_orders[_oid].update({"status": "filled", "filled_qty": "6",
+                             "filled_avg_price": "78.60"})
+_sell38(_om, 790_000)          # next signal reconciles it
+check("the late fill IS announced once reconciled -- the bug",
+      len(_seen), 1)
+check("...as a real fill", _seen[0][1], "FILLED")
+check("...with the filled share count", _seen[0][2]["fill_qty"], 6)
+check("...and the realized P&L, so the row reconciles against the "
+      "session total", _seen[0][2]["trade_pnl_e4"],
+      (786_000 - 770_000) * 6)
+check("...tagged so it is distinguishable from a normal fill",
+      _seen[0][2]["reason"], "late fill")
+check("...carrying the side it actually was", _seen[0][0]["side"],
+      SIDE_SELL)
+
+# (2) same side: leave it working, do not duplicate
+_om2, _b2 = _om38("same", pending_next=1)
+_sell38(_om2)
+_oid2 = _om2.pending_orders["RKLB"]["order_id"]
+_out2 = _sell38(_om2, 781_000)
+check("a second SAME-side order is declined rather than submitted",
+      _out2.startswith("blocked:"), True)
+check("...with a reason that says why",
+      "already working" in _out2, True)
+check("...and the original order is left ALONE at the broker -- "
+      "cancelling a working SELL to submit an identical SELL buys "
+      "nothing and cost a real exit five minutes",
+      _oid2 in _b2.open_orders, True)
+
+# (3) opposite side still cancels -- that is the wash-trade case
+_om3, _b3 = _om38("opp", pending_next=1)
+_sell38(_om3)
+_oid3 = _om3.pending_orders["RKLB"]["order_id"]
+_om3.on_signal({"side": SIDE_BUY, "price_e4": 775_000,
+                "symbol": "RKLB", "strategy": "vwap_bounce"})
+check("an OPPOSITE-side order still cancels the pending one -- this is "
+      "the case Alpaca rejects as a wash trade, and the only case "
+      "cancelling was ever for", _oid3 in _b3.open_orders, False)
+
+check("main() wires the dashboard to the late-fill hook",
+      "om.on_late_fill = dash.on_signal" in _om_src, True)
+
 print(f"\n==============================================")
 print(f"  RESULT: {PASS} PASS / {FAIL} FAIL")
 print(f"==============================================")
